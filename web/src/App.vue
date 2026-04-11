@@ -63,7 +63,7 @@ async function refresh() {
 
 function onTaskStarted() {
   // 任务启动后开始较快轮询
-  startPolling(30000)
+  startPolling(10000)
   refresh()
 }
 

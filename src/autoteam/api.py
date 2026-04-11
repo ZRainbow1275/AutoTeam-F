@@ -413,9 +413,20 @@ if DIST_DIR.exists():
         return FileResponse(str(DIST_DIR / "index.html"))
 
 
+class _QuietAccessLog(logging.Filter):
+    """过滤前端轮询产生的高频访问日志"""
+    _quiet_paths = ("/api/status", "/api/tasks", "/api/config/auto-check")
+
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(p in msg for p in self._quiet_paths)
+
+
 def start_server(host: str = "0.0.0.0", port: int = 8787):
     """启动 API 服务器"""
     import uvicorn
+    # 过滤轮询日志，避免刷屏
+    logging.getLogger("uvicorn.access").addFilter(_QuietAccessLog())
     logger.info("[API] 启动 AutoTeam API 服务器 http://%s:%d", host, port)
     if DIST_DIR.exists():
         logger.info("[API] 前端面板 http://%s:%d", host, port)
