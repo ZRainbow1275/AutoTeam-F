@@ -112,7 +112,7 @@ def sync_account_states(chatgpt_api=None):
 
 
 def cmd_status():
-    """显示所有账号状态（先同步 Team 实际状态）"""
+    """显示所有账号状态（先同步 Team 实际状态，active 账号实时查询额度）"""
     sync_account_states()
 
     accounts = load_accounts()
@@ -120,19 +120,45 @@ def cmd_status():
         print("暂无账号")
         return
 
-    print(f"\n{'邮箱':<40} {'状态':<12} {'额度恢复时间':<25} {'认证文件'}")
-    print("-" * 100)
+    # active 账号实时查询额度
+    quota_cache = {}
     for acc in accounts:
-        resets = ""
-        if acc.get("quota_resets_at"):
+        if acc["status"] == STATUS_ACTIVE and acc.get("auth_file") and Path(acc["auth_file"]).exists():
+            auth_data = json.loads(Path(acc["auth_file"]).read_text())
+            access_token = auth_data.get("access_token")
+            if access_token:
+                status, info = check_codex_quota(access_token)
+                if status == "ok" and isinstance(info, dict):
+                    quota_cache[acc["email"]] = info
+
+    print(f"\n{'邮箱':<40} {'状态':<10} {'5h额度':<12} {'周额度':<12} {'5h重置':<14} {'周重置':<14}")
+    print("-" * 105)
+    for acc in accounts:
+        email = acc["email"]
+        status = acc["status"]
+        qi = quota_cache.get(email)
+
+        if qi:
+            p_pct = f"{100 - qi['primary_pct']}%"
+            w_pct = f"{100 - qi['weekly_pct']}%"
+            p_reset = time.strftime("%m-%d %H:%M", time.localtime(qi["primary_resets_at"])) if qi.get("primary_resets_at") else "-"
+            w_reset = time.strftime("%m-%d %H:%M", time.localtime(qi["weekly_resets_at"])) if qi.get("weekly_resets_at") else "-"
+        elif acc.get("quota_resets_at"):
             rt = acc["quota_resets_at"]
             if time.time() >= rt:
-                resets = "已恢复"
+                p_pct = "已恢复"
             else:
-                resets = time.strftime("%m-%d %H:%M", time.localtime(rt))
+                p_pct = "100%"
+            w_pct = "-"
+            p_reset = time.strftime("%m-%d %H:%M", time.localtime(rt)) if time.time() < rt else "已恢复"
+            w_reset = "-"
+        else:
+            p_pct = "-"
+            w_pct = "-"
+            p_reset = "-"
+            w_reset = "-"
 
-        auth = "有" if acc.get("auth_file") else "无"
-        print(f"{acc['email']:<40} {acc['status']:<12} {resets:<25} {auth}")
+        print(f"{email:<40} {status:<10} {p_pct:<12} {w_pct:<12} {p_reset:<14} {w_reset:<14}")
 
     active = [a for a in accounts if a["status"] == STATUS_ACTIVE]
     standby = [a for a in accounts if a["status"] == STATUS_STANDBY]
@@ -210,13 +236,13 @@ def cmd_check():
 
             if status_str == "ok":
                 if isinstance(info, dict):
-                    p_pct = info.get("primary_pct", 0)
-                    w_pct = info.get("weekly_pct", 0)
+                    p_remain = 100 - info.get("primary_pct", 0)
+                    w_remain = 100 - info.get("weekly_pct", 0)
                     p_reset = info.get("primary_resets_at", 0)
                     w_reset = info.get("weekly_resets_at", 0)
                     p_time = time.strftime("%m-%d %H:%M", time.localtime(p_reset)) if p_reset else "?"
                     w_time = time.strftime("%m-%d %H:%M", time.localtime(w_reset)) if w_reset else "?"
-                    print(f"[{email}] ✅ 5h: {p_pct}% (重置 {p_time}) | 周: {w_pct}% (重置 {w_time})")
+                    print(f"[{email}] ✅ 5h: {p_remain}% (重置 {p_time}) | 周: {w_remain}% (重置 {w_time})")
                 else:
                     print(f"[{email}] ✅ 额度可用")
             elif status_str == "exhausted":
