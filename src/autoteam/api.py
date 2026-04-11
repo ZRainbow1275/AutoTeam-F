@@ -320,6 +320,12 @@ def _auto_check_loop():
                     continue
                 _playwright_lock.release()
 
+                # 将低于阈值的账号标记为 exhausted，rotate 会自动移出并补充
+                from autoteam.accounts import update_account, STATUS_EXHAUSTED
+                for email, remaining in low_accounts:
+                    logger.info("[巡检] %s 剩余 %d%%，标记为 exhausted", email, remaining)
+                    update_account(email, status=STATUS_EXHAUSTED, quota_exhausted_at=time.time())
+
                 logger.info("[巡检] 触发自动轮转...")
                 from autoteam.manager import cmd_rotate
                 try:
