@@ -141,7 +141,9 @@ def cmd_status():
 
 
 def _check_and_refresh(acc):
-    """检查单个账号额度，401 时自动刷新 token。返回 (status_str, resets_at)"""
+    """检查单个账号额度，401 时自动刷新 token。返回 (status_str, info)
+    info: exhausted 时为 resets_at，ok 时为 quota_info dict
+    """
     email = acc["email"]
     auth_file = acc.get("auth_file")
 
@@ -155,7 +157,7 @@ def _check_and_refresh(acc):
     if not access_token:
         return "no_auth", None
 
-    status, resets_at = check_codex_quota(access_token)
+    status, info = check_codex_quota(access_token)
 
     # token 过期，尝试刷新
     if status == "auth_error" and rt:
@@ -167,11 +169,11 @@ def _check_and_refresh(acc):
             auth_data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             Path(auth_file).write_text(json.dumps(auth_data, indent=2))
             print(f"[{email}] token 已刷新，重新检查额度...")
-            status, resets_at = check_codex_quota(new_tokens["access_token"])
+            status, info = check_codex_quota(new_tokens["access_token"])
         else:
             print(f"[{email}] token 刷新失败")
 
-    return status, resets_at
+    return status, info
 
 
 def cmd_check():
@@ -204,11 +206,21 @@ def cmd_check():
         print(f"\n检查 {len(active_with_auth)} 个 active 账号的额度...\n")
         for acc in active_with_auth:
             email = acc["email"]
-            status_str, resets_at = _check_and_refresh(acc)
+            status_str, info = _check_and_refresh(acc)
 
             if status_str == "ok":
-                print(f"[{email}] ✅ 额度可用")
+                if isinstance(info, dict):
+                    p_pct = info.get("primary_pct", 0)
+                    w_pct = info.get("weekly_pct", 0)
+                    p_reset = info.get("primary_resets_at", 0)
+                    w_reset = info.get("weekly_resets_at", 0)
+                    p_time = time.strftime("%m-%d %H:%M", time.localtime(p_reset)) if p_reset else "?"
+                    w_time = time.strftime("%m-%d %H:%M", time.localtime(w_reset)) if w_reset else "?"
+                    print(f"[{email}] ✅ 5h: {p_pct}% (重置 {p_time}) | 周: {w_pct}% (重置 {w_time})")
+                else:
+                    print(f"[{email}] ✅ 额度可用")
             elif status_str == "exhausted":
+                resets_at = info
                 print(f"[{email}] ❌ 额度已用完")
                 update_account(email,
                     status=STATUS_EXHAUSTED,
@@ -242,13 +254,13 @@ def cmd_check():
                 update_account(email, auth_file=auth_file)
                 print(f"[{email}] ✅ token 已更新")
                 # 重新检查额度
-                status_str, resets_at = _check_and_refresh(
+                status_str, info = _check_and_refresh(
                     find_account(load_accounts(), email))
                 if status_str == "exhausted":
                     update_account(email,
                         status=STATUS_EXHAUSTED,
                         quota_exhausted_at=time.time(),
-                        quota_resets_at=resets_at,
+                        quota_resets_at=info,
                     )
                     exhausted_list.append(acc)
                     print(f"[{email}] ❌ 额度已用完")
