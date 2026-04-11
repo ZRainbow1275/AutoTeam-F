@@ -329,21 +329,26 @@ def cmd_check():
                 )
                 exhausted_list.append(acc)
             elif status_str == "auth_error":
-                # token 失效，先看历史额度，低于阈值直接标记 exhausted 不浪费时间重新登录
+                # token 失效，先看历史额度（重置时间已过的不算）
                 lq = acc.get("last_quota")
                 if lq:
-                    p_remain = 100 - lq.get("primary_pct", 0)
-                    if p_remain < threshold:
-                        resets_at = lq.get("primary_resets_at") or (time.time() + 18000)
-                        logger.warning("[%s] token 失效，历史额度 %d%% < %d%%，直接标记 exhausted",
-                                       email, p_remain, threshold)
-                        update_account(email,
-                            status=STATUS_EXHAUSTED,
-                            quota_exhausted_at=time.time(),
-                            quota_resets_at=resets_at,
-                        )
-                        exhausted_list.append(acc)
-                        continue
+                    p_resets = lq.get("primary_resets_at", 0)
+                    if not (p_resets and time.time() >= p_resets):
+                        # 重置时间未过，历史数据有效
+                        p_remain = 100 - lq.get("primary_pct", 0)
+                        if p_remain < threshold:
+                            resets_at = p_resets or (time.time() + 18000)
+                            logger.warning("[%s] token 失效，历史额度 %d%% < %d%%，直接标记 exhausted",
+                                           email, p_remain, threshold)
+                            update_account(email,
+                                status=STATUS_EXHAUSTED,
+                                quota_exhausted_at=time.time(),
+                                quota_resets_at=resets_at,
+                            )
+                            exhausted_list.append(acc)
+                            continue
+                    else:
+                        logger.info("[%s] token 失效但 5h 重置时间已过，需重新登录验证", email)
                 logger.warning("[%s] 认证失败，需要重新登录 Codex", email)
                 auth_error_list.append(acc)
 
@@ -395,6 +400,9 @@ def cmd_check():
                         logger.info("[%s] 额度可用 (%d%%)", email, p_remain)
                 elif status_str == "ok":
                     logger.info("[%s] 额度可用", email)
+                elif status_str == "auth_error":
+                    logger.warning("[%s] 重新登录后仍无法查询额度（可能未选中 Team workspace），标记为 standby", email)
+                    update_account(email, status=STATUS_STANDBY)
             else:
                 logger.error("[%s] Codex 登录失败，标记为 standby", email)
                 update_account(email, status=STATUS_STANDBY)
@@ -1019,15 +1027,19 @@ def cmd_rotate(target_seats=5):
                                 skipped.append(acc)
                                 continue
                             quota_ok = True
-                        # auth_error: token 失效，用 last_quota 判断
+                        # auth_error: token 失效，用 last_quota 判断（但重置时间已过的不算）
                         if status_str == "auth_error":
                             lq = acc.get("last_quota")
                             if lq:
-                                p_remain = 100 - lq.get("primary_pct", 0)
-                                if p_remain < threshold:
-                                    logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
-                                    skipped.append(acc)
-                                    continue
+                                p_resets = lq.get("primary_resets_at", 0)
+                                if p_resets and time.time() >= p_resets:
+                                    logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                                else:
+                                    p_remain = 100 - lq.get("primary_pct", 0)
+                                    if p_remain < threshold:
+                                        logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
+                                        skipped.append(acc)
+                                        continue
                 except Exception:
                     pass
 
@@ -1035,18 +1047,24 @@ def cmd_rotate(target_seats=5):
             if not quota_ok:
                 lq = acc.get("last_quota")
                 if lq:
-                    p_remain = 100 - lq.get("primary_pct", 0)
-                    if p_remain < threshold:
-                        logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
+                    p_resets = lq.get("primary_resets_at", 0)
+                    if p_resets and time.time() >= p_resets:
+                        # 重置时间已过，旧数据作废，视为额度已恢复
+                        logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                    else:
+                        p_remain = 100 - lq.get("primary_pct", 0)
+                        if p_remain < threshold:
+                            logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
+                            skipped.append(acc)
+                            continue
+                else:
+                    # 没有 last_quota，看 quota_resets_at 是否已过
+                    resets_at = acc.get("quota_resets_at")
+                    if resets_at and time.time() < resets_at:
+                        mins = max(0, int((resets_at - time.time()) / 60))
+                        logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
                         skipped.append(acc)
                         continue
-                # 没有 last_quota 但有 quota_resets_at（因额度不足被移出过），看是否已过重置时间
-                resets_at = acc.get("quota_resets_at")
-                if resets_at and time.time() < resets_at:
-                    mins = max(0, int((resets_at - time.time()) / 60))
-                    logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
-                    skipped.append(acc)
-                    continue
 
             logger.info("[4/5] 复用: %s", email)
             if not chatgpt or not chatgpt.browser:

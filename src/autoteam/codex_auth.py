@@ -93,6 +93,25 @@ def login_codex_via_browser(email, password, mail_client=None):
         )
 
         # === Step 0: 先登录 ChatGPT 并切换到 Team workspace ===
+        # 登录前就注入 _account cookie，引导登录流程进入 Team workspace
+        if CHATGPT_ACCOUNT_ID:
+            context.add_cookies([{
+                "name": "_account",
+                "value": CHATGPT_ACCOUNT_ID,
+                "domain": "chatgpt.com",
+                "path": "/",
+                "secure": True,
+                "sameSite": "Lax",
+            }, {
+                "name": "_account",
+                "value": CHATGPT_ACCOUNT_ID,
+                "domain": "auth.openai.com",
+                "path": "/",
+                "secure": True,
+                "sameSite": "Lax",
+            }])
+            logger.debug("[Codex] 登录前已注入 _account cookie = %s", CHATGPT_ACCOUNT_ID)
+
         logger.info("[Codex] 先登录 ChatGPT 选择 Team workspace...")
         _page = context.new_page()
         _page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
@@ -189,24 +208,7 @@ def login_codex_via_browser(email, password, mail_client=None):
             _screenshot(_page, "codex_00_after_workspace.png")
             logger.info("[Codex] 选择 workspace 后 URL: %s", _page.url)
 
-        # 确保 _account cookie 设置为 Team account ID
-        if CHATGPT_ACCOUNT_ID:
-            context.add_cookies([{
-                "name": "_account",
-                "value": CHATGPT_ACCOUNT_ID,
-                "domain": "chatgpt.com",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-            }, {
-                "name": "_account",
-                "value": CHATGPT_ACCOUNT_ID,
-                "domain": "auth.openai.com",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-            }])
-            logger.debug("[Codex] 已设置 _account cookie = %s", CHATGPT_ACCOUNT_ID)
+        # _account cookie 已在登录前注入
 
         # 关闭 ChatGPT 页面但保留 context
         _page.close()
@@ -570,9 +572,9 @@ def check_codex_quota(access_token, account_id=None):
     except Exception:
         return "auth_error", None
 
-    rate_limit = data.get("rate_limit", {})
-    primary = rate_limit.get("primary_window", {})
-    secondary = rate_limit.get("secondary_window", {})
+    rate_limit = data.get("rate_limit") or {}
+    primary = rate_limit.get("primary_window") or {}
+    secondary = rate_limit.get("secondary_window") or {}
 
     quota_info = {
         "primary_pct": primary.get("used_percent", 0),
