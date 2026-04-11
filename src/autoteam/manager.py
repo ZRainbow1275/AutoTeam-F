@@ -329,6 +329,21 @@ def cmd_check():
                 )
                 exhausted_list.append(acc)
             elif status_str == "auth_error":
+                # token 失效，先看历史额度，低于阈值直接标记 exhausted 不浪费时间重新登录
+                lq = acc.get("last_quota")
+                if lq:
+                    p_remain = 100 - lq.get("primary_pct", 0)
+                    if p_remain < threshold:
+                        resets_at = lq.get("primary_resets_at") or (time.time() + 18000)
+                        logger.warning("[%s] token 失效，历史额度 %d%% < %d%%，直接标记 exhausted",
+                                       email, p_remain, threshold)
+                        update_account(email,
+                            status=STATUS_EXHAUSTED,
+                            quota_exhausted_at=time.time(),
+                            quota_resets_at=resets_at,
+                        )
+                        exhausted_list.append(acc)
+                        continue
                 logger.warning("[%s] 认证失败，需要重新登录 Codex", email)
                 auth_error_list.append(acc)
 
@@ -364,6 +379,20 @@ def cmd_check():
                     )
                     exhausted_list.append(acc)
                     logger.warning("[%s] 额度已用完", email)
+                elif status_str == "ok" and isinstance(info, dict):
+                    p_remain = 100 - info.get("primary_pct", 0)
+                    update_account(email, last_quota=info)
+                    if p_remain < threshold:
+                        resets_at = info.get("primary_resets_at") or (time.time() + 18000)
+                        logger.warning("[%s] 5h剩余 %d%% < %d%%，标记为 exhausted", email, p_remain, threshold)
+                        update_account(email,
+                            status=STATUS_EXHAUSTED,
+                            quota_exhausted_at=time.time(),
+                            quota_resets_at=resets_at,
+                        )
+                        exhausted_list.append(acc)
+                    else:
+                        logger.info("[%s] 额度可用 (%d%%)", email, p_remain)
                 elif status_str == "ok":
                     logger.info("[%s] 额度可用", email)
             else:
@@ -896,6 +925,13 @@ def cmd_rotate(target_seats=5):
     """
     TARGET = target_seats
 
+    from autoteam.config import AUTO_CHECK_THRESHOLD
+    try:
+        from autoteam.api import _auto_check_config
+        threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
+    except ImportError:
+        threshold = AUTO_CHECK_THRESHOLD
+
     chatgpt = None
     mail_client = None
 
@@ -955,45 +991,77 @@ def cmd_rotate(target_seats=5):
 
         logger.info("[4/5] 填补 %d 个空缺 (当前 %d/%d)...", vacancies, current_count, TARGET)
 
-        # 优先复用旧账号
+        # 优先复用旧账号（先验证额度是否真的恢复了）
         filled = 0
         standby_list = get_standby_accounts()
-        recovered = [a for a in standby_list if a.get("_quota_recovered")]
+        skipped = []
 
-        if recovered:
-            logger.info("[4/5] 找到 %d 个额度已恢复的旧账号", len(recovered))
-
-        for acc in recovered:
+        for acc in standby_list:
             if filled >= vacancies:
                 break
             email = acc["email"]
+            auth_file = acc.get("auth_file")
+
+            # 验证额度是否真的恢复了
+            quota_ok = False
+            if auth_file and Path(auth_file).exists():
+                try:
+                    auth_data = json.loads(Path(auth_file).read_text())
+                    access_token = auth_data.get("access_token")
+                    if access_token:
+                        status_str, info = check_codex_quota(access_token)
+                        if status_str == "exhausted":
+                            logger.info("[4/5] 跳过 %s（额度未恢复）", email)
+                            skipped.append(acc)
+                            continue
+                        if status_str == "ok" and isinstance(info, dict):
+                            p_remain = 100 - info.get("primary_pct", 0)
+                            if p_remain < threshold:
+                                logger.info("[4/5] 跳过 %s（剩余 %d%% < %d%%）", email, p_remain, threshold)
+                                skipped.append(acc)
+                                continue
+                            quota_ok = True
+                        # auth_error: token 失效，用 last_quota 判断
+                        if status_str == "auth_error":
+                            lq = acc.get("last_quota")
+                            if lq:
+                                p_remain = 100 - lq.get("primary_pct", 0)
+                                if p_remain < threshold:
+                                    logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
+                                    skipped.append(acc)
+                                    continue
+                except Exception:
+                    pass
+
+            # 没有认证文件或无法查询额度时，用 last_quota / quota_resets_at 兜底
+            if not quota_ok:
+                lq = acc.get("last_quota")
+                if lq:
+                    p_remain = 100 - lq.get("primary_pct", 0)
+                    if p_remain < threshold:
+                        logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
+                        skipped.append(acc)
+                        continue
+                # 没有 last_quota 但有 quota_resets_at（因额度不足被移出过），看是否已过重置时间
+                resets_at = acc.get("quota_resets_at")
+                if resets_at and time.time() < resets_at:
+                    mins = max(0, int((resets_at - time.time()) / 60))
+                    logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
+                    skipped.append(acc)
+                    continue
+
             logger.info("[4/5] 复用: %s", email)
             if not chatgpt or not chatgpt.browser:
                 ensure_chatgpt()
             reinvite_account(chatgpt, ensure_mail(), acc)
             filled += 1
 
+        if skipped:
+            logger.info("[4/5] 跳过 %d 个额度未恢复的旧号", len(skipped))
+
         remaining = vacancies - filled
         if remaining <= 0:
             logger.info("[4/5] 已用旧账号填满空缺")
-            sync_to_cpa()
-            _print_status_table(load_accounts())
-            return
-
-        # 判断是否需要创建新账号
-        active_accounts = get_active_accounts()
-        exhausted_emails = {a["email"] for a in load_accounts() if a["status"] == STATUS_EXHAUSTED}
-        active_with_quota = [a for a in active_accounts if a["email"] not in exhausted_emails]
-        not_recovered = [a for a in standby_list if not a.get("_quota_recovered")]
-
-        if not_recovered and active_with_quota:
-            logger.info("[4/5] %d 个旧号等恢复中，Team 仍有 %d 个可用，暂不创建",
-                        len(not_recovered), len(active_with_quota))
-            for a in not_recovered:
-                rt = a.get("quota_resets_at")
-                if rt:
-                    mins = max(0, int((rt - time.time()) / 60))
-                    logger.info("[4/5]   %s → %d 分钟后恢复", a['email'], mins)
             sync_to_cpa()
             _print_status_table(load_accounts())
             return
