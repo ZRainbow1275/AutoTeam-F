@@ -103,13 +103,12 @@ def sync_to_cpa():
 
     logger.info("[CPA] active 认证文件: %d, CPA 认证文件: %d", len(active_files), len(cpa_files))
 
-    # 上传：active 有但 CPA 没有
+    # 上传：所有 active 认证文件（覆盖同名文件，确保 token 最新）
     uploaded = 0
     for name, path in active_files.items():
-        if name not in cpa_names:
-            logger.info("[CPA] 上传: %s", name)
-            if upload_to_cpa(path):
-                uploaded += 1
+        logger.info("[CPA] 上传: %s", name)
+        if upload_to_cpa(path):
+            uploaded += 1
 
     # 删除：CPA 中有但不在 active 列表的（仅限本地管理的账号）
     deleted = 0
