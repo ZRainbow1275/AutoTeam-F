@@ -657,9 +657,9 @@ def post_account_login(params: LoginAccountParams):
         raise HTTPException(status_code=404, detail="账号不存在")
 
     def _run():
-        from autoteam.accounts import update_account
+        from autoteam.accounts import STATUS_ACTIVE, update_account
         from autoteam.cloudmail import CloudMailClient
-        from autoteam.codex_auth import login_codex_via_browser, save_auth_file
+        from autoteam.codex_auth import check_codex_quota, login_codex_via_browser, save_auth_file
 
         mail_client = CloudMailClient()
         mail_client.login()
@@ -667,6 +667,15 @@ def post_account_login(params: LoginAccountParams):
         if bundle:
             auth_file = save_auth_file(bundle)
             update_account(email, auth_file=auth_file)
+            # 登录成功且是 team plan，自动标记为 active
+            if bundle.get("plan_type") == "team":
+                update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
+                # 查一下额度并保存快照
+                token = bundle.get("access_token")
+                if token:
+                    st, info = check_codex_quota(token)
+                    if st == "ok" and isinstance(info, dict):
+                        update_account(email, last_quota=info)
             return {"email": email, "plan": bundle.get("plan_type"), "auth_file": auth_file}
         raise RuntimeError(f"Codex 登录失败: {email}")
 
