@@ -918,8 +918,35 @@ def start_server(host: str = "0.0.0.0", port: int = 8787):
 
     # 过滤轮询日志，避免刷屏
     logging.getLogger("uvicorn.access").addFilter(_QuietAccessLog())
+    global API_KEY
     if not API_KEY:
-        logger.warning("[API] 未设置 API_KEY，所有接口无需认证。建议在 .env 中设置 API_KEY=<你的密钥>")
+        import secrets as _secrets
+
+        key = input("未设置 API_KEY，请输入一个 API Key（直接回车自动生成）: ").strip()
+        if not key:
+            key = _secrets.token_urlsafe(24)
+            logger.info("[API] 已自动生成 API Key: %s", key)
+        # 写入 .env
+        from autoteam.config import PROJECT_ROOT
+
+        env_file = PROJECT_ROOT / ".env"
+        if env_file.exists():
+            content = env_file.read_text()
+            if "API_KEY=" in content:
+                import re
+
+                content = re.sub(r"^API_KEY=.*$", f"API_KEY={key}", content, flags=re.MULTILINE)
+            else:
+                content = content.rstrip() + f"\nAPI_KEY={key}\n"
+            env_file.write_text(content)
+        else:
+            env_file.write_text(f"API_KEY={key}\n")
+        API_KEY = key
+        # 同步到 config 模块
+        import autoteam.config
+
+        autoteam.config.API_KEY = key
+        logger.info("[API] API Key 已保存到 .env")
     else:
         logger.info("[API] API Key 鉴权已启用")
     logger.info("[API] 启动 AutoTeam API 服务器 http://%s:%d", host, port)
