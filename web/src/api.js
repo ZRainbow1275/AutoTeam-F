@@ -41,6 +41,7 @@ export const api = {
   getActiveAccounts: () => request('GET', '/accounts/active'),
   getStandbyAccounts: () => request('GET', '/accounts/standby'),
   deleteAccount: (email) => request('DELETE', `/accounts/${encodeURIComponent(email)}`),
+  loginAccount: (email) => request('POST', '/accounts/login', { email }),
   getCpaFiles: () => request('GET', '/cpa/files'),
 
   startAdminLogin: (email) => request('POST', '/admin/login/start', { email }),

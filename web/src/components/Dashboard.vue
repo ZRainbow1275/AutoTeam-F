@@ -54,15 +54,24 @@
               </td>
               <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'primary') }}</td>
               <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'weekly') }}</td>
-              <td class="px-4 py-3 text-right">
+              <td class="px-4 py-3 text-right space-x-2">
+                <button
+                  @click="loginAccount(acc.email)"
+                  :disabled="actionDisabled || actionEmail === acc.email"
+                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
+                  :class="actionDisabled || actionEmail === acc.email
+                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
+                    : 'bg-blue-600/10 text-blue-400 border-blue-500/30 hover:bg-blue-600/20'">
+                  {{ actionEmail === acc.email && actionType === 'login' ? '登录中...' : '登录' }}
+                </button>
                 <button
                   @click="removeAccount(acc.email)"
-                  :disabled="deleteDisabled || deletingEmail === acc.email"
+                  :disabled="actionDisabled || actionEmail === acc.email"
                   class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="deleteDisabled || deletingEmail === acc.email
+                  :class="actionDisabled || actionEmail === acc.email
                     ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
                     : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
-                  {{ deletingEmail === acc.email ? '删除中...' : '删除' }}
+                  {{ actionEmail === acc.email && actionType === 'delete' ? '删除中...' : '删除' }}
                 </button>
               </td>
             </tr>
@@ -96,11 +105,12 @@ const props = defineProps({
 })
 const emit = defineEmits(['refresh'])
 
-const deletingEmail = ref('')
+const actionEmail = ref('')
+const actionType = ref('')
 const message = ref('')
 const messageClass = ref('')
 const adminReady = computed(() => !!props.adminStatus?.configured)
-const deleteDisabled = computed(() => !!props.runningTask || !adminReady.value)
+const actionDisabled = computed(() => !!props.runningTask || !adminReady.value)
 
 const cards = computed(() => {
   if (!props.status) return []
@@ -163,13 +173,35 @@ function pctColor(val) {
   return 'text-red-400'
 }
 
+async function loginAccount(email) {
+  if (actionDisabled.value) return
+
+  actionEmail.value = email
+  actionType.value = 'login'
+  message.value = ''
+  try {
+    const result = await api.loginAccount(email)
+    message.value = `已提交 ${email} 的登录任务: ${result.task_id}`
+    messageClass.value = 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+    emit('refresh')
+  } catch (e) {
+    message.value = e.message
+    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+  } finally {
+    actionEmail.value = ''
+    actionType.value = ''
+    setTimeout(() => { message.value = '' }, 8000)
+  }
+}
+
 async function removeAccount(email) {
-  if (deleteDisabled.value) return
+  if (actionDisabled.value) return
 
   const ok = window.confirm(`确认删除账号 ${email}？\n这会同时清理本地记录、CPA、Team/Invite 和 CloudMail。`)
   if (!ok) return
 
-  deletingEmail.value = email
+  actionEmail.value = email
+  actionType.value = 'delete'
   message.value = ''
   try {
     const result = await api.deleteAccount(email)
@@ -180,10 +212,9 @@ async function removeAccount(email) {
     message.value = e.message
     messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
   } finally {
-    deletingEmail.value = ''
-    setTimeout(() => {
-      message.value = ''
-    }, 8000)
+    actionEmail.value = ''
+    actionType.value = ''
+    setTimeout(() => { message.value = '' }, 8000)
   }
 }
 </script>

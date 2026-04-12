@@ -607,6 +607,39 @@ def delete_account(email: str):
         _playwright_lock.release()
 
 
+class LoginAccountParams(BaseModel):
+    email: str
+
+
+@app.post("/api/accounts/login", status_code=202)
+def post_account_login(params: LoginAccountParams):
+    """触发单个账号的 Codex 登录（后台执行）"""
+    from autoteam.accounts import find_account, load_accounts
+
+    email = params.email.strip().lower()
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    def _run():
+        from autoteam.accounts import update_account
+        from autoteam.cloudmail import CloudMailClient
+        from autoteam.codex_auth import login_codex_via_browser, save_auth_file
+
+        mail_client = CloudMailClient()
+        mail_client.login()
+        bundle = login_codex_via_browser(email, acc.get("password", ""), mail_client=mail_client)
+        if bundle:
+            auth_file = save_auth_file(bundle)
+            update_account(email, auth_file=auth_file)
+            return {"email": email, "plan": bundle.get("plan_type"), "auth_file": auth_file}
+        raise RuntimeError(f"Codex 登录失败: {email}")
+
+    task = _start_task(f"login:{email}", _run, {"email": email})
+    return task
+
+
 @app.get("/api/status")
 def get_status():
     """获取所有账号状态 + active 账号实时额度"""
