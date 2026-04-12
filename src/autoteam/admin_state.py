@@ -109,9 +109,20 @@ def get_admin_session_token():
     return load_admin_state().get("session_token", "")
 
 
+def _is_valid_uuid(value: str) -> bool:
+    """检查是否为有效的 UUID 格式"""
+    import re
+
+    return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", value, re.I))
+
+
 def get_chatgpt_account_id():
     state = load_admin_state()
-    return state.get("account_id", "") or os.environ.get("CHATGPT_ACCOUNT_ID", "")
+    state_id = state.get("account_id", "")
+    # state.json 里的值必须是 UUID 格式才有效（user-xxx 是 user ID 不是 account ID）
+    if state_id and _is_valid_uuid(state_id):
+        return state_id
+    return os.environ.get("CHATGPT_ACCOUNT_ID", "")
 
 
 def get_admin_password():

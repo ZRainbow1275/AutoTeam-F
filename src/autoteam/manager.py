@@ -1172,12 +1172,39 @@ def cmd_rotate(target_seats=5):
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
         api_count = get_team_member_count(chatgpt)
-        # API 有缓存延迟，移出后可能返回旧数据，手动修正
-        current_count = max(0, api_count - removed_count) if api_count >= 0 else 0
+        logger.info("[4/5] API 返回成员数: %d（本轮移出: %d）", api_count, removed_count)
+        if api_count <= 0:
+            # API 返回异常，用本地 active 账号数兜底
+            local_active = sum(1 for a in load_accounts() if a["status"] == STATUS_ACTIVE)
+            logger.warning("[4/5] API 成员数异常 (%d)，使用本地 active 数: %d", api_count, local_active)
+            current_count = local_active
+        else:
+            # API 有缓存延迟，移出后可能返回旧数据，手动修正
+            current_count = max(0, api_count - removed_count)
         vacancies = TARGET - current_count
 
         if vacancies <= 0:
-            logger.info("[4/5] Team 已满 (%d/%d)", current_count, TARGET)
+            excess = current_count - TARGET
+            if excess > 0:
+                logger.info("[4/5] Team 超员 (%d/%d)，清理 %d 个多余成员...", current_count, TARGET, excess)
+                # 只移除本地管理的账号，优先移除额度最低的
+                all_accs = load_accounts()
+                local_active = [a for a in all_accs if a["status"] == STATUS_ACTIVE]
+                # 按额度排序，额度低的优先移除
+                local_active.sort(key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0))
+                removed = 0
+                for acc in local_active:
+                    if removed >= excess:
+                        break
+                    email = acc["email"]
+                    if remove_from_team(chatgpt, email):
+                        update_account(email, status=STATUS_STANDBY)
+                        logger.info("[4/5] 超员清理: %s → standby", email)
+                        removed += 1
+                if removed:
+                    logger.info("[4/5] 已清理 %d 个多余成员", removed)
+            else:
+                logger.info("[4/5] Team 已满 (%d/%d)", current_count, TARGET)
             return
 
         logger.info("[4/5] 填补 %d 个空缺 (当前 %d/%d)...", vacancies, current_count, TARGET)
@@ -1436,9 +1463,13 @@ def cmd_main_codex_sync():
 def get_team_member_count(chatgpt_api):
     """获取当前 Team 成员数"""
     account_id = get_chatgpt_account_id()
+    if not account_id:
+        logger.error("[Team] account_id 为空，无法查询成员数")
+        return -1
     path = f"/backend-api/accounts/{account_id}/users"
     result = chatgpt_api._api_fetch("GET", path)
     if result["status"] != 200:
+        logger.error("[Team] 获取成员列表失败: %d %s", result["status"], result["body"][:200])
         return -1
     data = json.loads(result["body"])
     members = data.get("items", data.get("users", data.get("members", [])))
