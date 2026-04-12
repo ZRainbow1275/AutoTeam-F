@@ -479,16 +479,23 @@ class ChatGPTTeamAPI:
             data = {}
 
         candidates = []
+        _uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
         def walk(node):
             if isinstance(node, dict):
-                account_id = node.get("account_id") or node.get("id")
-                name = node.get("workspace_name") or node.get("name") or node.get("display_name")
-                if isinstance(account_id, str) and len(account_id) >= 8:
+                # account_id 必须是 UUID 格式（排除 user-xxx 等非 account ID）
+                account_id = node.get("account_id")
+                if not account_id or not _uuid_re.match(str(account_id)):
+                    account_id = node.get("id")
+                    if not account_id or not _uuid_re.match(str(account_id)):
+                        account_id = None
+                # workspace_name 只取 workspace_name 字段，不取 name/display_name（那可能是用户名）
+                name = node.get("workspace_name") or ""
+                if account_id:
                     candidates.append(
                         {
                             "account_id": account_id,
-                            "workspace_name": name or "",
+                            "workspace_name": name,
                             "type": str(node.get("type", "")),
                         }
                     )
