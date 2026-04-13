@@ -789,12 +789,18 @@ def _register_direct_once(mail_client, email, password):
             return False
 
         # 等待页面跳转完成（可能跳到 create-account/password）
-        time.sleep(5)
+        for _wait in range(10):
+            if "password" in page.url or page.locator('input[type="password"]').count() > 0:
+                break
+            time.sleep(1)
+        logger.info("[直接注册] 密码页检测 URL: %s", page.url)
+        screenshot(page, "direct_03b_before_password.png")
 
         try:
             for attempt in range(2):
                 pwd_input = page.locator('input[type="password"]').first
                 if not pwd_input.is_visible(timeout=10000):
+                    logger.info("[直接注册] 未检测到密码输入框，跳过")
                     break
 
                 logger.info("[直接注册] 设置密码")
