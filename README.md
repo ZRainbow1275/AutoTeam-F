@@ -12,7 +12,6 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-API_&_Web-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue](https://img.shields.io/badge/Vue_3-Frontend-4FC08D?style=for-the-badge&logo=vue.js&logoColor=white)](https://vuejs.org)
 
-
 </div>
 
 ---
@@ -22,14 +21,15 @@
 | | 功能 | 描述 |
 |---|---|---|
 | 📧 | **自动注册** | 创建临时邮箱 → 注册 ChatGPT → 自动填写验证码/个人信息 |
-| 🔐 | **Codex OAuth** | 自动完成 Codex 登录，保存 CPA 兼容的认证文件 |
-| 📊 | **额度检查** | 检测 Codex 5h 额度，token 过期自动刷新/重新登录 |
-| 🔄 | **智能轮转** | 额度低于阈值自动移出，复用前验证额度，万不得已才创建新号 |
-| ☁️ | **CPA 同步** | 认证文件自动上传/删除，只同步 active 账号 |
-| 👥 | **Team 管理** | 自动补满/清理成员，同步 Team 实际状态 |
-| 🌐 | **HTTP API** | FastAPI 接口，方便对接外部系统、定时任务 |
-| 🖥️ | **Web 面板** | Vue 3 管理面板，账号状态、操作、任务历史、巡检设置 |
+| 🔐 | **Codex OAuth** | 自动完成 Codex 登录，无密码时走一次性验证码，保存 CPA 兼容认证文件 |
+| 📊 | **额度检查** | 检测 Codex 5h/周额度，低于阈值自动标记，token 过期按历史额度判断 |
+| 🔄 | **智能轮转** | 额度低于阈值自动移出，复用前验证额度，超员自动清理，万不得已才创建新号 |
+| ☁️ | **CPA 同步** | 认证文件自动上传覆盖，只同步 active 账号，登录后自动同步 |
+| 👥 | **Team 管理** | 自动补满/清理成员，查看全部 Team 成员（含外部成员） |
+| 🌐 | **HTTP API** | FastAPI 接口 + API Key 鉴权，方便对接外部系统 |
+| 🖥️ | **Web 面板** | 侧边栏分页管理：仪表盘、Team 成员、操作任务、实时日志、巡检设置 |
 | 🔍 | **自动巡检** | 后台定时检查额度，低于阈值自动触发轮转，阈值可在面板配置 |
+| 🛡️ | **启动验证** | 每次启动自动验证 CloudMail 和 CPA 连通性，配置有误立即提示 |
 
 ## 快速开始
 
@@ -46,29 +46,36 @@ uv run playwright install chromium
 
 ### 配置
 
+首次运行任何命令时会自动进入配置向导，交互式填写必填项并验证连通性：
+
+```bash
+uv run autoteam api    # 启动时自动检测并提示填写缺失配置
+```
+
+也可以手动编辑 `.env`：
+
 ```bash
 cp .env.example .env   # 复制配置模板，填入实际值
 ```
 
 **`.env` 配置项：**
 
-| 配置项 | 说明 |
-|--------|------|
-| **CloudMail** | 临时邮箱服务地址和凭据 |
-| **CPA** | CLIProxyAPI 地址和管理密钥 |
-| **AUTO_CHECK_THRESHOLD** | 额度低于此百分比触发轮转，默认 `10`（可在 Web 面板修改） |
-| **AUTO_CHECK_INTERVAL** | 巡检间隔（秒），默认 `300`（5 分钟） |
-| **AUTO_CHECK_MIN_LOW** | 至少几个账号低于阈值才触发轮转，默认 `2` |
+| 配置项 | 说明 | 必填 |
+|--------|------|------|
+| `CLOUDMAIL_BASE_URL` | CloudMail API 地址 | 是 |
+| `CLOUDMAIL_EMAIL` | CloudMail 登录邮箱 | 是 |
+| `CLOUDMAIL_PASSWORD` | CloudMail 登录密码 | 是 |
+| `CLOUDMAIL_DOMAIN` | 临时邮箱域名（如 `@example.com`） | 是 |
+| `CPA_URL` | CLIProxyAPI 地址 | 否（默认 `http://127.0.0.1:8317`） |
+| `CPA_KEY` | CPA 管理密钥 | 是 |
+| `API_KEY` | Web 面板 / API 鉴权密钥 | 否（首次启动自动生成） |
+| `AUTO_CHECK_THRESHOLD` | 额度低于此百分比触发轮转 | 否（默认 `10`，可在面板修改） |
+| `AUTO_CHECK_INTERVAL` | 巡检间隔（秒） | 否（默认 `300`） |
+| `AUTO_CHECK_MIN_LOW` | 至少几个账号低于阈值才触发 | 否（默认 `2`） |
 
-管理员登录改为首次启动后在 Web 页面内完成，系统会自动保存：
+**管理员登录：**
 
-- 主号邮箱
-- session token
-- 主号密码（仅当登录流程要求输入密码时保存，供主号 Codex 同步复用）
-- Workspace / account ID
-- workspace 名称
-
-以上信息统一写入项目根目录下的 `state.json` 文件，不再额外保存 `session`。
+首次启动后在 Web 面板或命令行完成主号登录，系统自动保存到 `state.json`（邮箱、session token、workspace ID 等）。
 
 ### 使用
 
@@ -78,16 +85,16 @@ uv run autoteam <command> [args]
 
 | 命令 | 说明 |
 |------|------|
-| `admin-login [--email]` | 交互式完成管理员主号登录，按提示输入邮箱、密码或验证码 |
-| `main-codex-sync` | 交互式同步主号 Codex 到 CPA，按提示输入密码或验证码 |
-| `status` | 查看所有账号状态（自动同步 Team 实际成员） |
-| `check` | 检查 active 账号额度，低于阈值标记 exhausted，token 失效按历史额度判断 |
-| `rotate [N]` | 智能轮转：检查额度 → 移出低于阈值的 → 验证旧号额度后复用 → 补满到 N 个（默认 5） |
+| `api` | 启动 HTTP API + Web 管理面板（默认端口 8787） |
+| `status` | 查看所有账号状态（自动同步 Team 成员 + auths 目录） |
+| `check` | 检查 active 账号额度，低于阈值标记 exhausted |
+| `rotate [N]` | 智能轮转：检查 → 移出 → 复用/创建 → 补满到 N 个（默认 5） |
 | `add` | 手动添加一个新账号 |
-| `fill [N]` | 补满 Team 成员到 N 个（默认 5） |
+| `fill [N]` | 补满 Team 成员到 N 个 |
 | `cleanup [N]` | 清理多余成员到 N 个（只移除本地管理的） |
-| `sync` | 手动同步认证文件到 CPA |
-| `api` | 启动 HTTP API 服务器（默认端口 8787） |
+| `sync` | 手动同步认证文件到 CPA（覆盖上传） |
+| `admin-login` | 交互式完成管理员主号登录 |
+| `main-codex-sync` | 交互式同步主号 Codex 到 CPA |
 
 **日常只需一条命令：**
 
@@ -95,117 +102,79 @@ uv run autoteam <command> [args]
 uv run autoteam rotate
 ```
 
-首次配置管理员主号也可以直接用命令行：
-
-```bash
-uv run autoteam admin-login
-uv run autoteam admin-login --email you@example.com
-uv run autoteam main-codex-sync
-```
-
-### 主号 Codex Sync
-
-`main-codex-sync` 用于把管理员主号的 Codex 登录态单独同步到 CPA。
-
-- 前置条件：先完成 `admin-login`，让系统拿到主号邮箱、session token、workspace/account ID
-- 交互方式：命令行或 Web 都可以发起；如果流程要求密码或邮箱验证码，会继续提示输入
-- 同步结果：成功后会生成 `auths/codex-main-*.json`，并立即推送到 CPA
-- 作用范围：这是主号专用的 Codex 认证，不会加入账号轮转池，也不会写入普通子号的账号列表
-
-普通的 `sync` 只是把当前已有的认证文件重新推送到 CPA；`main-codex-sync` 则是在需要时重新完成一次主号 Codex 登录，并把新的主号认证同步过去。
-
-### HTTP API
-
-启动 API 服务器后，所有管理功能均可通过 HTTP 调用，方便对接定时任务平台、Web 面板等外部系统。
+### Web 管理面板
 
 ```bash
 uv run autoteam api                # 默认 0.0.0.0:8787
 uv run autoteam api --port 9000   # 自定义端口
 ```
 
-启动后访问 `http://localhost:8787/docs` 查看交互式 API 文档（Swagger UI）。
+启动后访问 `http://localhost:8787`，首次需要输入 API Key（启动时自动生成并显示）。
 
-#### 端点一览
+**面板页面：**
 
-**同步端点（即时返回）**
+| 页面 | 功能 |
+|------|------|
+| 📊 仪表盘 | 账号统计卡片 + 账号表格（实时额度、状态、登录/移出/删除操作） |
+| 👥 Team 成员 | 全部 Team 成员列表（含手动添加的外部成员），10 分钟缓存 |
+| ⚡ 操作 & 任务 | 一键执行轮转/检查/补满/添加/清理/同步，任务历史和状态跟踪 |
+| 📋 日志 | 实时日志查看器，3 秒刷新，自动滚动 |
+| ⚙️ 设置 | 管理员登录、主号 Codex 同步、巡检参数配置 |
+
+适配桌面端（侧边栏）和手机端（底部 tab 栏）。
+
+### HTTP API
+
+启动后访问 `http://localhost:8787/docs` 查看 Swagger 文档。所有 `/api/*` 端点需要 `Authorization: Bearer <API_KEY>` 认证。
+
+<details>
+<summary>端点一览</summary>
+
+**即时返回**
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/status` | 账号状态 + active 实时额度 |
+| GET | `/api/auth/check` | 验证 API Key |
+| GET | `/api/status` | 账号状态 + 实时额度 |
 | GET | `/api/accounts` | 所有账号列表 |
-| GET | `/api/accounts/active` | 活跃账号 |
-| GET | `/api/accounts/standby` | 待命账号 |
-| GET | `/api/admin/status` | 当前管理员登录状态 |
-| POST | `/api/admin/login/start` | 开始管理员登录 `{"email":"admin@example.com"}` |
-| POST | `/api/admin/login/password` | 提交密码 `{"password":"..."}` |
-| POST | `/api/admin/login/code` | 提交邮箱验证码 `{"code":"123456"}` |
-| POST | `/api/admin/login/workspace` | 提交组织选择 `{"option_id":"0"}` |
-| POST | `/api/admin/login/cancel` | 取消正在进行的管理员登录 |
-| POST | `/api/admin/logout` | 清除已保存的管理员登录态 |
-| GET | `/api/main-codex/status` | 当前主号 Codex 同步状态 |
-| POST | `/api/main-codex/start` | 开始主号 Codex 同步 |
-| POST | `/api/main-codex/password` | 提交主号密码 `{"password":"..."}` |
-| POST | `/api/main-codex/code` | 提交主号验证码 `{"code":"123456"}` |
-| POST | `/api/main-codex/cancel` | 取消正在进行的主号 Codex 同步 |
+| GET | `/api/team/members` | Team 全部成员（含外部） |
+| GET | `/api/logs` | 最近日志 |
+| GET | `/api/config/auto-check` | 巡检配置 |
+| PUT | `/api/config/auto-check` | 修改巡检配置 |
 | POST | `/api/sync` | 同步认证文件到 CPA |
-| POST | `/api/sync/main-codex` | 兼容旧接口，等价于 `/api/main-codex/start` |
-| GET | `/api/cpa/files` | CPA 认证文件列表 |
-| GET | `/api/config/auto-check` | 获取巡检配置 |
-| PUT | `/api/config/auto-check` | 修改巡检配置（运行时生效） |
+| POST | `/api/accounts/login` | 触发单账号 Codex 登录 |
+| POST | `/api/accounts/{email}/kick` | 移出 Team |
+| DELETE | `/api/accounts/{email}` | 删除账号 |
 
-**后台任务端点（返回 task_id，轮询获取结果）**
+**后台任务（返回 task_id）**
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/tasks/rotate` | 智能轮转 `{"target": 5}` |
-| POST | `/api/tasks/check` | 检查所有 active 额度 |
+| POST | `/api/tasks/rotate` | 智能轮转 |
+| POST | `/api/tasks/check` | 检查额度 |
 | POST | `/api/tasks/add` | 添加新账号 |
-| POST | `/api/tasks/fill` | 补满成员 `{"target": 5}` |
-| POST | `/api/tasks/cleanup` | 清理多余成员 `{"max_seats": null}` |
-| GET | `/api/tasks` | 查看所有任务 |
-| GET | `/api/tasks/{task_id}` | 查看任务状态和结果 |
+| POST | `/api/tasks/fill` | 补满成员 |
+| POST | `/api/tasks/cleanup` | 清理成员 |
+| GET | `/api/tasks` | 任务列表 |
+| GET | `/api/tasks/{task_id}` | 任务详情 |
 
-#### 调用示例
+**管理员登录 / 主号 Codex**
 
-```bash
-# 查看账号状态
-curl http://localhost:8787/api/status
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/admin/status` | 管理员状态 |
+| POST | `/api/admin/login/start` | 开始登录 |
+| POST | `/api/admin/login/password` | 提交密码 |
+| POST | `/api/admin/login/code` | 提交验证码 |
+| POST | `/api/admin/login/workspace` | 选择组织 |
+| POST | `/api/admin/login/cancel` | 取消登录 |
+| POST | `/api/admin/logout` | 清除登录态 |
+| POST | `/api/main-codex/start` | 开始主号 Codex 同步 |
+| POST | `/api/main-codex/password` | 提交密码 |
+| POST | `/api/main-codex/code` | 提交验证码 |
+| POST | `/api/main-codex/cancel` | 取消同步 |
 
-# 触发轮转（后台执行）
-curl -X POST http://localhost:8787/api/tasks/rotate \
-  -H 'Content-Type: application/json' \
-  -d '{"target": 5}'
-# 返回: {"task_id": "a1b2c3d4e5f6", "status": "pending", ...}
-
-# 查看任务进度
-curl http://localhost:8787/api/tasks/a1b2c3d4e5f6
-# 返回: {"task_id": "...", "status": "completed", "result": ..., ...}
-```
-
-> 后台任务使用线程锁防止并发冲突，同一时间只允许一个 Playwright 操作。若有任务正在执行，新请求返回 `409 Conflict`。
-
-### Web 管理面板
-
-启动 API 后直接访问 `http://localhost:8787` 即可打开 Web 面板，无需额外安装 Node.js（构建产物已内置）。
-
-**面板功能：**
-
-- **管理员登录** — 首次启动直接输入主号邮箱，按页面提示继续提交密码或邮箱验证码，成功后自动保存登录态
-- **Dashboard** — 账号统计卡片（活跃/待命/用完/总计）+ 账号表格（实时额度、颜色标签、重置时间）
-- **操作面板** — 一键执行轮转、检查额度、补满、添加、清理、同步 CPA、同步主号 Codex；未完成管理员登录时自动禁用
-- **任务历史** — 所有任务记录，实时状态跟踪（等待中/执行中/已完成/失败），耗时统计
-- **巡检设置** — 可视化配置巡检间隔、额度阈值、触发账号数，修改后运行时立即生效
-
-面板每 10 分钟自动刷新数据，有任务执行或管理员登录进行中时切换为 10 秒轮询，结束后自动恢复。
-
-**前端开发（可选）：**
-
-```bash
-cd web
-npm install
-npm run dev       # Vite dev server :5173，自动代理 /api → :8787
-npm run build     # 构建产物输出到 src/autoteam/web/dist/
-```
+</details>
 
 ## 工作原理
 
@@ -263,23 +232,29 @@ autoteam/
 ├── pyproject.toml              # 项目配置 + 依赖
 ├── setup.sh                    # 一键安装脚本
 ├── .env.example                # 配置模板
+├── .pre-commit-config.yaml     # pre-commit (ruff lint + format)
+├── ruff.toml                   # ruff 配置
+├── .github/workflows/          # GitHub Actions CI
 ├── src/autoteam/
 │   ├── manager.py              # CLI 入口，所有命令
-│   ├── api.py                  # HTTP API（FastAPI）
+│   ├── api.py                  # HTTP API + 鉴权 + 自动巡检
+│   ├── setup_wizard.py         # 首次配置向导 + 连通性验证
+│   ├── admin_state.py          # 管理员状态管理 (state.json)
 │   ├── config.py               # 配置加载（从 .env）
 │   ├── display.py              # 虚拟显示器自动设置
 │   ├── accounts.py             # 账号池持久化管理
-│   ├── chatgpt_api.py          # ChatGPT 内部 API
+│   ├── account_ops.py          # 账号删除/清理操作
+│   ├── chatgpt_api.py          # ChatGPT 内部 API + 管理员登录
 │   ├── cloudmail.py            # CloudMail API 客户端
-│   ├── codex_auth.py           # Codex OAuth + token 管理
+│   ├── codex_auth.py           # Codex OAuth + token + 主号同步
 │   ├── cpa_sync.py             # CPA 认证文件同步
 │   ├── invite.py               # 注册流程自动化
 │   └── web/dist/               # 前端构建产物（已内置）
 └── web/                        # 前端源码（Vue 3 + Vite + Tailwind）
     ├── src/
-    │   ├── App.vue             # 主组件
+    │   ├── App.vue             # 主组件 + 鉴权 + 路由
     │   ├── api.js              # API 调用封装
-    │   └── components/         # Dashboard / TaskPanel / TaskHistory
+    │   └── components/         # Sidebar / Dashboard / TeamMembers / TasksPage / LogViewer / Settings
     ├── package.json
     └── vite.config.js
 ```
@@ -315,6 +290,15 @@ autoteam/
 | xvfb | Linux 无头服务器虚拟显示 |
 | [CloudMail](https://github.com/maillab/cloud-mail) | Cloudflare Workers 临时邮箱服务 |
 | [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) | Codex 代理，认证文件同步目标 |
+
+**前端开发（可选）：**
+
+```bash
+cd web
+npm install
+npm run dev       # Vite dev server :5173，自动代理 /api → :8787
+npm run build     # 构建产物输出到 src/autoteam/web/dist/
+```
 
 ## 友情链接
 
