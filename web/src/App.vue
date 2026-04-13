@@ -27,28 +27,19 @@
   <!-- 主面板 -->
   <div v-else class="flex min-h-screen">
     <!-- 侧边栏 -->
-    <Sidebar :active="currentPage" @navigate="currentPage = $event" />
+    <Sidebar :active="currentPage" :loading="loading" :auth-required="authRequired"
+      @navigate="currentPage = $event" @refresh="refresh" @logout="doLogout" />
 
     <!-- 主内容区 -->
     <div class="flex-1 p-4 md:p-6 overflow-y-auto pb-20 md:pb-6">
-      <!-- 顶部状态栏 -->
-      <div class="flex items-center justify-end gap-3 mb-6">
-        <span v-if="busyTask" class="flex items-center gap-2 text-sm text-yellow-400">
-          <span class="animate-spin inline-block w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full"></span>
-          {{ busyTask.command === 'admin-login'
-            ? '管理员登录中...'
-            : busyTask.command === 'main-codex-sync'
-              ? '主号 Codex 同步中...'
-              : `${busyTask.command} 执行中...` }}
-        </span>
-        <button @click="refresh" :disabled="loading"
-          class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-sm rounded-lg border border-gray-700 transition disabled:opacity-50">
-          {{ loading ? '刷新中...' : '刷新' }}
-        </button>
-        <button v-if="authRequired" @click="doLogout"
-          class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-sm rounded-lg border border-gray-700 transition text-gray-400 hover:text-white">
-          登出
-        </button>
+      <!-- 任务执行中提示 -->
+      <div v-if="busyTask" class="flex items-center gap-2 text-sm text-yellow-400 mb-4">
+        <span class="animate-spin inline-block w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full"></span>
+        {{ busyTask.command === 'admin-login'
+          ? '管理员登录中...'
+          : busyTask.command === 'main-codex-sync'
+            ? '主号 Codex 同步中...'
+            : `${busyTask.command} 执行中...` }}
       </div>
 
       <!-- 页面内容 -->

@@ -11,8 +11,12 @@
 
     <!-- 账号表格 -->
     <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-      <div class="px-4 py-3 border-b border-gray-800">
+      <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
         <h2 class="text-lg font-semibold text-white">账号列表</h2>
+        <button @click="syncAccounts" :disabled="syncing"
+          class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs rounded-lg border border-gray-700 transition disabled:opacity-50 text-gray-400 hover:text-white">
+          {{ syncing ? '同步中...' : '同步账号' }}
+        </button>
       </div>
       <div v-if="message" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border" :class="messageClass">
         {{ message }}
@@ -117,6 +121,7 @@ const emit = defineEmits(['refresh'])
 
 const actionEmail = ref('')
 const actionType = ref('')
+const syncing = ref(false)
 const message = ref('')
 const messageClass = ref('')
 const adminReady = computed(() => !!props.adminStatus?.configured)
@@ -181,6 +186,23 @@ function pctColor(val) {
   if (val > 30) return 'text-green-400'
   if (val > 0) return 'text-yellow-400'
   return 'text-red-400'
+}
+
+async function syncAccounts() {
+  syncing.value = true
+  message.value = ''
+  try {
+    const result = await api.postSyncAccounts()
+    message.value = result.message || '同步完成'
+    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    emit('refresh')
+  } catch (e) {
+    message.value = e.message
+    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+  } finally {
+    syncing.value = false
+    setTimeout(() => { message.value = '' }, 8000)
+  }
 }
 
 async function loginAccount(email) {
