@@ -107,11 +107,62 @@ def check_and_setup(interactive: bool = True) -> bool:
 
     print("\n配置已保存到 .env\n")
 
-    # 重新加载 config 模块
+    # 重新加载 config 和依赖模块
     import importlib
 
     import autoteam.config
 
     importlib.reload(autoteam.config)
+    try:
+        import autoteam.cloudmail
+
+        importlib.reload(autoteam.cloudmail)
+    except Exception:
+        pass
+
+    # 验证 CloudMail 配置
+    _verify_cloudmail()
 
     return True
+
+
+def _verify_cloudmail():
+    """验证 CloudMail 配置是否正确：登录 + 创建测试邮箱 + 删除"""
+    base_url = os.environ.get("CLOUDMAIL_BASE_URL", "")
+    email = os.environ.get("CLOUDMAIL_EMAIL", "")
+    password = os.environ.get("CLOUDMAIL_PASSWORD", "")
+    domain = os.environ.get("CLOUDMAIL_DOMAIN", "")
+
+    if not all([base_url, email, password, domain]):
+        return
+
+    print("验证 CloudMail 配置...")
+
+    try:
+        from autoteam.cloudmail import CloudMailClient
+
+        client = CloudMailClient()
+        client.login()
+        print("  [1/3] 登录成功")
+    except Exception as e:
+        print(f"  [1/3] 登录失败: {e}")
+        print("  请检查 CLOUDMAIL_BASE_URL、CLOUDMAIL_EMAIL、CLOUDMAIL_PASSWORD 是否正确")
+        return
+
+    test_account_id = None
+    try:
+        test_account_id, test_email = client.create_temp_email(prefix="autoteam-test")
+        print(f"  [2/3] 创建测试邮箱成功: {test_email}")
+    except Exception as e:
+        print(f"  [2/3] 创建邮箱失败: {e}")
+        print("  请检查 CLOUDMAIL_DOMAIN 是否正确")
+        return
+
+    try:
+        if test_account_id:
+            client.delete_account(test_account_id)
+            print("  [3/3] 测试邮箱已清理")
+    except Exception as e:
+        print(f"  [3/3] 清理测试邮箱失败: {e}（不影响使用）")
+
+    print("  CloudMail 配置验证通过\n")
