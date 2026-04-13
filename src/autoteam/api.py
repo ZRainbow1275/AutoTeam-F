@@ -1267,7 +1267,15 @@ if DIST_DIR.exists():
 class _QuietAccessLog(logging.Filter):
     """过滤前端轮询产生的高频访问日志"""
 
-    _quiet_paths = ("/api/status", "/api/tasks", "/api/config/auto-check")
+    _quiet_paths = (
+        "/api/status",
+        "/api/tasks",
+        "/api/config/auto-check",
+        "/api/admin/status",
+        "/api/main-codex/status",
+        "/api/auth/check",
+        "/api/setup/status",
+    )
 
     def filter(self, record):
         msg = record.getMessage()
