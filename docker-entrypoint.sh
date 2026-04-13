@@ -6,8 +6,9 @@ rm -f /tmp/.X99-lock
 Xvfb :99 -screen 0 1280x800x24 &
 export DISPLAY=:99
 
-# 确保数据目录存在
+# 确保数据目录存在且可写
 mkdir -p /app/data /app/data/auths /app/data/screenshots
+chmod -R 777 /app/data
 
 # 数据文件：无条件软链到 data/（确保所有写入都持久化）
 for f in .env accounts.json state.json; do
