@@ -672,50 +672,26 @@ def login_codex_via_browser(email, password, mail_client=None):
                 if otp_input.is_visible(timeout=2000) and mail_client:
                     import re as _re3
 
-                    # 记录当前时间，只接受之后收到的邮件
-                    from datetime import datetime
-
-                    _otp_request_time = datetime.utcnow()
-
-                    # 提前 30 秒容差，避免时钟偏差导致漏掉刚发的邮件
-                    from datetime import timedelta
-
-                    _otp_cutoff = _otp_request_time - timedelta(seconds=30)
-                    logger.info(
-                        "[Codex] 需要邮箱验证码 (step %d)，等待 %s 之后的新邮件...",
-                        step + 1,
-                        _otp_cutoff.strftime("%H:%M:%S"),
-                    )
+                    logger.info("[Codex] 需要邮箱验证码 (step %d)...", step + 1)
                     otp = None
                     t0 = time.time()
                     while time.time() - t0 < 120:
                         for em in mail_client.search_emails_by_recipient(email, size=10):
-                            # 只接受 OpenAI 发的邮件
                             sender = (em.get("sendEmail") or "").lower()
                             if "openai" not in sender and "chatgpt" not in sender:
                                 continue
                             subj = (em.get("subject") or "").lower()
                             if "invited" in subj or "invitation" in subj:
                                 continue
-                            # 检查邮件时间
-                            create_time_str = em.get("createTime", "")
-                            if create_time_str:
-                                try:
-                                    mail_time = datetime.strptime(create_time_str, "%Y-%m-%d %H:%M:%S")
-                                    if mail_time < _otp_cutoff:
-                                        continue
-                                except Exception:
-                                    pass
                             text = em.get("text", "") or em.get("content", "")
                             m = _re3.search(r"\b(\d{6})\b", text)
-                            if m:
+                            if m and m.group(1) not in _used_codes:
                                 otp = m.group(1)
                                 break
                         if otp:
                             break
                         time.sleep(3)
                     if otp:
-                        _used_codes.add(otp)
                         otp_input.fill(otp)
                         time.sleep(0.5)
                         page.locator(
@@ -723,7 +699,16 @@ def login_codex_via_browser(email, password, mail_client=None):
                         ).first.click()
                         time.sleep(5)
                         logger.info("[Codex] 已输入验证码: %s", otp)
-                        continue  # 重新循环检查下一个页面
+                        # 检查验证码是否有效——如果页面还在验证码输入，说明无效
+                        try:
+                            still_code = page.locator('input[name="code"], input[inputmode="numeric"]').first
+                            if still_code.is_visible(timeout=2000):
+                                logger.warning("[Codex] 验证码 %s 无效，标记并跳过", otp)
+                                _used_codes.add(otp)
+                                # 不 continue，让循环重新检测当前页面状态
+                        except Exception:
+                            pass
+                        continue
             except Exception:
                 pass
 
