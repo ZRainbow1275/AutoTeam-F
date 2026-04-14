@@ -9,7 +9,7 @@ dependencies = [
     "requests>=2.28.0",
     "rich>=14.3.4",
     "uvicorn[standard]>=0.44.0",
-    "xvfbwrapper>=0.2.9",
+    "xvfbwrapper>=0.2.9; sys_platform == 'linux'",
 ]
 
 [project.scripts]
