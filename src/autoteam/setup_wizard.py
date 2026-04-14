@@ -7,7 +7,7 @@ import secrets
 import sys
 
 from autoteam.config import PROJECT_ROOT
-from autoteam.textio import read_text, write_text
+from autoteam.textio import parse_env_line, read_text, write_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +31,10 @@ def _read_env() -> dict[str, str]:
     result = {}
     if ENV_FILE.exists():
         for line in read_text(ENV_FILE).splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                result[key.strip()] = value.strip()
+            parsed = parse_env_line(line)
+            if parsed:
+                key, value = parsed
+                result[key] = value
     return result
 
 
@@ -106,7 +106,11 @@ def check_and_setup(interactive: bool = True) -> bool:
         if key == "API_KEY":
             hint = " [回车自动生成]"
 
-        value = input(f"  {prompt}{hint}: ").strip()
+        try:
+            value = input(f"  {prompt}{hint}: ").strip()
+        except KeyboardInterrupt:
+            print("\n\n已取消配置。")
+            raise SystemExit(130)
 
         if not value:
             if key == "API_KEY":
