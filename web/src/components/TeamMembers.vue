@@ -30,6 +30,7 @@
                 <th class="px-4 py-3 font-medium">角色</th>
                 <th class="px-4 py-3 font-medium">类型</th>
                 <th class="px-4 py-3 font-medium">来源</th>
+                <th class="px-4 py-3 font-medium text-right">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -40,9 +41,9 @@
                 <td class="px-4 py-3">
                   <span class="px-2 py-0.5 rounded text-xs font-medium"
                     :class="{
-                      'bg-purple-500/10 text-purple-400': m.role === 'owner',
-                      'bg-blue-500/10 text-blue-400': m.role === 'admin',
-                      'bg-gray-500/10 text-gray-300': m.role !== 'owner' && m.role !== 'admin',
+                      'bg-purple-500/10 text-purple-400': m.role === 'account-owner',
+                      'bg-blue-500/10 text-blue-400': m.role === 'account-admin',
+                      'bg-gray-500/10 text-gray-300': m.role !== 'account-owner' && m.role !== 'account-admin',
                     }">
                     {{ m.role || 'member' }}
                   </span>
@@ -57,6 +58,19 @@
                   <span class="text-xs" :class="m.is_local ? 'text-blue-400' : 'text-gray-500'">
                     {{ m.is_local ? '本地管理' : '外部' }}
                   </span>
+                </td>
+                <td class="px-4 py-3 text-right">
+                  <button
+                    v-if="m.role !== 'account-owner'"
+                    @click="removeMember(m)"
+                    :disabled="removingId === memberKey(m)"
+                    class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
+                    :class="removingId === memberKey(m)
+                      ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
+                      : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'"
+                  >
+                    {{ removingId === memberKey(m) ? '处理中...' : '移出' }}
+                  </button>
                 </td>
               </tr>
             </tbody>
@@ -82,6 +96,7 @@ import { api } from '../api.js'
 const data = ref(null)
 const loading = ref(false)
 const error = ref('')
+const removingId = ref('')
 
 const CACHE_KEY = 'autoteam_team_members'
 
@@ -105,6 +120,10 @@ function saveCache(d) {
   } catch {}
 }
 
+function memberKey(member) {
+  return `${member.type}:${member.user_id}:${member.email}`
+}
+
 async function fetchMembers() {
   loading.value = true
   error.value = ''
@@ -115,6 +134,30 @@ async function fetchMembers() {
     error.value = e.message
   } finally {
     loading.value = false
+  }
+}
+
+async function removeMember(member) {
+  const actionText = member.type === 'invite' ? '取消邀请' : '移出 Team'
+  const ok = window.confirm(`确认${actionText} ${member.email}？`)
+  if (!ok) return
+
+  removingId.value = memberKey(member)
+  error.value = ''
+  try {
+    await api.removeTeamMember({
+      email: member.email,
+      user_id: member.user_id,
+      type: member.type,
+    })
+    try {
+      localStorage.removeItem(CACHE_KEY)
+    } catch {}
+    await fetchMembers()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    removingId.value = ''
   }
 }
 

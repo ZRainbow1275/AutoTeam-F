@@ -336,6 +336,12 @@ class ManualAccountCallbackParams(BaseModel):
     redirect_url: str
 
 
+class TeamMemberRemoveParams(BaseModel):
+    email: str
+    user_id: str
+    type: str
+
+
 def _sanitize_account(acc: dict) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     return {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
@@ -1078,6 +1084,61 @@ def get_team_members():
                     }
                 )
             return {"members": result, "total": len(members), "invites": len(invites)}
+        finally:
+            chatgpt.stop()
+    finally:
+        _playwright_lock.release()
+
+
+@app.post("/api/team/members/remove")
+def post_team_member_remove(params: TeamMemberRemoveParams):
+    """移出 Team 成员或取消邀请。"""
+    from autoteam.admin_state import get_admin_session_token, get_chatgpt_account_id
+
+    if not get_admin_session_token() or not get_chatgpt_account_id():
+        raise HTTPException(status_code=400, detail="请先完成管理员登录")
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再操作"))
+
+    try:
+        from autoteam.accounts import find_account, load_accounts, update_account
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+
+        email = params.email.strip().lower()
+        user_id = params.user_id.strip()
+        member_type = params.type.strip().lower()
+
+        if not email or not user_id:
+            raise HTTPException(status_code=400, detail="缺少必要参数")
+        if member_type not in ("member", "invite"):
+            raise HTTPException(status_code=400, detail="无效的成员类型")
+
+        account_id = get_chatgpt_account_id()
+        chatgpt = ChatGPTTeamAPI()
+        chatgpt.start()
+        try:
+            if member_type == "invite":
+                path = f"/backend-api/accounts/{account_id}/invites/{user_id}"
+                action_text = "取消邀请"
+            else:
+                path = f"/backend-api/accounts/{account_id}/users/{user_id}"
+                action_text = "移出 Team"
+
+            result = chatgpt._api_fetch("DELETE", path)
+            if result["status"] not in (200, 204):
+                raise HTTPException(status_code=500, detail=f"{action_text}失败: HTTP {result['status']}")
+
+            accounts = load_accounts()
+            acc = find_account(accounts, email)
+            if acc:
+                update_account(email, status="standby")
+
+            return {
+                "message": f"已{action_text}: {email}",
+                "email": email,
+                "type": member_type,
+            }
         finally:
             chatgpt.stop()
     finally:

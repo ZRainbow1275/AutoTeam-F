@@ -1,8 +1,11 @@
 """CPA (CLIProxyAPI) 认证文件同步 - 保持本地 codex 认证文件与 CPA 一致"""
 
+import base64
 import json
 import logging
 import time
+from datetime import datetime
+from hashlib import md5
 from pathlib import Path
 
 import requests
@@ -83,12 +86,224 @@ def download_from_cpa(name):
     return None
 
 
-def _write_auth_text(path, content):
-    write_text(path, content)
+def _parse_expired_timestamp(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not value:
+        return time.time() + 3600
+    text = str(value).strip()
     try:
-        path.chmod(0o600)
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return time.time() + 3600
+
+
+def _parse_optional_timestamp(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not value:
+        return 0.0
+    text = str(value).strip()
+    try:
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _parse_jwt_payload(token):
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+
+
+def _bundle_from_auth_data(auth_data, fallback_name=""):
+    id_token = auth_data.get("id_token", "")
+    claims = _parse_jwt_payload(id_token) if id_token else {}
+    auth_claims = claims.get("https://api.openai.com/auth", {}) if isinstance(claims, dict) else {}
+
+    plan_type = auth_claims.get("chatgpt_plan_type", "")
+    if not plan_type and "-team" in fallback_name:
+        plan_type = "team"
+    if not plan_type and "-plus" in fallback_name:
+        plan_type = "plus"
+    if not plan_type and "-free" in fallback_name:
+        plan_type = "free"
+    if not plan_type:
+        plan_type = "unknown"
+
+    return {
+        "id_token": id_token,
+        "access_token": auth_data.get("access_token", ""),
+        "refresh_token": auth_data.get("refresh_token", ""),
+        "account_id": auth_data.get("account_id", ""),
+        "email": auth_data.get("email", ""),
+        "plan_type": plan_type,
+        "expired": _parse_expired_timestamp(auth_data.get("expired")),
+        "last_refresh_ts": _parse_optional_timestamp(auth_data.get("last_refresh")),
+    }
+
+
+def _normalized_auth_path(bundle, main=False):
+    email = bundle.get("email", "")
+    account_id = bundle.get("account_id", "")
+    if main:
+        suffix = account_id or md5(email.encode()).hexdigest()[:8]
+        return AUTH_DIR / f"codex-main-{suffix}.json"
+    plan_type = bundle.get("plan_type", "unknown")
+    hash_id = md5(account_id.encode()).hexdigest()[:8] if account_id else "unknown"
+    return AUTH_DIR / f"codex-{email}-{plan_type}-{hash_id}.json"
+
+
+def _auth_identity(bundle, main=False):
+    if main:
+        return ("main", bundle.get("account_id") or bundle.get("email") or "")
+    return ("codex", (bundle.get("email") or "").lower(), bundle.get("account_id") or "")
+
+
+def _candidate_score(auth_data, bundle, name, main=False):
+    canonical_name = _normalized_auth_path(bundle, main=main).name
+    return (
+        1 if name == canonical_name else 0,
+        bundle.get("last_refresh_ts", _parse_optional_timestamp(auth_data.get("last_refresh"))),
+        _parse_expired_timestamp(auth_data.get("expired")),
+        len(auth_data.get("refresh_token") or ""),
+    )
+
+
+def _write_auth_file(filepath, bundle):
+    auth_data = {
+        "type": "codex",
+        "id_token": bundle.get("id_token", ""),
+        "access_token": bundle.get("access_token", ""),
+        "refresh_token": bundle.get("refresh_token", ""),
+        "account_id": bundle.get("account_id", ""),
+        "email": bundle.get("email", ""),
+        "expired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(bundle.get("expired", 0))),
+        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(bundle.get("last_refresh_ts", time.time()))),
+    }
+    write_text(filepath, json.dumps(auth_data, indent=2))
+    try:
+        filepath.chmod(0o600)
     except Exception:
         pass
+    return filepath
+
+
+def _save_normalized_auth_file(bundle, main=False):
+    filepath = _normalized_auth_path(bundle, main=main)
+
+    if main:
+        for old in AUTH_DIR.glob("codex-main-*.json"):
+            if old != filepath and old.exists():
+                old.unlink()
+    else:
+        email = bundle.get("email", "")
+        for old in AUTH_DIR.glob(f"codex-{email}-*.json"):
+            if old != filepath and old.exists():
+                old.unlink()
+
+    return _write_auth_file(filepath, bundle)
+
+
+def _load_local_best_candidate(identity_key):
+    """读取本地同 identity 的最佳候选认证文件。"""
+    best = None
+    for path in AUTH_DIR.glob("codex-*.json"):
+        if not path.is_file():
+            continue
+        try:
+            auth_data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if auth_data.get("type") != "codex":
+            continue
+        main = path.name.startswith("codex-main-")
+        bundle = _bundle_from_auth_data(auth_data, fallback_name=path.name)
+        if _auth_identity(bundle, main=main) != identity_key:
+            continue
+        candidate = {
+            "path": path,
+            "auth_data": auth_data,
+            "bundle": bundle,
+            "main": main,
+        }
+        if best is None or _candidate_score(
+            candidate["auth_data"], candidate["bundle"], candidate["path"].name, candidate["main"]
+        ) > _candidate_score(best["auth_data"], best["bundle"], best["path"].name, best["main"]):
+            best = candidate
+    return best
+
+
+def _cleanup_local_duplicates(accounts=None):
+    """清理本地同账号重复认证文件，只保留一个规范文件。"""
+    grouped = {}
+    for path in AUTH_DIR.glob("codex-*.json"):
+        if not path.is_file():
+            continue
+        try:
+            auth_data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if auth_data.get("type") != "codex":
+            continue
+        main = path.name.startswith("codex-main-")
+        bundle = _bundle_from_auth_data(auth_data, fallback_name=path.name)
+        key = _auth_identity(bundle, main=main)
+        grouped.setdefault(key, []).append(
+            {
+                "path": path,
+                "auth_data": auth_data,
+                "bundle": bundle,
+                "main": main,
+            }
+        )
+
+    canonical_map = {}
+    removed = 0
+    for items in grouped.values():
+        if not items:
+            continue
+        winner = max(
+            items, key=lambda item: _candidate_score(item["auth_data"], item["bundle"], item["path"].name, item["main"])
+        )
+        canonical_path = Path(_save_normalized_auth_file(winner["bundle"], main=winner["main"]))
+        canonical_map[_auth_identity(winner["bundle"], main=winner["main"])] = canonical_path
+        for item in items:
+            if item["path"] != canonical_path and item["path"].exists():
+                item["path"].unlink()
+                removed += 1
+
+    if accounts is not None:
+        changed = False
+        for acc in accounts:
+            auth_path = acc.get("auth_file")
+            if not auth_path:
+                continue
+            try:
+                path = Path(auth_path)
+                if not path.exists():
+                    continue
+                auth_data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            bundle = _bundle_from_auth_data(auth_data, fallback_name=path.name)
+            canonical_path = canonical_map.get(_auth_identity(bundle, main=False))
+            if canonical_path and acc.get("auth_file") != str(canonical_path.resolve()):
+                acc["auth_file"] = str(canonical_path.resolve())
+                changed = True
+        return removed, changed
+
+    return removed, False
 
 
 def sync_from_cpa():
@@ -111,6 +326,12 @@ def sync_from_cpa():
     added_accounts = 0
     updated_accounts = 0
     skipped = 0
+    cpa_duplicates_deleted = 0
+    local_kept_newer = 0
+
+    local_duplicates_deleted, accounts_path_repaired = _cleanup_local_duplicates(accounts)
+    if accounts_path_repaired:
+        save_accounts(accounts)
 
     cpa_files = list_cpa_files()
     if not cpa_files:
@@ -121,9 +342,13 @@ def sync_from_cpa():
             "accounts_added": 0,
             "accounts_updated": 0,
             "skipped": 0,
+            "cpa_duplicates_deleted": 0,
+            "local_duplicates_deleted": local_duplicates_deleted,
+            "local_kept_newer": 0,
             "total": 0,
         }
 
+    candidates = []
     for item in cpa_files:
         name = (item.get("name") or "").strip()
         if not name or not name.endswith(".json") or not name.startswith("codex-"):
@@ -147,33 +372,99 @@ def sync_from_cpa():
             skipped += 1
             continue
 
-        local_path = AUTH_DIR / name
-        existed = local_path.exists()
-        previous = None
-        if existed:
-            try:
-                previous = local_path.read_text(encoding="utf-8")
-            except Exception:
-                previous = None
+        bundle = _bundle_from_auth_data(auth_data, fallback_name=name)
+        email = (bundle.get("email") or item.get("email") or "").lower().strip()
+        bundle["email"] = email
 
-        if not existed:
-            imported_files += 1
-        elif previous != content:
-            updated_files += 1
-
-        _write_auth_text(local_path, content)
-
-        email = (auth_data.get("email") or item.get("email") or "").lower().strip()
-        if name.startswith("codex-main-") or not email:
+        if not email and not name.startswith("codex-main-"):
+            logger.info("[CPA] 跳过缺少邮箱的文件: %s", name)
             continue
 
-        # 清理同邮箱的旧本地文件，保留 CPA 当前下载的版本
-        for old in AUTH_DIR.glob(f"codex-{email}-*.json"):
-            if old.name != name and old.exists():
-                old.unlink()
+        candidates.append(
+            {
+                "name": name,
+                "auth_data": auth_data,
+                "bundle": bundle,
+                "main": name.startswith("codex-main-"),
+            }
+        )
+
+    grouped = {}
+    for item in candidates:
+        grouped.setdefault(_auth_identity(item["bundle"], main=item["main"]), []).append(item)
+
+    for items in grouped.values():
+        winner = max(
+            items,
+            key=lambda item: _candidate_score(item["auth_data"], item["bundle"], item["name"], main=item["main"]),
+        )
+        for item in items:
+            if item is winner:
+                continue
+            if delete_from_cpa(item["name"]):
+                cpa_duplicates_deleted += 1
+
+        name = winner["name"]
+        bundle = winner["bundle"]
+        email = bundle.get("email", "")
+        identity_key = _auth_identity(bundle, main=winner["main"])
+        local_best = _load_local_best_candidate(identity_key)
+        cpa_score = _candidate_score(winner["auth_data"], bundle, name, main=winner["main"])
+        local_score = None
+        if local_best:
+            local_score = _candidate_score(
+                local_best["auth_data"], local_best["bundle"], local_best["path"].name, main=local_best["main"]
+            )
+
+        if winner["main"]:
+            if local_best and local_score >= cpa_score:
+                local_kept_newer += 1
+                normalized_path = local_best["path"]
+            else:
+                normalized_path = _normalized_auth_path(bundle, main=True)
+                existed = normalized_path.exists()
+                previous = None
+                if existed:
+                    try:
+                        previous = normalized_path.read_text(encoding="utf-8")
+                    except Exception:
+                        previous = None
+
+                normalized_path = Path(_save_normalized_auth_file(bundle, main=True))
+                current = normalized_path.read_text(encoding="utf-8")
+                if not existed:
+                    imported_files += 1
+                elif previous != current:
+                    updated_files += 1
+            if normalized_path.name != name:
+                old_path = AUTH_DIR / name
+                if old_path.exists() and old_path != normalized_path:
+                    old_path.unlink()
+            continue
+
+        if local_best and local_score >= cpa_score:
+            local_kept_newer += 1
+            normalized_path = local_best["path"]
+        else:
+            normalized_path = _normalized_auth_path(bundle)
+            existed = normalized_path.exists()
+            previous = None
+            if existed:
+                try:
+                    previous = normalized_path.read_text(encoding="utf-8")
+                except Exception:
+                    previous = None
+
+            normalized_path = Path(_save_normalized_auth_file(bundle))
+            current = normalized_path.read_text(encoding="utf-8")
+
+            if not existed:
+                imported_files += 1
+            elif previous != current:
+                updated_files += 1
 
         acc = find_account(accounts, email)
-        resolved_path = str(local_path.resolve())
+        resolved_path = str(normalized_path.resolve())
         if acc:
             if acc.get("auth_file") != resolved_path:
                 acc["auth_file"] = resolved_path
@@ -199,12 +490,20 @@ def sync_from_cpa():
     if changed_accounts:
         save_accounts(accounts)
 
+    local_duplicates_deleted_after, accounts_path_repaired = _cleanup_local_duplicates(accounts)
+    local_duplicates_deleted += local_duplicates_deleted_after
+    if accounts_path_repaired:
+        save_accounts(accounts)
+
     logger.info(
-        "[CPA] 反向同步完成: 新增文件 %d, 更新文件 %d, 新增账号 %d, 更新账号 %d, 跳过 %d",
+        "[CPA] 反向同步完成: 新增文件 %d, 更新文件 %d, 新增账号 %d, 更新账号 %d, 保留本地较新 %d, CPA去重 %d, 本地去重 %d, 跳过 %d",
         imported_files,
         updated_files,
         added_accounts,
         updated_accounts,
+        local_kept_newer,
+        cpa_duplicates_deleted,
+        local_duplicates_deleted,
         skipped,
     )
     return {
@@ -213,6 +512,9 @@ def sync_from_cpa():
         "accounts_added": added_accounts,
         "accounts_updated": updated_accounts,
         "skipped": skipped,
+        "local_kept_newer": local_kept_newer,
+        "cpa_duplicates_deleted": cpa_duplicates_deleted,
+        "local_duplicates_deleted": local_duplicates_deleted,
         "total": len(cpa_files),
     }
 
@@ -227,6 +529,9 @@ def sync_to_cpa():
 
     accounts = load_accounts()
     local_emails = {a["email"].lower() for a in accounts}
+    local_duplicates_deleted, accounts_path_repaired = _cleanup_local_duplicates(accounts)
+    if accounts_path_repaired:
+        save_accounts(accounts)
 
     # 修复断裂的 auth_file 路径
     changed = False
@@ -270,7 +575,7 @@ def sync_to_cpa():
             if delete_from_cpa(name):
                 deleted += 1
 
-    logger.info("[CPA] 同步完成: 上传 %d, 删除 %d", uploaded, deleted)
+    logger.info("[CPA] 同步完成: 上传 %d, 删除 %d, 本地去重 %d", uploaded, deleted, local_duplicates_deleted)
 
     # 最终状态
     final_cpa = list_cpa_files()

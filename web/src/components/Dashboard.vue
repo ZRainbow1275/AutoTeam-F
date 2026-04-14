@@ -60,6 +60,7 @@
               <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'weekly') }}</td>
               <td class="px-4 py-3 text-right space-x-2">
                 <button
+                  v-if="acc.status !== 'active'"
                   @click="loginAccount(acc.email)"
                   :disabled="actionDisabled || actionEmail === acc.email"
                   class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"

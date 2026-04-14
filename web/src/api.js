@@ -87,5 +87,6 @@ export const api = {
   setAutoCheckConfig: (cfg) => request('PUT', '/config/auto-check', cfg),
 
   getTeamMembers: () => request('GET', '/team/members'),
+  removeTeamMember: (payload) => request('POST', '/team/members/remove', payload),
   getLogs: (limit = 100, since = 0) => request('GET', `/logs?limit=${limit}&since=${since}`),
 }
