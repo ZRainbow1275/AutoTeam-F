@@ -716,20 +716,96 @@ def _is_email_in_team(email):
             chatgpt.stop()
 
 
+_DIRECT_EMAIL_SELECTORS = (
+    'input[name="email"], input[type="email"], input[id="email"], '
+    'input[autocomplete="email"], input[autocomplete="username"], '
+    'input[placeholder*="email" i], input[placeholder*="Email" i]'
+)
+_DIRECT_PASSWORD_SELECTORS = 'input[name="password"], input[type="password"]'
+_DIRECT_CODE_SELECTORS = 'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
+
+
+def _safe_invite_screenshot(page, name):
+    from autoteam.invite import screenshot
+
+    try:
+        screenshot(page, name)
+    except Exception as exc:
+        logger.debug("[直接注册] 截图失败 %s: %s", name, exc)
+
+
+def _page_excerpt(page, limit=240):
+    try:
+        return page.locator("body").inner_text(timeout=1500)[:limit].replace("\n", " ")
+    except Exception:
+        return ""
+
+
+def _detect_direct_register_step(page):
+    url = (page.url or "").lower()
+    if _is_google_redirect(page):
+        return "google"
+
+    try:
+        if page.locator(_DIRECT_PASSWORD_SELECTORS).first.is_visible(timeout=300):
+            return "password"
+    except Exception:
+        pass
+
+    try:
+        if page.locator(_DIRECT_CODE_SELECTORS).first.is_visible(timeout=300):
+            return "code"
+    except Exception:
+        pass
+
+    try:
+        if page.locator('input[name="name"], [role="spinbutton"]').first.is_visible(timeout=300):
+            return "profile"
+    except Exception:
+        pass
+
+    if "chatgpt.com" in url and "auth" not in url:
+        return "completed"
+
+    try:
+        if page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=300):
+            return "email"
+    except Exception:
+        pass
+
+    if "log-in-or-create-account" in url or url.endswith("/auth/login"):
+        return "email"
+    if "create-account" in url or "password" in url:
+        return "password"
+    return "unknown"
+
+
+def _wait_for_direct_register_step(page, allowed_steps, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        step = _detect_direct_register_step(page)
+        if step in allowed_steps:
+            return step
+        time.sleep(0.5)
+    return _detect_direct_register_step(page)
+
+
 def _register_direct_once(mail_client, email, password):
     """执行一次直接注册，返回是否完成注册并进入 Team。"""
     from playwright.sync_api import sync_playwright
-
-    from autoteam.invite import screenshot
 
     logger.info("[直接注册] %s", email)
     signup_url = "https://chatgpt.com/auth/login"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+        launch_kwargs = {
+            "headless": False,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
+        if sys.platform.startswith("win"):
+            launch_kwargs["slow_mo"] = 100
+
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -746,16 +822,11 @@ def _register_direct_once(mail_client, email, password):
             logger.info("[直接注册] 等待 Cloudflare... (%ds)", i * 5)
             time.sleep(5)
 
-        screenshot(page, "direct_01_login_page.png")
+        _safe_invite_screenshot(page, "direct_01_login_page.png")
 
         # OpenAI 首页有多种 A/B 测试变体，需要逐步找到邮箱输入框
-        _email_selectors = (
-            'input[name="email"], input[type="email"], input[id="email"], '
-            'input[autocomplete="email"], input[autocomplete="username"], '
-            'input[placeholder*="email" i], input[placeholder*="Email" i]'
-        )
         try:
-            email_visible = page.locator(_email_selectors).first.is_visible(timeout=3000)
+            email_visible = page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=3000)
             if not email_visible:
                 # 尝试按优先级点击各种按钮来展开/跳转到邮箱输入
                 for sel, desc in [
@@ -775,96 +846,143 @@ def _register_direct_once(mail_client, email, password):
                         if btn.is_visible(timeout=1000):
                             logger.info("[直接注册] 点击: %s", desc)
                             btn.click()
-                            time.sleep(3)
+                            time.sleep(2)
                             # 检查邮箱输入框是否出现了
-                            if page.locator(_email_selectors).first.is_visible(timeout=3000):
+                            step = _wait_for_direct_register_step(
+                                page,
+                                {"email", "password", "code", "profile", "completed", "google"},
+                                timeout=10,
+                            )
+                            if step != "unknown":
                                 break
                     except Exception:
                         continue
         except Exception:
             pass
 
-        screenshot(page, "direct_02_signup.png")
+        _safe_invite_screenshot(page, "direct_02_signup.png")
 
         logger.info("[直接注册] 输入邮箱: %s", email)
+        email_step = _wait_for_direct_register_step(
+            page,
+            {"email", "password", "code", "profile", "completed", "google"},
+            timeout=15,
+        )
+        logger.info("[直接注册] 邮箱步骤初始状态: %s | URL: %s", email_step, page.url)
+
+        if email_step == "google":
+            logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
+            browser.close()
+            return False
+        if email_step == "unknown":
+            logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
+
         try:
-            for attempt in range(2):
-                email_input = page.locator(
-                    'input[name="email"], input[type="email"], input[id="email"], '
-                    'input[autocomplete="email"], input[autocomplete="username"], '
-                    'input[placeholder*="email" i], input[placeholder*="Email" i]'
-                ).first
-                if not email_input.is_visible(timeout=5000):
+            for attempt in range(3):
+                step = _detect_direct_register_step(page)
+                if step != "email":
                     break
 
+                email_input = page.locator(_DIRECT_EMAIL_SELECTORS).first
+                email_input.wait_for(state="visible", timeout=5000)
                 email_input.fill(email)
                 time.sleep(0.5)
-                screenshot(page, f"direct_02b_email_filled_{attempt}.png")
-                logger.info("[直接注册] 邮箱已填入，点击 Continue...")
+                logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
+                _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
                 _click_primary_auth_button(page, email_input, ["Continue", "继续"])
-                time.sleep(5)
-                logger.info("[直接注册] 点击 Continue 后 URL: %s", page.url)
-                screenshot(page, f"direct_02c_after_continue_{attempt}.png")
 
-                if not _is_google_redirect(page):
+                next_step = _wait_for_direct_register_step(
+                    page,
+                    {"email", "password", "code", "profile", "completed", "google"},
+                    timeout=15,
+                )
+                logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
+                _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
+
+                if next_step == "google":
+                    _safe_invite_screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
+                    logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                    page.go_back(wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(2)
+                    continue
+                if next_step != "email":
                     break
 
-                screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
-                logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                page.go_back(wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-        except Exception:
-            pass
+                logger.warning(
+                    "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
+                    page.url,
+                    _page_excerpt(page),
+                )
+        except Exception as exc:
+            logger.warning("[直接注册] 邮箱步骤异常: %s | URL: %s", exc, page.url)
 
-        screenshot(page, "direct_03_after_email.png")
-        logger.info("[直接注册] 当前 URL: %s", page.url)
-        if _is_google_redirect(page):
+        _safe_invite_screenshot(page, "direct_03_after_email.png")
+        current_step = _detect_direct_register_step(page)
+        logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
+        if current_step == "google":
             logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
+        if current_step == "email":
+            logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
             return False
 
         # 等待页面跳转完成（可能跳到 create-account/password）
-        for _wait in range(10):
-            if "password" in page.url or page.locator('input[type="password"]').count() > 0:
-                break
-            time.sleep(1)
-        logger.info("[直接注册] 密码页检测 URL: %s", page.url)
-        screenshot(page, "direct_03b_before_password.png")
+        password_step = _wait_for_direct_register_step(
+            page,
+            {"password", "code", "profile", "completed", "google", "email"},
+            timeout=15,
+        )
+        logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
+        _safe_invite_screenshot(page, "direct_03b_before_password.png")
 
         try:
             for attempt in range(2):
-                pwd_input = page.locator('input[type="password"]').first
-                if not pwd_input.is_visible(timeout=10000):
+                if _detect_direct_register_step(page) != "password":
                     logger.info("[直接注册] 未检测到密码输入框，跳过")
                     break
 
+                pwd_input = page.locator(_DIRECT_PASSWORD_SELECTORS).first
+                pwd_input.wait_for(state="visible", timeout=10000)
                 logger.info("[直接注册] 设置密码")
                 pwd_input.fill(password)
                 time.sleep(0.5)
                 _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
-                time.sleep(5)
+                next_step = _wait_for_direct_register_step(
+                    page,
+                    {"password", "code", "profile", "completed", "google", "email"},
+                    timeout=15,
+                )
+                logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
 
-                if not _is_google_redirect(page):
+                if next_step == "google":
+                    _safe_invite_screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
+                    logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                    page.go_back(wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(2)
+                    continue
+                if next_step != "password":
                     break
+        except Exception as exc:
+            logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
 
-                screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
-                logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                page.go_back(wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-        except Exception:
-            pass
-
-        screenshot(page, "direct_04_after_password.png")
-        if _is_google_redirect(page):
+        _safe_invite_screenshot(page, "direct_04_after_password.png")
+        current_step = _detect_direct_register_step(page)
+        if current_step == "google":
             logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
+        if current_step == "email":
+            logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
             return False
 
         code_input = None
         try:
-            code_input = page.locator(
-                'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
-            ).first
+            code_input = page.locator(_DIRECT_CODE_SELECTORS).first
             if not code_input.is_visible(timeout=5000):
                 code_input = None
         except Exception:
@@ -901,7 +1019,7 @@ def _register_direct_once(mail_client, email, password):
                 browser.close()
                 return False
 
-        screenshot(page, "direct_05_after_code.png")
+        _safe_invite_screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
         name_input = page.locator('input[name="name"]').first
@@ -937,7 +1055,7 @@ def _register_direct_once(mail_client, email, password):
         except Exception:
             pass
 
-        screenshot(page, "direct_06_after_profile.png")
+        _safe_invite_screenshot(page, "direct_06_after_profile.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
         try:
@@ -948,7 +1066,7 @@ def _register_direct_once(mail_client, email, password):
         except Exception:
             pass
 
-        screenshot(page, "direct_07_final.png")
+        _safe_invite_screenshot(page, "direct_07_final.png")
 
         current_url = page.url
         success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
