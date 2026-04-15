@@ -48,11 +48,13 @@ from autoteam.codex_auth import (
     _click_primary_auth_button,
     _is_google_redirect,
     check_codex_quota,
+    get_saved_main_auth_file,
     login_codex_via_browser,
     refresh_access_token,
+    refresh_main_auth_file,
     save_auth_file,
 )
-from autoteam.cpa_sync import sync_from_cpa, sync_to_cpa
+from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
 from autoteam.textio import read_text, write_text
 
 logger = logging.getLogger(__name__)
@@ -741,19 +743,156 @@ def _page_excerpt(page, limit=240):
         return ""
 
 
+def _first_visible_editable_locator(page, selectors, timeout=800):
+    try:
+        locator = page.locator(selectors).first
+        if not locator.is_visible(timeout=timeout):
+            return None
+        if locator.is_editable(timeout=timeout):
+            return locator
+    except Exception:
+        return None
+    return None
+
+
+def _collect_date_spinbutton_meta(page):
+    try:
+        return page.evaluate(
+            """() => {
+                const byIdsText = (rawIds) => {
+                    return (rawIds || '')
+                        .split(/\\s+/)
+                        .filter(Boolean)
+                        .map(id => {
+                            const el = document.getElementById(id);
+                            return el ? (el.textContent || '').trim() : '';
+                        })
+                        .filter(Boolean)
+                        .join(' ');
+                };
+
+                return Array.from(document.querySelectorAll('[role="spinbutton"]')).map((el, index) => ({
+                    index,
+                    text: (el.textContent || '').trim(),
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    ariaValueText: el.getAttribute('aria-valuetext') || '',
+                    ariaValueMin: el.getAttribute('aria-valuemin') || '',
+                    ariaValueMax: el.getAttribute('aria-valuemax') || '',
+                    placeholder: el.getAttribute('placeholder') || '',
+                    dataType: el.getAttribute('data-type') || el.dataset?.type || '',
+                    labelledText: byIdsText(el.getAttribute('aria-labelledby')),
+                    describedText: byIdsText(el.getAttribute('aria-describedby')),
+                }));
+            }"""
+        )
+    except Exception:
+        return []
+
+
+def _infer_date_spinbutton_kind(meta):
+    text_parts = [
+        meta.get("text", ""),
+        meta.get("ariaLabel", ""),
+        meta.get("ariaValueText", ""),
+        meta.get("placeholder", ""),
+        meta.get("dataType", ""),
+        meta.get("labelledText", ""),
+        meta.get("describedText", ""),
+    ]
+    lowered = " ".join(part for part in text_parts if part).lower()
+
+    def _to_int(value):
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return None
+
+    max_val = _to_int(meta.get("ariaValueMax"))
+
+    if any(token in lowered for token in ("year", "yyyy", "yy", "年")):
+        return "year"
+    if any(token in lowered for token in ("month", "mm", "月")):
+        return "month"
+    if any(token in lowered for token in ("day", "dd", "日")):
+        return "day"
+
+    if max_val is not None:
+        if max_val > 31:
+            return "year"
+        if max_val == 12:
+            return "month"
+        if max_val <= 31:
+            return "day"
+
+    return None
+
+
+def _fill_about_you_birthday_by_meta(page):
+    metas = _collect_date_spinbutton_meta(page)
+    if len(metas) < 3:
+        return False
+
+    desired = {"year": "1995", "month": "06", "day": "15"}
+    kind_to_meta = {}
+
+    for meta in metas:
+        kind = _infer_date_spinbutton_kind(meta)
+        if kind and kind not in kind_to_meta:
+            kind_to_meta[kind] = meta
+
+    if not all(kind in kind_to_meta for kind in desired):
+        logger.info("[直接注册] 无法可靠识别生日字段顺序，降级为位置猜测")
+        return False
+
+    try:
+        for kind in ("year", "month", "day"):
+            meta = kind_to_meta[kind]
+            sb = page.locator('[role="spinbutton"]').nth(meta["index"])
+            sb.click(force=True)
+            time.sleep(0.2)
+            try:
+                page.keyboard.press("ControlOrMeta+A")
+                time.sleep(0.1)
+            except Exception:
+                pass
+            page.keyboard.type(desired[kind], delay=80)
+            time.sleep(0.3)
+
+        logger.info(
+            "[直接注册] 已按字段识别填入生日: year=%s month=%s day=%s | order=%s",
+            desired["year"],
+            desired["month"],
+            desired["day"],
+            {kind: kind_to_meta[kind]["index"] for kind in ("year", "month", "day")},
+        )
+        return True
+    except Exception as exc:
+        logger.warning("[直接注册] 按字段填写生日失败，降级为位置猜测: %s", exc)
+        return False
+
+
 def _detect_direct_register_step(page):
     url = (page.url or "").lower()
     if _is_google_redirect(page):
         return "google"
 
+    if "email-verification" in url:
+        return "code"
+    if "about-you" in url:
+        return "profile"
+    if "create-account/password" in url or url.endswith("/password"):
+        return "password"
+    if "chatgpt.com" in url and "auth" not in url:
+        return "completed"
+
     try:
-        if page.locator(_DIRECT_PASSWORD_SELECTORS).first.is_visible(timeout=300):
+        if _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=300):
             return "password"
     except Exception:
         pass
 
     try:
-        if page.locator(_DIRECT_CODE_SELECTORS).first.is_visible(timeout=300):
+        if _first_visible_editable_locator(page, _DIRECT_CODE_SELECTORS, timeout=300):
             return "code"
     except Exception:
         pass
@@ -764,11 +903,8 @@ def _detect_direct_register_step(page):
     except Exception:
         pass
 
-    if "chatgpt.com" in url and "auth" not in url:
-        return "completed"
-
     try:
-        if page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=300):
+        if _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=300):
             return "email"
     except Exception:
         pass
@@ -788,6 +924,121 @@ def _wait_for_direct_register_step(page, allowed_steps, timeout=15):
             return step
         time.sleep(0.5)
     return _detect_direct_register_step(page)
+
+
+def _wait_for_direct_step_change(page, current_step, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        step = _detect_direct_register_step(page)
+        if step != current_step:
+            return step
+        time.sleep(0.5)
+    return _detect_direct_register_step(page)
+
+
+def _complete_direct_about_you(page):
+    """尽量完成 about-you 页面，兼容不同生日字段顺序。"""
+    if "about-you" not in (page.url or "").lower():
+        return True
+
+    birthday_orders = [
+        ("1995", "06", "15"),
+        ("06", "15", "1995"),
+        ("15", "06", "1995"),
+    ]
+
+    for attempt, values in enumerate(birthday_orders, 1):
+        if "about-you" not in (page.url or "").lower():
+            return True
+
+        try:
+            name_input = page.locator('input[name="name"]').first
+            if name_input.is_visible(timeout=2000):
+                try:
+                    if name_input.is_editable(timeout=500):
+                        name_input.fill("User")
+                        time.sleep(0.3)
+                except Exception:
+                    pass
+        except Exception:
+            name_input = None
+
+        spinbuttons = []
+        try:
+            spinbuttons = page.locator('[role="spinbutton"]').all()
+        except Exception:
+            spinbuttons = []
+
+        if len(spinbuttons) >= 3:
+            filled = _fill_about_you_birthday_by_meta(page)
+            if not filled:
+                for label_sel in ("text=生日日期", "text=Date of birth"):
+                    try:
+                        page.locator(label_sel).first.click(timeout=1000)
+                        time.sleep(0.3)
+                        break
+                    except Exception:
+                        continue
+
+                try:
+                    for sb, val in zip(spinbuttons[:3], values):
+                        sb.click(force=True)
+                        time.sleep(0.2)
+                        try:
+                            page.keyboard.press("ControlOrMeta+A")
+                            time.sleep(0.1)
+                        except Exception:
+                            pass
+                        page.keyboard.type(val, delay=80)
+                        time.sleep(0.3)
+                    logger.info("[直接注册] 尝试按位置填入生日（第 %d 次）: %s/%s/%s", attempt, *values)
+                except Exception as exc:
+                    logger.warning("[直接注册] 生日字段填写失败（第 %d 次）: %s", attempt, exc)
+        else:
+            try:
+                age_input = page.locator(
+                    'input[name="age"], input[placeholder*="年龄"], input[placeholder*="Age"]'
+                ).first
+                if age_input.is_visible(timeout=2000) and age_input.is_editable(timeout=500):
+                    age_input.fill("25")
+                    logger.info("[直接注册] 填入年龄: 25")
+            except Exception:
+                pass
+
+        submitted = False
+        for btn_selector in (
+            'button:has-text("完成帐户创建")',
+            'button:has-text("Create account")',
+            'button:has-text("Continue")',
+            'button:has-text("继续")',
+            'button[type="submit"]',
+        ):
+            try:
+                btn = page.locator(btn_selector).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    submitted = True
+                    break
+            except Exception:
+                continue
+
+        if not submitted:
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+
+        next_step = _wait_for_direct_register_step(
+            page,
+            {"profile", "completed", "code", "password", "email", "google"},
+            timeout=12,
+        )
+        logger.info("[直接注册] 提交资料后状态: %s | URL: %s", next_step, page.url)
+        if next_step != "profile":
+            return True
+
+    logger.warning("[直接注册] about-you 页面仍未完成 | URL: %s | body=%s", page.url, _page_excerpt(page))
+    return False
 
 
 def _register_direct_once(mail_client, email, password):
@@ -885,19 +1136,22 @@ def _register_direct_once(mail_client, email, password):
                 if step != "email":
                     break
 
-                email_input = page.locator(_DIRECT_EMAIL_SELECTORS).first
-                email_input.wait_for(state="visible", timeout=5000)
+                email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=1500)
+                if not email_input:
+                    logger.info("[直接注册] 邮箱输入框不可编辑，等待页面继续跳转...")
+                    next_step = _wait_for_direct_step_change(page, "email", timeout=10)
+                    if next_step != "email":
+                        break
+                    logger.warning("[直接注册] 邮箱输入框仍不可编辑，继续重试 | URL: %s", page.url)
+                    continue
+
                 email_input.fill(email)
                 time.sleep(0.5)
                 logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
                 _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
                 _click_primary_auth_button(page, email_input, ["Continue", "继续"])
 
-                next_step = _wait_for_direct_register_step(
-                    page,
-                    {"email", "password", "code", "profile", "completed", "google"},
-                    timeout=15,
-                )
+                next_step = _wait_for_direct_step_change(page, "email", timeout=15)
                 logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
                 _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
 
@@ -909,6 +1163,14 @@ def _register_direct_once(mail_client, email, password):
                     continue
                 if next_step != "email":
                     break
+
+                email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=600)
+                if not email_input:
+                    logger.info("[直接注册] 邮箱框已只读/跳转中，额外等待页面推进...")
+                    next_step = _wait_for_direct_step_change(page, "email", timeout=10)
+                    logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                    if next_step != "email":
+                        break
 
                 logger.warning(
                     "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
@@ -945,17 +1207,20 @@ def _register_direct_once(mail_client, email, password):
                     logger.info("[直接注册] 未检测到密码输入框，跳过")
                     break
 
-                pwd_input = page.locator(_DIRECT_PASSWORD_SELECTORS).first
-                pwd_input.wait_for(state="visible", timeout=10000)
+                pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=1500)
+                if not pwd_input:
+                    logger.info("[直接注册] 密码输入框不可编辑，等待页面继续跳转...")
+                    next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+                    if next_step != "password":
+                        break
+                    logger.warning("[直接注册] 密码输入框仍不可编辑，继续重试 | URL: %s", page.url)
+                    continue
+
                 logger.info("[直接注册] 设置密码")
                 pwd_input.fill(password)
                 time.sleep(0.5)
                 _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
-                next_step = _wait_for_direct_register_step(
-                    page,
-                    {"password", "code", "profile", "completed", "google", "email"},
-                    timeout=15,
-                )
+                next_step = _wait_for_direct_step_change(page, "password", timeout=15)
                 logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
 
                 if next_step == "google":
@@ -966,6 +1231,14 @@ def _register_direct_once(mail_client, email, password):
                     continue
                 if next_step != "password":
                     break
+
+                pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=600)
+                if not pwd_input:
+                    logger.info("[直接注册] 密码框已只读/跳转中，额外等待页面推进...")
+                    next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+                    logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                    if next_step != "password":
+                        break
         except Exception as exc:
             logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
 
@@ -1022,38 +1295,10 @@ def _register_direct_once(mail_client, email, password):
         _safe_invite_screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
-        name_input = page.locator('input[name="name"]').first
         try:
-            if name_input.is_visible(timeout=5000):
-                name_input.fill("User")
-                time.sleep(0.5)
-
-                spinbuttons = page.locator('[role="spinbutton"]').all()
-                if len(spinbuttons) >= 3:
-                    try:
-                        page.locator("text=生日日期").click()
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                    for sb, val in zip(spinbuttons[:3], ["1995", "06", "15"]):
-                        sb.click(force=True)
-                        time.sleep(0.2)
-                        page.keyboard.type(val, delay=80)
-                        time.sleep(0.3)
-                    logger.info("[直接注册] 填入生日: 1995/06/15")
-                else:
-                    age_input = page.locator('input[name="age"]').first
-                    try:
-                        if age_input.is_visible(timeout=3000):
-                            age_input.fill("25")
-                            logger.info("[直接注册] 填入年龄: 25")
-                    except Exception:
-                        pass
-
-                _click_primary_auth_button(page, name_input, ["完成帐户创建", "Continue", "继续"])
-                time.sleep(8)
-        except Exception:
-            pass
+            _complete_direct_about_you(page)
+        except Exception as exc:
+            logger.warning("[直接注册] about-you 步骤异常: %s | URL: %s", exc, page.url)
 
         _safe_invite_screenshot(page, "direct_06_after_profile.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
@@ -1605,6 +1850,16 @@ def cmd_manual_add():
         flow.stop()
 
 
+def _refresh_main_auth_after_admin_login():
+    try:
+        info = refresh_main_auth_file()
+        logger.info("[管理员登录] 已保存主号认证文件: %s", info.get("auth_file"))
+        return info
+    except Exception as exc:
+        logger.warning("[管理员登录] 主号认证文件生成失败: %s", exc)
+        return None
+
+
 def cmd_admin_login(email=None):
     """交互式完成管理员登录并保存到 state.json。"""
     email = (email or "").strip()
@@ -1625,6 +1880,8 @@ def cmd_admin_login(email=None):
         while True:
             if step == "completed":
                 info = chatgpt.complete_admin_login()
+                chatgpt.stop()
+                _refresh_main_auth_after_admin_login()
                 logger.info("[管理员登录] 登录完成: %s", info.get("email") or email)
                 if info.get("account_id"):
                     logger.info("[管理员登录] Workspace ID: %s", info["account_id"])
@@ -1704,6 +1961,8 @@ def cmd_admin_session(email=None):
     try:
         logger.info("[管理员登录] 开始导入 session_token: %s", email)
         info = chatgpt.import_admin_session(email, session_token)
+        chatgpt.stop()
+        _refresh_main_auth_after_admin_login()
         logger.info("[管理员登录] session_token 导入完成: %s", info.get("email") or email)
         if info.get("account_id"):
             logger.info("[管理员登录] Workspace ID: %s", info["account_id"])
@@ -1720,6 +1979,12 @@ def cmd_main_codex_sync():
     if not state.get("session_present") or not state.get("email"):
         logger.error("[主号 Codex] 缺少管理员登录态，请先执行 admin-login")
         return None
+
+    saved_auth_file = get_saved_main_auth_file()
+    if saved_auth_file:
+        sync_main_codex_to_cpa(saved_auth_file)
+        logger.info("[主号 Codex] 已直接同步现有认证文件: %s", saved_auth_file)
+        return {"auth_file": saved_auth_file}
 
     flow = MainCodexSyncFlow()
     try:
@@ -1884,7 +2149,8 @@ def cmd_cleanup(max_seats=None):
 
         # 确定要移除的数量
         if max_seats is None:
-            max_seats = len(external_members) + 2  # 保留外部成员 + 2 个本地席位
+            max_seats = 5
+            logger.info("[清理] 未指定上限，使用默认总人数: %d", max_seats)
         to_remove_count = total - max_seats
         if to_remove_count <= 0:
             logger.info("[清理] 成员数 %d 未超过上限 %d，无需清理", total, max_seats)
@@ -2006,6 +2272,13 @@ def main():
         from autoteam.setup_wizard import check_and_setup
 
         check_and_setup(interactive=True)
+
+    try:
+        from autoteam.auth_storage import ensure_auth_file_permissions
+
+        ensure_auth_file_permissions()
+    except Exception:
+        pass
 
     if args.command == "status":
         cmd_status()

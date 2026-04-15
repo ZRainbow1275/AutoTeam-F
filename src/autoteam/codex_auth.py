@@ -4,7 +4,6 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import re
 import secrets
 import time
@@ -22,12 +21,12 @@ from autoteam.admin_state import (
     get_chatgpt_workspace_name,
     update_admin_state,
 )
+from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
 from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-AUTH_DIR = PROJECT_ROOT / "auths"
 SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 
 # Codex OAuth 配置
@@ -120,6 +119,7 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
 
 def _write_auth_file(filepath, bundle):
     filepath = Path(filepath)
+    ensure_auth_dir()
     filepath.parent.mkdir(exist_ok=True)
 
     auth_data = {
@@ -134,7 +134,7 @@ def _write_auth_file(filepath, bundle):
     }
 
     write_text(filepath, json.dumps(auth_data, indent=2))
-    os.chmod(filepath, 0o600)
+    ensure_auth_file_permissions(filepath)
     logger.info("[Codex] 认证文件已保存: %s", filepath)
     return str(filepath)
 
@@ -1402,7 +1402,7 @@ def login_main_codex():
 
 def save_auth_file(bundle):
     """保存 CPA 兼容的认证文件。同一邮箱只保留一个文件，优先 team。"""
-    AUTH_DIR.mkdir(exist_ok=True)
+    ensure_auth_dir()
 
     email = bundle["email"]
     plan_type = bundle.get("plan_type", "unknown")
@@ -1429,6 +1429,39 @@ def save_main_auth_file(bundle):
 
     filepath = AUTH_DIR / f"codex-main-{account_id}.json"
     return _write_auth_file(filepath, bundle)
+
+
+def get_saved_main_auth_file():
+    """获取本地已保存的主号 Codex 认证文件路径。"""
+    candidates = []
+    for path in AUTH_DIR.glob("codex-main-*.json"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except Exception:
+            continue
+        candidates.append((stat.st_mtime, path.name, path))
+
+    if not candidates:
+        return ""
+
+    candidates.sort(reverse=True)
+    return str(candidates[0][2].resolve())
+
+
+def refresh_main_auth_file():
+    """基于已保存的管理员登录态，刷新并保存主号 Codex 认证文件。"""
+    bundle = login_codex_via_session()
+    if not bundle:
+        raise RuntimeError("无法基于管理员登录态生成主号 Codex 认证文件")
+
+    auth_file = save_main_auth_file(bundle)
+    return {
+        "email": bundle.get("email"),
+        "auth_file": auth_file,
+        "plan_type": bundle.get("plan_type"),
+    }
 
 
 def check_codex_quota(access_token, account_id=None):

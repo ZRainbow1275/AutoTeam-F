@@ -395,6 +395,7 @@ def _manual_account_status():
 def _finish_admin_login(completed: dict):
     global _admin_login_api, _admin_login_step
     api = _admin_login_api
+    info = None
     try:
         info = _pw_executor.run(api.complete_admin_login)
     finally:
@@ -405,6 +406,17 @@ def _finish_admin_login(completed: dict):
                 pass
         _admin_login_api = None
         _admin_login_step = None
+        if info and info.get("session_token") and info.get("account_id"):
+            try:
+                from autoteam.codex_auth import refresh_main_auth_file
+
+                main_auth = _pw_executor.run(refresh_main_auth_file)
+                if main_auth:
+                    info["main_auth"] = main_auth
+                    logger.info("[API] 管理员登录后已刷新主号认证文件: %s", main_auth.get("auth_file"))
+            except Exception as exc:
+                info["main_auth_error"] = str(exc)
+                logger.warning("[API] 管理员登录完成，但刷新主号认证文件失败: %s", exc)
         if _playwright_lock.locked():
             _playwright_lock.release()
     return {"status": "completed", "admin": _admin_status(), "info": info}
@@ -557,6 +569,17 @@ def post_admin_login_session(params: AdminSessionParams):
                 api.stop()
 
         info = _pw_executor.run(_do_import, params.email.strip(), params.session_token.strip())
+        if info.get("session_token") and info.get("account_id"):
+            try:
+                from autoteam.codex_auth import refresh_main_auth_file
+
+                main_auth = _pw_executor.run(refresh_main_auth_file)
+                if main_auth:
+                    info["main_auth"] = main_auth
+                    logger.info("[API] session_token 导入后已刷新主号认证文件: %s", main_auth.get("auth_file"))
+            except Exception as exc:
+                info["main_auth_error"] = str(exc)
+                logger.warning("[API] session_token 导入完成，但刷新主号认证文件失败: %s", exc)
         _admin_login_api = None
         _admin_login_step = None
         return {"status": "completed", "admin": _admin_status(), "info": info}
@@ -710,6 +733,19 @@ def post_main_codex_start():
         _main_codex_step = None
         if _playwright_lock.locked():
             _playwright_lock.release()
+
+    from autoteam.codex_auth import get_saved_main_auth_file
+    from autoteam.cpa_sync import sync_main_codex_to_cpa
+
+    saved_auth_file = get_saved_main_auth_file()
+    if saved_auth_file:
+        sync_main_codex_to_cpa(saved_auth_file)
+        return {
+            "status": "completed",
+            "message": "主号 Codex 已同步到 CPA",
+            "codex": _main_codex_status(),
+            "info": {"auth_file": saved_auth_file},
+        }
 
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(
@@ -1484,6 +1520,15 @@ def set_auto_check_config(cfg: AutoCheckConfig):
 
 @app.on_event("startup")
 def _start_auto_check():
+    try:
+        from autoteam.auth_storage import ensure_auth_file_permissions
+
+        fixed = ensure_auth_file_permissions()
+        if fixed:
+            logger.info("[启动] 已修复 %d 个 auths 认证文件权限", fixed)
+    except Exception as exc:
+        logger.warning("[启动] 修复 auths 认证文件权限失败: %s", exc)
+
     thread = threading.Thread(target=_auto_check_loop, daemon=True)
     thread.start()
 

@@ -10,13 +10,11 @@ from pathlib import Path
 
 import requests
 
+from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
 from autoteam.config import CPA_KEY, CPA_URL
 from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
-
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-AUTH_DIR = PROJECT_ROOT / "auths"
 
 
 def _headers():
@@ -181,6 +179,7 @@ def _candidate_score(auth_data, bundle, name, main=False):
 
 
 def _write_auth_file(filepath, bundle):
+    ensure_auth_dir()
     auth_data = {
         "type": "codex",
         "id_token": bundle.get("id_token", ""),
@@ -192,10 +191,7 @@ def _write_auth_file(filepath, bundle):
         "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(bundle.get("last_refresh_ts", time.time()))),
     }
     write_text(filepath, json.dumps(auth_data, indent=2))
-    try:
-        filepath.chmod(0o600)
-    except Exception:
-        pass
+    ensure_auth_file_permissions(filepath)
     return filepath
 
 
