@@ -25,5 +25,10 @@ packages = ["src/autoteam"]
 [dependency-groups]
 dev = [
     "pre-commit>=4.5.1",
+    "pytest>=8.4.2",
     "ruff>=0.15.10",
 ]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
