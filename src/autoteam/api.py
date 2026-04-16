@@ -347,9 +347,21 @@ class TeamMemberRemoveParams(BaseModel):
     type: str
 
 
+def _normalized_email(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _is_main_account_email(email: str | None) -> bool:
+    from autoteam.admin_state import get_admin_email
+
+    return bool(_normalized_email(email)) and _normalized_email(email) == _normalized_email(get_admin_email())
+
+
 def _sanitize_account(acc: dict) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
-    return {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
+    sanitized = {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
+    sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
+    return sanitized
 
 
 def _admin_status():
@@ -924,15 +936,22 @@ def get_accounts():
 def get_codex_auth(email: str):
     """导出账号的 Codex CLI 格式认证文件（~/.codex/auth.json）"""
     from autoteam.accounts import find_account, load_accounts
+    from autoteam.codex_auth import get_saved_main_auth_file
 
     email = email.strip().lower()
-    acc = find_account(load_accounts(), email)
-    if not acc:
-        raise HTTPException(status_code=404, detail="账号不存在")
+    auth_file = ""
 
-    auth_file = acc.get("auth_file")
-    if not auth_file or not Path(auth_file).exists():
-        raise HTTPException(status_code=404, detail="该账号没有认证文件")
+    if _is_main_account_email(email):
+        auth_file = get_saved_main_auth_file()
+        if not auth_file or not Path(auth_file).exists():
+            raise HTTPException(status_code=404, detail="主号没有可导出的认证文件")
+    else:
+        acc = find_account(load_accounts(), email)
+        if not acc:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        auth_file = acc.get("auth_file") or ""
+        if not auth_file or not Path(auth_file).exists():
+            raise HTTPException(status_code=404, detail="该账号没有认证文件")
 
     auth_data = json.loads(Path(auth_file).read_text())
 
@@ -994,6 +1013,9 @@ def delete_account(email: str):
         from autoteam.account_ops import delete_managed_account
         from autoteam.accounts import load_accounts
 
+        if _is_main_account_email(email):
+            raise HTTPException(status_code=400, detail="主号不允许删除")
+
         accounts = load_accounts()
         if not any(a["email"].lower() == email.lower() for a in accounts):
             raise HTTPException(status_code=404, detail="账号不存在")
@@ -1019,6 +1041,8 @@ def post_kick_account(email: str):
         from autoteam.manager import remove_from_team
 
         email = email.strip().lower()
+        if _is_main_account_email(email):
+            raise HTTPException(status_code=400, detail="主号不允许移出 Team")
         accounts = load_accounts()
         acc = find_account(accounts, email)
         if not acc:
@@ -1052,6 +1076,8 @@ def post_account_login(params: LoginAccountParams):
     from autoteam.accounts import find_account, load_accounts
 
     email = params.email.strip().lower()
+    if _is_main_account_email(email):
+        raise HTTPException(status_code=400, detail="主号不属于账号池登录对象")
     accounts = load_accounts()
     acc = find_account(accounts, email)
     if not acc:
@@ -1228,6 +1254,8 @@ def post_team_member_remove(params: TeamMemberRemoveParams):
 
         if not email or not user_id:
             raise HTTPException(status_code=400, detail="缺少必要参数")
+        if _is_main_account_email(email):
+            raise HTTPException(status_code=400, detail="主号不允许从 Team 成员页移出")
         if member_type not in ("member", "invite"):
             raise HTTPException(status_code=400, detail="无效的成员类型")
 
