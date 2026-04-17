@@ -60,3 +60,52 @@ def test_cmd_fill_tries_other_reusable_accounts_before_creating_new(monkeypatch)
         ("status", None),
     ]
     assert chatgpt.stopped == 1
+
+
+def test_cmd_fill_skips_google_accounts_during_auto_reuse(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    count_values = iter([4, 5])
+    events = []
+
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [
+            {"email": "bubblehuntr@gmail.com", "_quota_recovered": True},
+            {"email": "old-2@example.com", "_quota_recovered": True},
+        ],
+    )
+
+    def fake_reinvite(_chatgpt, _mail, acc):
+        events.append(("reinvite", acc["email"]))
+        return True
+
+    monkeypatch.setattr(manager, "reinvite_account", fake_reinvite)
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda _chatgpt, _mail: events.append(("create", None)) or True,
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync", None)))
+    monkeypatch.setattr(manager, "cmd_status", lambda: events.append(("status", None)))
+
+    manager.cmd_fill(target=5)
+
+    assert events == [
+        ("reinvite", "old-2@example.com"),
+        ("sync", None),
+        ("status", None),
+    ]
+    assert chatgpt.stopped == 1
+
+
+def test_auto_reuse_skip_reason_detects_google_provider_and_gmail():
+    assert manager._auto_reuse_skip_reason({"email": "bubblehuntr@gmail.com"}) == "Google 登录账号暂不支持自动复用"
+    assert (
+        manager._auto_reuse_skip_reason({"email": "user@example.com", "login_provider": "google"})
+        == "Google 登录账号暂不支持自动复用"
+    )
+    assert manager._auto_reuse_skip_reason({"email": "user@example.com"}) is None
