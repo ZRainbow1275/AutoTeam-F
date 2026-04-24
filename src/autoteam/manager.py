@@ -337,6 +337,10 @@ def cmd_status():
 def _check_and_refresh(acc):
     """检查单个账号额度，401 时自动刷新 token。返回 (status_str, info)
     info: exhausted 时为 exhausted_info，ok 时为 quota_info dict
+
+    使用 auth_file 里保存的 account_id 查询 —— Team/Personal/Free 号各自绑定的
+    account_id 不同,不能一律 fallback 到主号 team id,否则 Personal 号查到的会是
+    主号 Team 的额度(不准确,且被踢出 Team 后还会 401)。
     """
     email = acc["email"]
     auth_file = acc.get("auth_file")
@@ -347,11 +351,12 @@ def _check_and_refresh(acc):
     auth_data = json.loads(read_text(Path(auth_file)))
     access_token = auth_data.get("access_token")
     rt = auth_data.get("refresh_token")
+    acc_id = auth_data.get("account_id") or None
 
     if not access_token:
         return "no_auth", None
 
-    status, info = check_codex_quota(access_token)
+    status, info = check_codex_quota(access_token, account_id=acc_id)
 
     # token 过期，尝试刷新
     if status == "auth_error" and rt:
@@ -363,7 +368,7 @@ def _check_and_refresh(acc):
             auth_data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             write_text(Path(auth_file), json.dumps(auth_data, indent=2))
             logger.info("[%s] token 已刷新，重新检查额度...", email)
-            status, info = check_codex_quota(new_tokens["access_token"])
+            status, info = check_codex_quota(new_tokens["access_token"], account_id=acc_id)
         else:
             logger.error("[%s] token 刷新失败", email)
 
@@ -381,6 +386,60 @@ def cmd_check():
         threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
     except ImportError:
         threshold = AUTO_CHECK_THRESHOLD
+
+    def _check_personal_accounts(threshold):
+        """Personal 号只拍快照,不动状态:它不参与轮转,但用户希望能在 UI 看到剩余额度。
+
+        与 active 分支的差异:
+        - 不写 STATUS_EXHAUSTED(Personal 额度用完只影响 Codex 使用,不触发轮换)
+        - 不自动重新登录(personal OAuth 是人工触发,没有可靠的自动补救路径)
+        - auth_error 时仅记录日志,保留旧的 last_quota 供 UI 显示(别抹掉历史数据)
+        """
+        from autoteam.accounts import load_accounts as _reload
+
+        personal_accs = [
+            a for a in _reload() if a["status"] == STATUS_PERSONAL and not _is_main_account_email(a.get("email"))
+        ]
+        personal_with_auth = [a for a in personal_accs if a.get("auth_file") and Path(a["auth_file"]).exists()]
+        if not personal_with_auth:
+            return
+        logger.info("[检查] 检查 %d 个 personal 账号的额度...", len(personal_with_auth))
+        for acc in personal_with_auth:
+            email = acc["email"]
+            try:
+                status_str, info = _check_and_refresh(acc)
+            except Exception as exc:
+                logger.warning("[%s] personal 额度查询异常: %s", email, exc)
+                continue
+            if status_str == "ok" and isinstance(info, dict):
+                update_account(email, last_quota=info)
+                p_remain = 100 - info.get("primary_pct", 0)
+                w_remain = 100 - info.get("weekly_pct", 0)
+                p_reset = info.get("primary_resets_at", 0)
+                p_time = time.strftime("%m-%d %H:%M", time.localtime(p_reset)) if p_reset else "?"
+                logger.info(
+                    "[%s] (personal) 5h剩余 %d%% (重置 %s) | 周剩余 %d%%",
+                    email,
+                    p_remain,
+                    p_time,
+                    w_remain,
+                )
+            elif status_str == "exhausted":
+                quota_info = quota_result_quota_info(info) or {}
+                if quota_info:
+                    update_account(email, last_quota=quota_info)
+                window = info.get("window") if isinstance(info, dict) else ""
+                logger.warning(
+                    "[%s] (personal) %s额度已用完",
+                    email,
+                    "周" if window == "weekly" else "5h和周" if window == "combined" else "5h",
+                )
+            elif status_str == "auth_error":
+                logger.warning(
+                    "[%s] (personal) token 失效或账号无权访问 wham/usage(伪 personal 号被踢出 Team 后常见),保留旧快照",
+                    email,
+                )
+            # status_str == "no_auth" 已在 _check_and_refresh 里被 auth_file 判空挡掉
 
     accounts = load_accounts()
 
@@ -618,6 +677,12 @@ def cmd_check():
             else:
                 logger.error("[%s] Codex 登录失败，标记为 standby", email)
                 update_account(email, status=STATUS_STANDBY)
+
+    # Personal 号独立扫描(不参与轮转,但用户需要看到额度)
+    try:
+        _check_personal_accounts(threshold)
+    except Exception as exc:
+        logger.warning("[检查] personal 分支异常(不影响 active 结果): %s", exc)
 
     return exhausted_list
 
