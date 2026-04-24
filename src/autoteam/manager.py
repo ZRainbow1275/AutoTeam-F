@@ -851,8 +851,12 @@ def _check_pending_invites(chatgpt_api, mail_client, *, leave_workspace=False, o
         chatgpt_api.stop()
 
         email = _complete_registration(
-            inv_email, password, invite_link, mail_client,
-            leave_workspace=leave_workspace, out_outcome=out_outcome,
+            inv_email,
+            password,
+            invite_link,
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
         )
         if email:
             completed.append(email)
@@ -1634,7 +1638,9 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
         except Exception as exc:
             # Playwright 崩溃 / 网络异常等:不清理邮箱会让 CloudMail 积压,必须补一刀 discard 再抛。
             logger.error(
-                "[直接注册] %s 注册时发生未分类异常,discard 邮箱后向上抛: %s", email, exc,
+                "[直接注册] %s 注册时发生未分类异常,discard 邮箱后向上抛: %s",
+                email,
+                exc,
             )
             _discard_email("exception")
             record_failure(
@@ -1702,8 +1708,10 @@ def create_new_account(chatgpt_api, mail_client, *, leave_workspace=False, out_o
     if chatgpt_api and chatgpt_api.browser:
         logger.info("[创建] 先检查 pending invites...")
         completed = _check_pending_invites(
-            chatgpt_api, mail_client,
-            leave_workspace=leave_workspace, out_outcome=out_outcome,
+            chatgpt_api,
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
         )
         if completed:
             logger.info("[创建] 从 pending invites 完成了 %d 个账号", len(completed))
@@ -2607,9 +2615,7 @@ def _cmd_fill_personal(count):
             if batch_idx > 1:
                 try:
                     api = _ensure_chatgpt()
-                    ok = _wait_team_new_members_cleared(
-                        api, baseline_emails, max_wait=WAIT_TEAM_EMPTY_TIMEOUT
-                    )
+                    ok = _wait_team_new_members_cleared(api, baseline_emails, max_wait=WAIT_TEAM_EMPTY_TIMEOUT)
                     if not ok:
                         logger.error(
                             "[免费号] 第 %d 批开始前上一批新号未踢干净,停止生产避免触发风控",
@@ -2693,9 +2699,7 @@ def _cmd_fill_personal(count):
             if remaining > 0:
                 try:
                     api = _ensure_chatgpt()
-                    ok = _wait_team_new_members_cleared(
-                        api, baseline_emails, max_wait=WAIT_TEAM_EMPTY_TIMEOUT
-                    )
+                    ok = _wait_team_new_members_cleared(api, baseline_emails, max_wait=WAIT_TEAM_EMPTY_TIMEOUT)
                     if not ok:
                         logger.error("[免费号] 第 %d 批结束后新号未踢干净,停止继续生产", batch_idx)
                         break

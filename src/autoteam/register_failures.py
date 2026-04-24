@@ -42,13 +42,9 @@ def _load():
         corrupt_path = FAILURES_FILE.with_suffix(f".corrupt-{int(time.time())}.json")
         try:
             FAILURES_FILE.rename(corrupt_path)
-            logger.error(
-                "[register_failures] 解析失败, 已保留原文件为 %s: %s", corrupt_path.name, exc
-            )
+            logger.error("[register_failures] 解析失败, 已保留原文件为 %s: %s", corrupt_path.name, exc)
         except Exception as rename_exc:
-            logger.error(
-                "[register_failures] 解析失败且无法重命名 (%s): %s", exc, rename_exc
-            )
+            logger.error("[register_failures] 解析失败且无法重命名 (%s): %s", exc, rename_exc)
         return []
 
 

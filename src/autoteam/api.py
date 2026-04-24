@@ -1448,7 +1448,7 @@ def post_account_login(params: LoginAccountParams):
         )
 
         # 账号状态决定登录模式：PERSONAL 走 use_personal=True 补个人号 OAuth；其他走 Team 模式
-        use_personal = (acc.get("status") == STATUS_PERSONAL)
+        use_personal = acc.get("status") == STATUS_PERSONAL
 
         mail_client = CloudMailClient()
         mail_client.login()
@@ -1487,7 +1487,12 @@ def post_account_login(params: LoginAccountParams):
             from autoteam.cpa_sync import sync_to_cpa
 
             sync_to_cpa()
-            return {"email": email, "plan": bundle.get("plan_type"), "auth_file": auth_file, "mode": "personal" if use_personal else "team"}
+            return {
+                "email": email,
+                "plan": bundle.get("plan_type"),
+                "auth_file": auth_file,
+                "mode": "personal" if use_personal else "team",
+            }
         raise RuntimeError(f"Codex 登录失败: {email}")
 
     task = _start_task(f"login:{email}", _run, {"email": email})

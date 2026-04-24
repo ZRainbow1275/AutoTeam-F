@@ -297,9 +297,7 @@ class CloudMailClient:
         if "@" not in email_str:
             return None
         try:
-            r = self._admin_get(
-                "/admin/address", params={"limit": 5, "offset": 0, "query": email_str}
-            )
+            r = self._admin_get("/admin/address", params={"limit": 5, "offset": 0, "query": email_str})
             if r.status_code != 200:
                 return None
             results = (r.json() or {}).get("results") or []
@@ -440,9 +438,7 @@ class CloudMailClient:
         content = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", content)
         content = re.sub(r"(?is)<!--.*?-->", " ", content)
         content = re.sub(r"(?i)<br\s*/?>", "\n", content)
-        content = re.sub(
-            r"(?i)</(?:p|div|tr|table|h[1-6]|li|td|section|article)>", "\n", content
-        )
+        content = re.sub(r"(?i)</(?:p|div|tr|table|h[1-6]|li|td|section|article)>", "\n", content)
         content = re.sub(r"(?s)<[^>]+>", " ", content)
         content = html_lib.unescape(content)
         content = re.sub(r"[\t\r\f\v ]+", " ", content)

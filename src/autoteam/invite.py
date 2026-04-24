@@ -55,18 +55,35 @@ class RegisterBlocked(Exception):
 # 注册帮助区里偶尔出现的短语触发误报。
 _PHONE_URL_HINTS = ("verify-phone", "add-phone", "/phone", "phone_verification", "phone-number")
 _PHONE_TEXT_HINTS = (
-    "verify your phone", "add your phone", "verify phone",
-    "verification code to your phone", "add a phone number", "add a phone",
-    "enter your phone", "phone verification", "we'll text you",
-    "请输入手机号", "手机号码", "验证手机", "添加手机",
+    "verify your phone",
+    "add your phone",
+    "verify phone",
+    "verification code to your phone",
+    "add a phone number",
+    "add a phone",
+    "enter your phone",
+    "phone verification",
+    "we'll text you",
+    "请输入手机号",
+    "手机号码",
+    "验证手机",
+    "添加手机",
 )
 
 # 邮箱重复的识别特征（文案；各语言/版本都要覆盖）
 _DUPLICATE_TEXT_HINTS = (
-    "already have an account", "already exists", "already been used",
-    "this user already exists", "please use a different email", "different email",
-    "email is already taken", "account with this email",
-    "该邮箱已被使用", "邮箱已存在", "请使用其他邮箱", "电子邮件已被使用",
+    "already have an account",
+    "already exists",
+    "already been used",
+    "this user already exists",
+    "please use a different email",
+    "different email",
+    "email is already taken",
+    "account with this email",
+    "该邮箱已被使用",
+    "邮箱已存在",
+    "请使用其他邮箱",
+    "电子邮件已被使用",
 )
 
 
@@ -81,9 +98,7 @@ def detect_phone_verification(page):
             return False
         # 仅当页面上真的有电话输入控件时才判为阻塞；否则可能是说明文字/footer
         try:
-            tel_input = page.locator(
-                'input[type="tel"], input[name*="phone" i], input[autocomplete*="tel" i]'
-            ).first
+            tel_input = page.locator('input[type="tel"], input[name*="phone" i], input[autocomplete*="tel" i]').first
             if tel_input.is_visible(timeout=500):
                 return True
         except Exception as exc:
@@ -336,8 +351,14 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     bday = random_birthday()
     full_name = random_full_name()
     age_value = random_age()
-    logger.info("[注册] 本次身份: name=%s birthday=%s/%s/%s age=%s",
-                full_name, bday["year"], bday["month"], bday["day"], age_value)
+    logger.info(
+        "[注册] 本次身份: name=%s birthday=%s/%s/%s age=%s",
+        full_name,
+        bday["year"],
+        bday["month"],
+        bday["day"],
+        age_value,
+    )
 
     # 填写个人信息（全名 + 生日/年龄）
     name_input = find_visible(

@@ -418,7 +418,12 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                         for opt in options:
                             try:
                                 text = opt.inner_text(timeout=1000).strip()
-                                if text and "个人" not in text and "Personal" not in text and text not in ("ChatGPT", ""):
+                                if (
+                                    text
+                                    and "个人" not in text
+                                    and "Personal" not in text
+                                    and text not in ("ChatGPT", "")
+                                ):
                                     logger.info("[Codex] 选择 workspace: %s", text)
                                     opt.click()
                                     time.sleep(5)
@@ -622,7 +627,7 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                     logger.info("[Codex] 检测到工作空间选择页 (step %d, personal 模式)", step + 1)
                     personal_selected = False
                     try:
-                        personal_btn = page.locator('text=/个人|Personal/').first
+                        personal_btn = page.locator("text=/个人|Personal/").first
                         if personal_btn.is_visible(timeout=2000):
                             personal_btn.click(force=True)
                             time.sleep(1)

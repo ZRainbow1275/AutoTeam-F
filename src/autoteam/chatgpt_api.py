@@ -928,8 +928,7 @@ class ChatGPTTeamAPI:
         result = self._api_fetch("GET", "/backend-api/accounts")
         if result.get("status") != 200:
             raise RuntimeError(
-                f"无法获取 workspace 列表: status={result.get('status')},"
-                f" body={(result.get('body') or '')[:200]}"
+                f"无法获取 workspace 列表: status={result.get('status')}, body={(result.get('body') or '')[:200]}"
             )
         try:
             data = json.loads(result["body"])
