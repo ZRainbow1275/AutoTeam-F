@@ -3165,6 +3165,31 @@ def _cmd_fill_personal(count):
     finally:
         _stop_chatgpt()
 
+    # 队列化拒绝(Solution C):Team 子号已满 TEAM_SUB_ACCOUNT_HARD_CAP 时直接拒绝,
+    # 不强制踢健康账号腾席位。这样最小化风控暴露面 —— 只在自然 exhausted 或手动腾位置
+    # 后才生产免费号。
+    cap = TEAM_SUB_ACCOUNT_HARD_CAP
+    if len(baseline_emails) >= cap:
+        logger.warning(
+            "[免费号] Team 子号已满 %d/%d,fill-personal 拒绝执行。"
+            "请先等子号自然 exhausted 释放席位,或手动 kick/ replace 腾位置后再试。",
+            len(baseline_emails),
+            cap,
+        )
+        return
+    # 把本轮目标压到 (cap - baseline) 以内,防止任何批次超员
+    quota_for_run = cap - len(baseline_emails)
+    if count > quota_for_run:
+        logger.warning(
+            "[免费号] 目标 %d 超过当前可用席位 %d (Team 已占 %d/%d),自动压到 %d 个",
+            count,
+            quota_for_run,
+            len(baseline_emails),
+            cap,
+            quota_for_run,
+        )
+        count = quota_for_run
+
     produced = 0
     remaining = count
     batch_idx = 0
@@ -3179,11 +3204,19 @@ def _cmd_fill_personal(count):
                 logger.warning("[免费号] 收到取消请求,停止后续批次")
                 break
             batch_idx += 1
-            # Team 席位总上限 4 人:baseline 已占了一部分,本批最多再加 (4 - baseline) 个,
-            # 避免瞬间超过 4 个子号触发 OpenAI 风控。若 baseline 已占满 4,最少放 1 个让流程能推进
-            # (用户允许 baseline 存在,但至少要允许本任务有产出空间)。
-            max_new_this_batch = max(1, 4 - len(baseline_emails))
+            # Team 席位总上限 TEAM_SUB_ACCOUNT_HARD_CAP(4):baseline 已占了一部分,
+            # 本批最多再加 (cap - baseline) 个,严格不超员。若 baseline 已占满,
+            # 入口处已经拒绝并 return,这里不会走到。
+            max_new_this_batch = TEAM_SUB_ACCOUNT_HARD_CAP - len(baseline_emails)
             this_round = min(BATCH_SIZE, remaining, max_new_this_batch)
+            if this_round <= 0:
+                logger.warning(
+                    "[免费号] 第 %d 批可用席位已耗尽(baseline %d/%d),停止生产",
+                    batch_idx,
+                    len(baseline_emails),
+                    TEAM_SUB_ACCOUNT_HARD_CAP,
+                )
+                break
             logger.info(
                 "[免费号] === 第 %d 批开始(本批 %d 个,剩余 %d,baseline %d 个) ===",
                 batch_idx,

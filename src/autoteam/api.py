@@ -1896,8 +1896,26 @@ def post_add():
 
 @app.post("/api/tasks/fill", status_code=202)
 def post_fill(params: TaskParams = TaskParams()):
-    """补满 Team 成员（后台执行）。leave_workspace=True 时切换为"生产免费号"模式"""
-    from autoteam.manager import cmd_fill
+    """补满 Team 成员（后台执行）。leave_workspace=True 时切换为"生产免费号"模式
+
+    fill-personal 模式下额外做一次轻量预检:Team 子号已满 TEAM_SUB_ACCOUNT_HARD_CAP
+    则直接返回 409,不启动后台任务(队列化拒绝,Solution C)。本地状态足够用,无需启动
+    Playwright 远程查询,避免给前端按错按钮带来额外开销。
+    """
+    from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP, cmd_fill
+
+    if params.leave_workspace:
+        from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED, list_accounts
+
+        in_team_local = sum(1 for a in list_accounts() if a.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED))
+        if in_team_local >= TEAM_SUB_ACCOUNT_HARD_CAP:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Team 子号已满 {in_team_local}/{TEAM_SUB_ACCOUNT_HARD_CAP},"
+                    "fill-personal 拒绝执行。请先等子号自然 exhausted 或手动腾位置后再试"
+                ),
+            )
 
     command = "fill-personal" if params.leave_workspace else "fill"
     task = _start_task(
