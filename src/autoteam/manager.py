@@ -2093,6 +2093,13 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     # 剩余 >= threshold 才算真复用成功;否则判定"假恢复",kick 掉让 Team 席位交给新号。
     access_token = bundle.get("access_token")
     quota_verified = False
+    # fake_recovery 的原因要分清:
+    #   "exhausted" → quota 真用完,锁 5h 等自然恢复
+    #   "auth_error"/"exception" → token 被 OpenAI 风控 revoke(短时间内反复 invite/kick
+    #                              触发的) —— 锁 5h 完全没意义,token revoke 不会等就好,
+    #                              只能下次重新走完整 OAuth 拿新 token。锁 5h 反而让账号
+    #                              无法被任何流程选中,死锁在 standby。
+    fail_reason = "no_attempt"
     if access_token:
         try:
             try:
@@ -2113,6 +2120,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 if p_remain >= threshold:
                     quota_verified = True
                 else:
+                    fail_reason = "quota_low"
                     logger.warning(
                         "[轮转] %s OAuth 成功但实测 5h 剩余 %d%% < %d%%,判定假恢复",
                         email,
@@ -2125,24 +2133,41 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 quota_info = quota_result_quota_info(info) or {}
                 if quota_info:
                     update_account(email, last_quota=quota_info)
+                fail_reason = "exhausted"
                 logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
             else:
-                logger.warning("[轮转] %s OAuth 成功但额度验证返回 status=%s,保守判定假恢复", email, status_str)
+                # auth_error/其他 — token 风控类,wham 401 token_revoked 落这里
+                fail_reason = "auth_error"
+                logger.warning("[轮转] %s OAuth 成功但额度验证返回 status=%s,判定 token 风控", email, status_str)
         except Exception as exc:
-            logger.warning("[轮转] %s 额度验证抛异常,保守判定假恢复: %s", email, exc)
+            fail_reason = "exception"
+            logger.warning("[轮转] %s 额度验证抛异常,判定 token 风控: %s", email, exc)
 
     if not quota_verified:
-        # 把这个"假恢复"的账号从 Team 里 kick 掉,避免占席位 + 状态降回 STANDBY 但写一个
-        # 真实的 5h resets_at,这样短期内不会被 get_standby_accounts() 再选中。
-        _cleanup_team_leftover("fake_recovery_quota_not_usable")
+        # 把这个"假恢复"的账号从 Team 里 kick 掉,避免占席位
+        _cleanup_team_leftover(f"fake_recovery_{fail_reason}")
         now_ts = time.time()
-        update_account(
-            email,
-            status=STATUS_STANDBY,
-            auth_file=auth_file,
-            quota_exhausted_at=now_ts,
-            quota_resets_at=now_ts + 18000,
-        )
+        if fail_reason in ("exhausted", "quota_low"):
+            # 真的 quota 不足 → 锁 5h 等自然恢复
+            update_account(
+                email,
+                status=STATUS_STANDBY,
+                auth_file=auth_file,
+                quota_exhausted_at=now_ts,
+                quota_resets_at=now_ts + 18000,
+            )
+        else:
+            # token 风控/异常 —— 锁 5h 没用,token revoke 等不来。降级到 standby 但
+            # 不写 quota_exhausted_at/resets_at,让下次有机会重新尝试 OAuth(说不定
+            # 风控窗口已过)。同时清掉旧 last_quota 里的"剩余 100%"幻觉,免得下游
+            # 看着 last_quota 把它当可用号反复选中。
+            update_account(
+                email,
+                status=STATUS_STANDBY,
+                auth_file=auth_file,
+                quota_exhausted_at=None,
+                quota_resets_at=None,
+            )
         return False
 
     update_account(email, status=STATUS_ACTIVE, last_active_at=time.time(), auth_file=auth_file)

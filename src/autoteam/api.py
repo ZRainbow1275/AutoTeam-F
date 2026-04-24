@@ -1999,6 +1999,12 @@ _auto_check_config = {
 _auto_check_stop = threading.Event()
 _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
 
+# auto-fill watchdog 冷却:防止反复触发 cmd_rotate 导致 OpenAI 对短时间内
+# 多次 invite/kick 的子号批量 revoke token。30 分钟内只触发一次,给 OpenAI
+# 风控系统冷却时间。0 表示从未触发过。
+_auto_fill_last_trigger_ts = 0.0
+_AUTO_FILL_COOLDOWN_SECONDS = 1800  # 30 min
+
 
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
@@ -2034,39 +2040,52 @@ def _auto_check_loop():
 
             # Watchdog:active 账号数 < TEAM_SUB_ACCOUNT_HARD_CAP 时自动补位。
             # 之前的 `if not active: continue` 在 4 个 active 全 kick 进 standby
-            # 之后会让 Team 永远萎缩 —— 因为 _auto_check_loop 只盯 active 的额度,active=0
-            # 时根本不进循环,没人触发补位。结果用户看到 Team 长期只有 2~3 个子号。
-            # 这里走 cmd_rotate 全流程(check→kick exhausted→fill from standby→create new),
-            # 把 Team 恢复到 5 席(主号 + TEAM_SUB_ACCOUNT_HARD_CAP)。
+            # 之后会让 Team 永远萎缩。但触发频率必须节制 —— OpenAI 对短时间内反复
+            # invite/kick 同一批子号会 revoke token(token_revoked 错误),所以加
+            # 30 分钟冷却,避免巡检每 5 分钟无脑触发 cmd_rotate 把账号全洗成废号。
             from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP
 
+            global _auto_fill_last_trigger_ts
             if len(active) < TEAM_SUB_ACCOUNT_HARD_CAP:
-                if not _playwright_lock.acquire(blocking=False):
+                now_ts = time.time()
+                cooldown_remaining = (_auto_fill_last_trigger_ts + _AUTO_FILL_COOLDOWN_SECONDS) - now_ts
+                if cooldown_remaining > 0:
                     logger.info(
-                        "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",
+                        "[巡检] active=%d < %d,但 auto-fill 冷却中(还剩 %d 分钟)",
+                        len(active),
+                        TEAM_SUB_ACCOUNT_HARD_CAP,
+                        int(cooldown_remaining / 60),
+                    )
+                    # 冷却期内仍然继续做"低额度替换"(下面的 low_accounts 逻辑),
+                    # 只是不触发全量 cmd_rotate
+                else:
+                    if not _playwright_lock.acquire(blocking=False):
+                        logger.info(
+                            "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",
+                            len(active),
+                            TEAM_SUB_ACCOUNT_HARD_CAP,
+                        )
+                        continue
+                    _playwright_lock.release()
+                    logger.warning(
+                        "[巡检] active 账号 %d < %d,触发 auto-fill(cmd_rotate 全流程补位)",
                         len(active),
                         TEAM_SUB_ACCOUNT_HARD_CAP,
                     )
-                    continue
-                _playwright_lock.release()
-                logger.warning(
-                    "[巡检] active 账号 %d < %d,触发 auto-fill(cmd_rotate 全流程补位)",
-                    len(active),
-                    TEAM_SUB_ACCOUNT_HARD_CAP,
-                )
-                from autoteam.manager import cmd_rotate
+                    from autoteam.manager import cmd_rotate
 
-                try:
-                    _start_task(
-                        "auto-fill",
-                        cmd_rotate,
-                        {"target_seats": TEAM_SUB_ACCOUNT_HARD_CAP + 1},
-                        TEAM_SUB_ACCOUNT_HARD_CAP + 1,
-                    )
-                except Exception as e:
-                    logger.error("[巡检] auto-fill 启动失败: %s", e)
-                # 触发后本轮不再做"低额度替换",免得跟 cmd_rotate 抢锁
-                continue
+                    try:
+                        _start_task(
+                            "auto-fill",
+                            cmd_rotate,
+                            {"target_seats": TEAM_SUB_ACCOUNT_HARD_CAP + 1},
+                            TEAM_SUB_ACCOUNT_HARD_CAP + 1,
+                        )
+                        _auto_fill_last_trigger_ts = now_ts
+                    except Exception as e:
+                        logger.error("[巡检] auto-fill 启动失败: %s", e)
+                    # 触发后本轮不再做"低额度替换",免得跟 cmd_rotate 抢锁
+                    continue
 
             if not active:
                 continue
