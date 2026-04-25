@@ -31,9 +31,18 @@ AutoTeam 的目标不是单纯“多开号”，而是：
 ## 账号状态机
 
 ```text
-active ──额度不足──> exhausted ──移出 Team──> standby
-   ↑                                      │
-   └──────── 额度恢复 / 登录成功 ──────────┘
+             ┌───────────── 额度恢复 / 登录成功 ──────────────┐
+             │                                                │
+             ↓                                                │
+pending ──> active ──额度不足──> exhausted ──移出 Team──> standby
+             │                                                │
+             │                                      ┌─ 401/403 探测
+             │                                      ↓
+             │                               auth_invalid ──对账 KICK──> (删除 / 重登)
+             │
+             └── 对账发现本地 auth_file 缺失 ──> orphan ──人工补登──> active
+                                                   │
+                                                   └── RECONCILE_KICK_ORPHAN=true ──> KICK
 ```
 
 | 状态 | 含义 |
@@ -42,6 +51,24 @@ active ──额度不足──> exhausted ──移出 Team──> standby
 | `exhausted` | 当前在 Team 中，但额度不足，等待移出 |
 | `standby` | 已不在当前轮转席位中，等待后续复用 |
 | `pending` | 注册 / 创建流程尚未完成 |
+| `personal` | 已主动退出 Team，走个人号 Codex OAuth，不再参与 Team 轮转 |
+| `auth_invalid` | `auth_file` token 已不可用(401/403)。`cmd_check --include-standby` 探测或主动使用时落入此态,等对账 KICK 或重登 |
+| `orphan` | workspace 仍占席 + 本地 `auth_file` 缺失。默认 `RECONCILE_KICK_ORPHAN=true` 直接 KICK;关掉则打此标记等人工 |
+
+### 对账(reconcile)分支
+
+`_reconcile_team_members` 在 `cmd_check` 入口和独立命令 `autoteam reconcile [--dry-run]` 都会执行,对齐 workspace `/users` 的事实与本地 `accounts.json`:
+
+| workspace ↔ 本地 | 处置 |
+|-------------------|------|
+| active + auth_file 存在 | 正常 |
+| active + auth_file 缺失 | **残废**:先找 `auths/codex-{email}-team-*.json` 兜底,找不到按 `RECONCILE_KICK_ORPHAN` 决定 KICK 或标 `orphan` |
+| active + `last_quota` 5h/周均 100% | **耗尽未抛弃**:标 `exhausted` + `quota_exhausted_at=now`,**不立即 kick**(避开 token_revoked 风控) |
+| active ↔ pending | 升 `active` |
+| active ↔ standby | **错位**:改回 `active` + 补齐 auth_file |
+| active ↔ exhausted / personal / auth_invalid | KICK |
+| active ↔ orphan | 已标记,跳过 |
+| active ↔ 本地无记录 | **ghost**:按 `RECONCILE_KICK_GHOST` 决定 KICK 或留给 `sync_account_states` 补录 |
 
 ## 同步模型
 

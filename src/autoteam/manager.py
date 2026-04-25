@@ -29,7 +29,9 @@ from pathlib import Path
 from autoteam.account_ops import delete_managed_account, fetch_team_state
 from autoteam.accounts import (
     STATUS_ACTIVE,
+    STATUS_AUTH_INVALID,
     STATUS_EXHAUSTED,
+    STATUS_ORPHAN,
     STATUS_PENDING,
     STATUS_PERSONAL,
     STATUS_STANDBY,
@@ -107,27 +109,76 @@ def _auto_reuse_skip_reason(acc: dict | None) -> str | None:
 TEAM_SUB_ACCOUNT_HARD_CAP = 4
 
 
-def _reconcile_team_members(chatgpt_api=None):
+def _find_team_auth_file(email):
+    """在 auths 目录里找 codex-{email}-team-*.json。找到返回字符串路径,否则 None。"""
+    try:
+        from autoteam.auth_storage import AUTH_DIR
+    except Exception:
+        return None
+    if not AUTH_DIR.exists():
+        return None
+    candidates = sorted(AUTH_DIR.glob(f"codex-{email}-team-*.json"))
+    if candidates:
+        return str(candidates[0])
+    # 兜底:接受 free/personal 席位 auth 文件作为次优选
+    any_candidates = sorted(AUTH_DIR.glob(f"codex-{email}-*.json"))
+    return str(any_candidates[0]) if any_candidates else None
+
+
+def _is_quota_exhausted_snapshot(acc):
+    """本地 last_quota 表明 5h 和周额度均满(pct=100)→ 耗尽未抛弃。"""
+    lq = acc.get("last_quota") or {}
+    if not lq:
+        return False
+    try:
+        return int(lq.get("primary_pct", 0)) >= 100 and int(lq.get("weekly_pct", 0)) >= 100
+    except (TypeError, ValueError):
+        return False
+
+
+def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
     """对账:Team 实际成员 vs 本地 accounts.json,修复一切不一致。
 
     触发原因:历史 bug(OpenAI /users 同步延迟 → remove_from_team already_absent 误判 →
     DELETE 被跳过)在 Team 里留下"假 standby""假 personal"遗留成员,占 4 子号的席位。
-    新版 remove_from_team 已带 retry 修复源头,但对账层仍需兜底:
 
-    处理矩阵:
-        Team里 + 本地 active    → 正常,不动
-        Team里 + 本地 pending   → 注册完成,升 active
-        Team里 + 本地 standby   → 假 standby(应被踢但未踢),KICK
-        Team里 + 本地 exhausted → 应被踢但未踢,KICK
-        Team里 + 本地 personal  → fill-personal 本应踢出,KICK
-        Team里 + 本地无记录     → 手动邀请/其他来源,sync_account_states 会补录
+    处理矩阵(第一轮):
+        Team里 + 本地 active + auth_file 存在           → 正常
+        Team里 + 本地 active + auth_file 缺失           → **残废**
+            RECONCILE_KICK_ORPHAN=true(默认): KICK
+            RECONCILE_KICK_ORPHAN=false: 标 STATUS_ORPHAN 等人工
+        Team里 + 本地 active + last_quota 5h/周 均满    → **耗尽未抛弃**
+            标 STATUS_EXHAUSTED + quota_exhausted_at=now,**不立即 kick**
+            (避免 token_revoked 风控,让 cmd_replace 走正常流程)
+        Team里 + 本地 pending                            → 升 active
+        Team里 + 本地 standby                            → **错位**。修正本地 active,
+            校验 / 补齐 auth_file 指向 auths/codex-{email}-team-*.json
+        Team里 + 本地 exhausted                          → 假 exhausted,KICK
+        Team里 + 本地 personal                           → fill-personal 本应踢,KICK
+        Team里 + 本地 auth_invalid                       → token 失效,KICK
+        Team里 + 本地 orphan                             → 已标记,保留原状
+        Team里 + 本地无记录                              → **ghost**
+            RECONCILE_KICK_GHOST=true(默认): KICK;否则留给 sync_account_states
 
-    之后若 Team 非主号子账号仍 > TEAM_SUB_ACCOUNT_HARD_CAP,按 exhausted → personal →
-    standby → 额度最低的 active 顺序 kick 到刚好 4 为止。
+    之后若 Team 非主号子账号仍 > TEAM_SUB_ACCOUNT_HARD_CAP,按 orphan → auth_invalid →
+    exhausted → personal → standby → 额度最低 active 顺序 kick 到刚好 4 为止。
 
-    返回 dict: {kicked: [email...], flipped_to_active: [email...], over_cap_kicked: [email...]}
+    dry_run=True 只诊断不动账户,用于 cmd_reconcile_dry_run。
     """
-    result = {"kicked": [], "flipped_to_active": [], "over_cap_kicked": []}
+    from autoteam.config import RECONCILE_KICK_GHOST, RECONCILE_KICK_ORPHAN
+
+    result = {
+        "kicked": [],
+        "flipped_to_active": [],
+        "orphan_kicked": [],
+        "orphan_marked": [],
+        "misaligned_fixed": [],
+        "exhausted_marked": [],
+        "ghost_kicked": [],
+        "ghost_seen": [],
+        "over_cap_kicked": [],
+        "dry_run": bool(dry_run),
+    }
     account_id = get_chatgpt_account_id()
     if not account_id:
         logger.warning("[对账] account_id 为空,跳过对账")
@@ -142,6 +193,22 @@ def _reconcile_team_members(chatgpt_api=None):
         except Exception as exc:
             logger.warning("[对账] 无法启动 ChatGPTTeamAPI,跳过对账: %s", exc)
             return result
+
+    def _safe_kick(email_to_kick):
+        if dry_run:
+            logger.info("[对账/dry-run] 将会 KICK %s(未执行)", email_to_kick)
+            return "dry_run"
+        try:
+            return remove_from_team(chatgpt_api, email_to_kick, return_status=True)
+        except Exception as exc:
+            logger.error("[对账] KICK %s 抛异常: %s", email_to_kick, exc)
+            return "error"
+
+    def _safe_update(email_to_update, **fields):
+        if dry_run:
+            logger.info("[对账/dry-run] update_account(%s, %s)(未执行)", email_to_update, fields)
+            return
+        update_account(email_to_update, **fields)
 
     try:
         path = f"/backend-api/accounts/{account_id}/users"
@@ -171,26 +238,108 @@ def _reconcile_team_members(chatgpt_api=None):
         for email, _m in team_subs:
             acc = by_email.get(email)
             if not acc:
+                # ghost: workspace 有 + 本地完全无记录
+                result["ghost_seen"].append(email)
+                if RECONCILE_KICK_GHOST:
+                    logger.warning("[对账] ghost 成员 %s(本地无记录),KICK", email)
+                    rs = _safe_kick(email)
+                    if rs in ("removed", "already_absent", "dry_run"):
+                        result["ghost_kicked"].append(email)
+                else:
+                    logger.info(
+                        "[对账] ghost 成员 %s,RECONCILE_KICK_GHOST=false,留给 sync 补录",
+                        email,
+                    )
                 continue
+
             status = acc.get("status")
-            if status == STATUS_ACTIVE:
-                continue
+
             if status == STATUS_PENDING:
                 logger.info("[对账] %s pending → active(Team 里已存在)", email)
-                update_account(acc.get("email"), status=STATUS_ACTIVE)
+                _safe_update(acc.get("email"), status=STATUS_ACTIVE)
                 result["flipped_to_active"].append(email)
                 continue
-            if status in (STATUS_STANDBY, STATUS_EXHAUSTED, STATUS_PERSONAL):
-                logger.warning("[对账] %s 本地=%s 但 Team 里仍挂着,KICK", email, status)
-                try:
-                    remove_status = remove_from_team(chatgpt_api, acc.get("email"), return_status=True)
-                    if remove_status in ("removed", "already_absent"):
-                        # standby/exhausted 保留原状态,personal 也保留(下次 fill-personal 才会真处理)
-                        result["kicked"].append(email)
+
+            if status == STATUS_STANDBY:
+                # 错位:workspace 是事实来源,本地 standby 是陈旧状态
+                logger.warning("[对账] %s 错位(workspace=active 本地=standby),修正 active", email)
+                auth_path = acc.get("auth_file")
+                if not auth_path or not Path(auth_path).exists():
+                    found = _find_team_auth_file(email)
+                    if found:
+                        logger.info("[对账] %s 补齐 auth_file=%s", email, found)
+                        _safe_update(acc.get("email"), status=STATUS_ACTIVE, auth_file=found)
+                        result["misaligned_fixed"].append(email)
                     else:
-                        logger.error("[对账] KICK %s 失败: status=%s", email, remove_status)
-                except Exception as exc:
-                    logger.error("[对账] KICK %s 抛异常: %s", email, exc)
+                        # 错位且找不到 auth → 实为残废,降级
+                        logger.warning("[对账] %s 错位但无 auth 文件,降级为残废分支", email)
+                        if RECONCILE_KICK_ORPHAN:
+                            rs = _safe_kick(email)
+                            if rs in ("removed", "already_absent", "dry_run"):
+                                result["orphan_kicked"].append(email)
+                        else:
+                            _safe_update(acc.get("email"), status=STATUS_ORPHAN)
+                            result["orphan_marked"].append(email)
+                else:
+                    _safe_update(acc.get("email"), status=STATUS_ACTIVE)
+                    result["misaligned_fixed"].append(email)
+                continue
+
+            if status == STATUS_ACTIVE:
+                # 残废检查:workspace + 本地 active 但 auth_file 缺失
+                auth_path = acc.get("auth_file")
+                if not auth_path or not Path(auth_path).exists():
+                    found = _find_team_auth_file(email)
+                    if found:
+                        logger.info("[对账] %s active + auth_file=null,发现 %s,补上", email, found)
+                        _safe_update(acc.get("email"), auth_file=found)
+                        continue
+                    if RECONCILE_KICK_ORPHAN:
+                        logger.warning("[对账] 残废 %s(workspace 有 + 本地 auth 缺失),KICK", email)
+                        rs = _safe_kick(email)
+                        if rs in ("removed", "already_absent", "dry_run"):
+                            result["orphan_kicked"].append(email)
+                    else:
+                        logger.warning("[对账] 残废 %s,RECONCILE_KICK_ORPHAN=false,标 STATUS_ORPHAN", email)
+                        _safe_update(acc.get("email"), status=STATUS_ORPHAN)
+                        result["orphan_marked"].append(email)
+                    continue
+
+                # 耗尽未抛弃: last_quota 5h/周 均 100% → 标 EXHAUSTED,**不**立即 kick
+                if _is_quota_exhausted_snapshot(acc):
+                    logger.warning(
+                        "[对账] %s active + last_quota 0/0(耗尽未抛弃),标 EXHAUSTED(不立即 kick)",
+                        email,
+                    )
+                    _safe_update(
+                        acc.get("email"),
+                        status=STATUS_EXHAUSTED,
+                        quota_exhausted_at=time.time(),
+                    )
+                    result["exhausted_marked"].append(email)
+                    continue
+
+                # 正常 active
+                continue
+
+            if status == STATUS_ORPHAN:
+                # 上一轮已经标 orphan,等人工补 auth,不反复 kick
+                logger.debug("[对账] %s 已标 STATUS_ORPHAN,跳过", email)
+                continue
+
+            if status in (STATUS_EXHAUSTED, STATUS_PERSONAL, STATUS_AUTH_INVALID):
+                logger.warning("[对账] %s 本地=%s 但 Team 里仍挂着,KICK", email, status)
+                rs = _safe_kick(acc.get("email"))
+                if rs in ("removed", "already_absent", "dry_run"):
+                    # standby/exhausted 保留原状态,personal 也保留(下次 fill-personal 才真处理)
+                    result["kicked"].append(email)
+                elif rs != "error":
+                    logger.error("[对账] KICK %s 失败: status=%s", email, rs)
+                continue
+
+        # dry_run 下不做第二轮 over-cap kick(避免错判膨胀,完全只读)
+        if dry_run:
+            return result
 
         # 第二轮:硬上限 4 子号。kick 完上面的,再拉一次 /users 得到最新数
         resp2 = chatgpt_api._api_fetch("GET", path)
@@ -225,18 +374,22 @@ def _reconcile_team_members(chatgpt_api=None):
                 if not a:
                     return (0, 0)  # 不在本地的未知账号最先 kick
                 st = a.get("status")
-                if st == STATUS_EXHAUSTED:
+                if st == STATUS_ORPHAN:
                     return (1, 0)
-                if st == STATUS_PERSONAL:
+                if st == STATUS_AUTH_INVALID:
+                    return (1, 1)
+                if st == STATUS_EXHAUSTED:
                     return (2, 0)
-                if st == STATUS_STANDBY:
+                if st == STATUS_PERSONAL:
                     return (3, 0)
+                if st == STATUS_STANDBY:
+                    return (4, 0)
                 if st == STATUS_ACTIVE:
                     # active 按额度剩余从低到高 kick
                     lq = a.get("last_quota") or {}
                     p_remain = 100 - lq.get("primary_pct", 0)
-                    return (4, p_remain)
-                return (5, 0)
+                    return (5, p_remain)
+                return (6, 0)
 
             victims = sorted(remaining_subs, key=_priority)[:excess]
             for email in victims:
@@ -536,8 +689,17 @@ def _check_and_refresh(acc):
     return status, info
 
 
-def cmd_check():
-    """只检查 active 账号的额度，无认证文件或 auth_error 的自动重新登录 Codex"""
+STANDBY_PROBE_INTERVAL_SEC = 1.5  # 每个 standby 账号探测间隔,限速避免群访 OpenAI 触发风控
+STANDBY_PROBE_DEDUP_SEC = 24 * 3600  # 24h 内已探测过的 standby 跳过
+
+
+def cmd_check(include_standby: bool = False):
+    """检查 active 账号的额度,无认证文件或 auth_error 的自动重新登录 Codex。
+
+    参数:
+        include_standby: True 时额外探测 standby 池每个账号的 quota(限速 + 24h 去重),
+                         401/403 的标记为 STATUS_AUTH_INVALID。默认 False 保持向后兼容。
+    """
     from autoteam.config import AUTO_CHECK_THRESHOLD, CLOUDMAIL_DOMAIN
 
     # API 运行时配置优先（前端可修改）
@@ -860,7 +1022,107 @@ def cmd_check():
     except Exception as exc:
         logger.warning("[检查] personal 分支异常(不影响 active 结果): %s", exc)
 
+    # Standby 池额度探测(可选):修复"standby 永远无 quota 数据 → _quota_recovered 失真
+    # → fill 时盲选踩雷"的问题。限速 + 24h 去重,探到 401/403 标 STATUS_AUTH_INVALID。
+    if include_standby:
+        try:
+            _probe_standby_quota()
+        except Exception as exc:
+            logger.warning("[检查] standby 探测分支异常(不影响 active/personal 结果): %s", exc)
+
     return exhausted_list
+
+
+def _probe_standby_quota():
+    """遍历 standby 池,探测每个账号的 quota。
+
+    - 限速:每账号之间 sleep STANDBY_PROBE_INTERVAL_SEC,避免群访 OpenAI wham/usage 触发风控
+    - 去重:last_quota_check_at 在 STANDBY_PROBE_DEDUP_SEC 秒内的跳过
+    - auth_error(401/403/token 刷新失败):标 STATUS_AUTH_INVALID,等 reconcile 处置
+    - exhausted:刷新 quota_exhausted_at / quota_resets_at(修正过期快照),维持 standby
+    - ok:仅写回 last_quota + last_quota_check_at,不改 status(standby 的 status 由 fill/rotate 决定)
+    """
+    standby = get_standby_accounts()
+    if not standby:
+        logger.info("[检查] standby 池为空,跳过探测")
+        return
+
+    now = time.time()
+    to_probe = []
+    skipped = 0
+    no_auth = 0
+    for acc in standby:
+        auth_file = acc.get("auth_file")
+        if not auth_file or not Path(auth_file).exists():
+            no_auth += 1
+            continue
+        last_check = acc.get("last_quota_check_at") or 0
+        if last_check and (now - last_check) < STANDBY_PROBE_DEDUP_SEC:
+            skipped += 1
+            continue
+        to_probe.append(acc)
+
+    if not to_probe:
+        logger.info(
+            "[检查] standby 池共 %d 个,全部在 24h 内已探测或无 auth_file(skipped=%d,no_auth=%d),跳过",
+            len(standby),
+            skipped,
+            no_auth,
+        )
+        return
+
+    logger.info(
+        "[检查] 探测 %d 个 standby 账号的额度(总 %d,跳过 %d 近期已探测,%d 无 auth_file,间隔 %.1fs)...",
+        len(to_probe),
+        len(standby),
+        skipped,
+        no_auth,
+        STANDBY_PROBE_INTERVAL_SEC,
+    )
+
+    for idx, acc in enumerate(to_probe):
+        email = acc["email"]
+        if idx > 0:
+            time.sleep(STANDBY_PROBE_INTERVAL_SEC)
+        try:
+            status_str, info = _check_and_refresh(acc)
+        except Exception as exc:
+            logger.warning("[%s] (standby) 探测异常,跳过: %s", email, exc)
+            continue
+
+        probe_ts = time.time()
+        if status_str == "ok" and isinstance(info, dict):
+            update_account(email, last_quota=info, last_quota_check_at=probe_ts)
+            p_remain = 100 - info.get("primary_pct", 0)
+            w_remain = 100 - info.get("weekly_pct", 0)
+            logger.info("[%s] (standby) 探测成功 5h剩余 %d%% | 周剩余 %d%%", email, p_remain, w_remain)
+        elif status_str == "exhausted":
+            quota_info = quota_result_quota_info(info) or {}
+            resets_at = quota_result_resets_at(info) or int(probe_ts + 18000)
+            payload = {
+                "last_quota_check_at": probe_ts,
+                "quota_exhausted_at": probe_ts,
+                "quota_resets_at": resets_at,
+            }
+            if quota_info:
+                payload["last_quota"] = quota_info
+            update_account(email, **payload)
+            window = info.get("window") if isinstance(info, dict) else ""
+            logger.warning(
+                "[%s] (standby) %s额度仍未恢复,刷新重置时间",
+                email,
+                "周" if window == "weekly" else "5h",
+            )
+        elif status_str == "auth_error":
+            update_account(email, status=STATUS_AUTH_INVALID, last_quota_check_at=probe_ts)
+            logger.warning("[%s] (standby) auth_file 已失效(401/403),标记 %s", email, STATUS_AUTH_INVALID)
+        elif status_str == "no_auth":
+            # 理论上入口已过滤,这里兜底:记时间戳避免下一轮重复命中
+            update_account(email, last_quota_check_at=probe_ts)
+            logger.info("[%s] (standby) auth_file 缺失,跳过", email)
+        else:
+            update_account(email, last_quota_check_at=probe_ts)
+            logger.info("[%s] (standby) 未知探测结果 %s,仅记录时间戳", email, status_str)
 
 
 def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=3, retry_interval=3.0):
@@ -970,9 +1232,19 @@ def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=
         return "failed" if return_status else False
 
 
-def invite_to_team(chatgpt_api, email, seat_type="default"):
-    """邀请账号加入 Team。旧账号用 default，新账号用 usage_based。"""
+def invite_to_team(chatgpt_api, email, seat_type="default", return_detail=False):
+    """邀请账号加入 Team。旧账号用 default,新账号用 usage_based。
+
+    return_detail=False(默认,向后兼容): 返回 bool
+    return_detail=True: 返回 (ok, seat_label) 二元组,seat_label ∈ {"chatgpt","codex","unknown"},
+        供上游把席位类型落盘到 accounts.json。
+    """
     status, data = chatgpt_api.invite_member(email, seat_type=seat_type)
+    # 归一化 seat_label: invite_member 返回 "chatgpt" / "usage_based" / "unknown",
+    # 映射到 accounts.SEAT_* 一致的字符串,避免跨模块对枚举值的二次翻译。
+    raw_seat = data.get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
+    seat_label = {"chatgpt": "chatgpt", "usage_based": "codex"}.get(raw_seat, "unknown")
+
     if status == 200 and isinstance(data, dict):
         errored = data.get("errored_emails", [])
         if errored:
@@ -981,9 +1253,15 @@ def invite_to_team(chatgpt_api, email, seat_type="default"):
             # default 失败则尝试 usage_based
             if seat_type == "default":
                 logger.info("[Team] 尝试 usage_based 方式...")
-                return invite_to_team(chatgpt_api, email, seat_type="usage_based")
+                return invite_to_team(chatgpt_api, email, seat_type="usage_based", return_detail=return_detail)
+            if return_detail:
+                return False, "unknown"
             return False
-    return status == 200
+
+    ok = status == 200
+    if return_detail:
+        return ok, seat_label if ok else "unknown"
+    return ok
 
 
 def _run_post_register_oauth(email, password, mail_client, leave_workspace=False, out_outcome=None):
@@ -1034,9 +1312,11 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
         bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
         if bundle:
             auth_file = save_auth_file(bundle)
+            # personal 分支:已主动退出 Team,bundle 是个人 free/plus plan,算 codex 席位
             update_account(
                 email,
                 status=STATUS_PERSONAL,
+                seat_type="codex",
                 auth_file=auth_file,
                 last_active_at=time.time(),
             )
@@ -1064,8 +1344,17 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
     bundle = login_codex_via_browser(email, password, mail_client=mail_client)
     if bundle:
         auth_file = save_auth_file(bundle)
-        update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
-        logger.info("[注册] 账号就绪: %s", email)
+        # 注册后 Team bundle 成功拿到,说明 workspace 已同步:seat_type=chatgpt
+        bundle_plan = (bundle.get("plan_type") or "").lower()
+        seat_label = "chatgpt" if bundle_plan == "team" else "codex"
+        update_account(
+            email,
+            status=STATUS_ACTIVE,
+            seat_type=seat_label,
+            auth_file=auth_file,
+            last_active_at=time.time(),
+        )
+        logger.info("[注册] 账号就绪: %s (seat=%s)", email, seat_label)
         _record_outcome("success", plan=bundle.get("plan_type"))
         return email
     # 部分成功：账号已入 Team(席位被占用)但 auth_file 缺失,需要用户手动"补登录"。
@@ -3562,6 +3851,46 @@ def cmd_pull_cpa():
     return result
 
 
+def cmd_reconcile(dry_run: bool = False):
+    """独立运行一次对账,修正残废 / 错位 / 耗尽未抛弃 / ghost 成员。
+
+    与 cmd_check 内部的 `_reconcile_team_members` 共享同一套逻辑,但:
+    - 不做额度检查、不触发 Codex 登录,纯做状态对齐
+    - 入口日志更友好,返回结构化 result 便于 API / 脚本消费
+    - dry_run=True 等价于 cmd_reconcile_dry_run,只输出诊断不动账户
+    """
+    logger.info("[对账] 开始独立对账 dry_run=%s", dry_run)
+    recon = _reconcile_team_members(dry_run=dry_run)
+
+    # 汇总日志,方便看出哪些分支命中
+    summary_keys = [
+        "kicked",
+        "flipped_to_active",
+        "orphan_kicked",
+        "orphan_marked",
+        "misaligned_fixed",
+        "exhausted_marked",
+        "ghost_kicked",
+        "ghost_seen",
+        "over_cap_kicked",
+    ]
+    parts = [f"{k}={len(recon.get(k) or [])}" for k in summary_keys]
+    logger.info("[对账] %s结果: %s", "(dry-run)" if dry_run else "", ", ".join(parts))
+
+    # 具体列表只在非空时打,避免日志噪声
+    for k in summary_keys:
+        items = recon.get(k) or []
+        if items:
+            logger.info("[对账] %s → %s", k, items)
+
+    return recon
+
+
+def cmd_reconcile_dry_run():
+    """诊断模式:只输出报告,不 kick 任何账号、不写 accounts.json。"""
+    return cmd_reconcile(dry_run=True)
+
+
 def main():
     import argparse
 
@@ -3572,7 +3901,12 @@ def main():
     sub = parser.add_subparsers(dest="command", help="可用命令")
 
     sub.add_parser("status", help="查看所有账号状态")
-    sub.add_parser("check", help="检查活跃账号 Codex 额度")
+    check_p = sub.add_parser("check", help="检查活跃账号 Codex 额度")
+    check_p.add_argument(
+        "--include-standby",
+        action="store_true",
+        help="同时探测 standby 池的 quota(限速+24h 去重,会对每个 standby 账号打一次 wham/usage)",
+    )
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
     rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
     sub.add_parser("add", help="手动添加一个新账号")
@@ -3591,6 +3925,16 @@ def main():
 
     sub.add_parser("sync", help="手动同步认证文件到 CPA")
     sub.add_parser("pull-cpa", help="从 CPA 反向同步认证文件到本地")
+
+    reconcile_p = sub.add_parser(
+        "reconcile",
+        help="对账 Team 实际成员 vs 本地状态,修复残废 / 错位 / 耗尽未抛弃 / ghost",
+    )
+    reconcile_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只输出诊断报告,不 kick、不改 accounts.json",
+    )
 
     api_p = sub.add_parser("api", help="启动 HTTP API 服务器")
     api_p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
@@ -3618,7 +3962,7 @@ def main():
     if args.command == "status":
         cmd_status()
     elif args.command == "check":
-        cmd_check()
+        cmd_check(include_standby=getattr(args, "include_standby", False))
     elif args.command == "rotate":
         cmd_rotate(args.target)
     elif args.command == "add":
@@ -3639,6 +3983,8 @@ def main():
         sync_to_cpa()
     elif args.command == "pull-cpa":
         cmd_pull_cpa()
+    elif args.command == "reconcile":
+        cmd_reconcile(dry_run=getattr(args, "dry_run", False))
     elif args.command == "api":
         from autoteam.api import start_server
 

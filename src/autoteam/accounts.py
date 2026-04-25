@@ -16,6 +16,13 @@ STATUS_EXHAUSTED = "exhausted"  # 在 team 中，额度用完
 STATUS_STANDBY = "standby"  # 已移出 team，等待额度恢复
 STATUS_PENDING = "pending"  # 已邀请，等待注册完成
 STATUS_PERSONAL = "personal"  # 已主动退出 team，走个人号 Codex OAuth，不再参与 Team 轮转
+STATUS_AUTH_INVALID = "auth_invalid"  # auth_file token 已不可用(401/403),待 reconcile 清理或重登
+STATUS_ORPHAN = "orphan"  # 在 workspace 里占着席位,但本地没 auth_file(残废,待人工介入或兜底 kick)
+
+# 席位类型:标记该账号在 ChatGPT Team 里被授予的席位种类,用于下游 fill / check 区分对待
+SEAT_CHATGPT = "chatgpt"  # 完整 ChatGPT 席位(PATCH invite seat_type=default 成功)
+SEAT_CODEX = "codex"  # 仅 Codex 席位(usage_based,PATCH 改 default 失败时保留的兜底)
+SEAT_UNKNOWN = "unknown"  # 未知/未记录,老账号或手动导入默认值
 
 
 def _normalized_email(value):
@@ -48,11 +55,14 @@ def find_account(accounts, email):
     return None
 
 
-def add_account(email, password, cloudmail_account_id=None):
-    """添加新账号"""
+def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNOWN):
+    """添加新账号。seat_type 取值见 SEAT_CHATGPT / SEAT_CODEX / SEAT_UNKNOWN。"""
     accounts = load_accounts()
     if find_account(accounts, email):
-        return  # 已存在
+        # 已存在仍允许补写 seat_type,避免旧记录一直是 unknown
+        if seat_type and seat_type != SEAT_UNKNOWN:
+            update_account(email, seat_type=seat_type)
+        return
 
     accounts.append(
         {
@@ -60,9 +70,11 @@ def add_account(email, password, cloudmail_account_id=None):
             "password": password,
             "cloudmail_account_id": cloudmail_account_id,
             "status": STATUS_PENDING,
+            "seat_type": seat_type or SEAT_UNKNOWN,
             "auth_file": None,  # CPA 认证文件路径
             "quota_exhausted_at": None,  # 额度用完的时间
             "quota_resets_at": None,  # 额度恢复时间
+            "last_quota_check_at": None,  # 最近一次 wham/usage 探测时间戳,用于 standby 探测去重
             "created_at": time.time(),
             "last_active_at": None,
         }

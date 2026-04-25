@@ -27,6 +27,32 @@ cp .env.example .env
 | `AUTO_CHECK_THRESHOLD` | 额度低于此百分比触发轮转 | 否（默认 `10`） |
 | `AUTO_CHECK_INTERVAL` | 巡检间隔（秒） | 否（默认 `300`） |
 | `AUTO_CHECK_MIN_LOW` | 至少几个账号低于阈值才触发 | 否（默认 `2`） |
+| `RECONCILE_KICK_ORPHAN` | 对账发现"残废"成员(workspace 有 active + 本地 `auth_file` 缺失)时是否自动 KICK。关掉则标记 `STATUS_ORPHAN` 等人工处理 | 否（默认 `true`） |
+| `RECONCILE_KICK_GHOST` | 对账发现"ghost"成员(workspace 有但本地完全无记录)时是否自动 KICK。关掉则留给 `sync_account_states` 反向补录 | 否（默认 `true`） |
+
+## 账号状态与席位字段
+
+`accounts.json` 中每条记录的 `status` 枚举(常量见 `src/autoteam/accounts.py`):
+
+| 状态 | 含义 |
+|------|------|
+| `active` | 在 Team 中且本地认为可用 |
+| `exhausted` | 在 Team 中但额度耗尽,等待移出 |
+| `standby` | 已移出 Team,等待后续复用 |
+| `pending` | 注册 / 创建流程尚未完成 |
+| `personal` | 已主动退出 Team,走个人号 Codex OAuth,不再参与 Team 轮转 |
+| `auth_invalid` | `auth_file` token 已失效(401/403),等对账清理或重登。`cmd_check --include-standby` 探到 401/403 时会落到这个状态 |
+| `orphan` | workspace 仍占席但本地 `auth_file` 缺失。`RECONCILE_KICK_ORPHAN=false` 时对账会把残废成员打上此标记而不 KICK,等人工补登 |
+
+`seat_type` 字段标记该账号在 ChatGPT Team 里被授予的席位种类:
+
+| seat_type | 含义 |
+|-----------|------|
+| `chatgpt` | 完整 ChatGPT 席位(PATCH `seat_type=default` 成功) |
+| `codex` | 仅 Codex 席位(`usage_based`,PATCH 改 default 失败时的兜底) |
+| `unknown` | 未知 / 老记录默认值,手动导入时若未指定也落在这里 |
+
+`last_quota_check_at`(epoch 秒)记录最近一次 wham/usage 探测时间,供 `cmd_check --include-standby` 的 24h 去重使用。
 
 ## Mail Provider 切换
 

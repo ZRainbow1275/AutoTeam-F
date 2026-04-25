@@ -741,6 +741,30 @@ def get_admin_diagnose():
         _playwright_lock.release()
 
 
+@app.post("/api/admin/reconcile")
+def post_admin_reconcile(request: Request):
+    """对账 Team 实际成员 vs 本地状态,修复残废 / 错位 / 耗尽未抛弃 / ghost。
+
+    与 /api/admin/diagnose 使用同款鉴权模式(auth_middleware 已处理 API_KEY)。
+    查询参数:
+        dry_run=1 → 只诊断,不 KICK、不改 accounts.json
+    返回 _reconcile_team_members 的完整结果 dict。
+    """
+    from autoteam.manager import cmd_reconcile
+
+    dry_run = str(request.query_params.get("dry_run", "")).strip().lower() in ("1", "true", "yes")
+
+    def _do():
+        return cmd_reconcile(dry_run=dry_run)
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行"))
+    try:
+        return _pw_executor.run(_do)
+    finally:
+        _playwright_lock.release()
+
+
 @app.get("/api/main-codex/status")
 def get_main_codex_status():
     """获取主号 Codex 同步状态。"""
@@ -1837,16 +1861,22 @@ def get_cpa_files():
 # ---------------------------------------------------------------------------
 
 
+class CheckParams(BaseModel):
+    include_standby: bool = False  # True 时额外探测 standby 池(限速+24h 去重)
+
+
 @app.post("/api/tasks/check", status_code=202)
-def post_check():
-    """检查所有 active 账号额度（后台执行）"""
+def post_check(params: CheckParams = CheckParams()):
+    """检查所有 active 账号额度（后台执行）。include_standby=True 时追加探测 standby 池。"""
     from autoteam.manager import cmd_check
 
+    include_standby = bool(params.include_standby)
+
     def _run():
-        exhausted = cmd_check()
+        exhausted = cmd_check(include_standby=include_standby)
         return {"exhausted": [a["email"] for a in exhausted]}
 
-    task = _start_task("check", _run, {})
+    task = _start_task("check", _run, {"include_standby": include_standby})
     return task
 
 

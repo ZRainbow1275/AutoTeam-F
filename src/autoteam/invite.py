@@ -479,9 +479,11 @@ def run():
         status, data = chatgpt.invite_member(email)
 
         if status != 200:
-            logger.error("[邀请] 邀请失败 (HTTP %d)", status)
+            err_kind = (data or {}).get("_error_kind", "unknown") if isinstance(data, dict) else "unknown"
+            logger.error("[邀请] 邀请失败 (HTTP %d, kind=%s)", status, err_kind)
             return False
-        logger.info("[邀请] 邀请已发送")
+        invited_seat = (data or {}).get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
+        logger.info("[邀请] 邀请已发送 (seat_type=%s)", invited_seat)
 
         # Step 3: 等待邀请邮件
         logger.info("[邀请] 等待邀请邮件...")

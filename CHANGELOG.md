@@ -4,6 +4,28 @@
 
 ## [Unreleased] — 2026-04-25
 
+### invite-hardening:邀请 / 巡检 / 对账三路加固
+
+- **feat(invite): seat fallback 鲁棒性** — `chatgpt_api.invite_member` 新增 `_classify_invite_error`(rate_limited / network / domain_blocked / other) + POST `/invites` 退避重试 `[5s, 15s]`;`_update_invite_seat_type` 的 PATCH 加 1 次重试,全部失败时**保留 codex 席位**(`_seat_type="usage_based"`)而不是丢账号。响应 dict 现在一定包含 `_seat_type` ∈ {`chatgpt`, `usage_based`, `unknown`} 与 `_error_kind`,`invite.py` / `manual_account.py` / `manager._run_post_register_oauth` 都据此把席位类型落到 `accounts.json.seat_type`。
+- **feat(check): `cmd_check --include-standby`** — `cmd_check(include_standby=False)` 默认行为不变;传 `True` 时调用新增的 `_probe_standby_quota` 遍历 standby 池,限速 `STANDBY_PROBE_INTERVAL_SEC=1.5s`、去重 `STANDBY_PROBE_DEDUP_SEC=86400s`(24h 内已探测过的跳过)。探到 401/403 → 标 `STATUS_AUTH_INVALID`,仍 exhausted → 刷新 `quota_exhausted_at/resets_at`,ok → 写回 `last_quota` + `last_quota_check_at`(不动 status)。CLI `autoteam check --include-standby`,API `POST /api/tasks/check` 接受 `{"include_standby": true}`。
+- **feat(reconcile): 残废 / 错位 / 耗尽未抛弃 + dry-run** — `_reconcile_team_members` 从原先 3 类扩到 8 类分支,覆盖:
+  - **残废**(workspace 有 active + 本地 `auth_file` 缺失)→ 先尝试从 `auths/codex-{email}-team-*.json` 兜底补齐;找不到则按 `RECONCILE_KICK_ORPHAN` 决定 KICK 或标 `STATUS_ORPHAN`
+  - **错位**(workspace active + 本地 standby)→ 改回 active + 补齐 auth_file(找不到 auth 则降级残废路径)
+  - **耗尽未抛弃**(active + `last_quota` 5h/周均 100%)→ 标 `STATUS_EXHAUSTED` + `quota_exhausted_at=now`,**不立即 kick**,让正常 rotate 流程走,避开 token_revoked 风控
+  - **ghost**(workspace 有 + 本地完全无记录)→ 按 `RECONCILE_KICK_GHOST` 决定 KICK 或留给 `sync_account_states` 补录
+  - `auth_invalid` / `exhausted` / `personal` → 同样 KICK
+  - `orphan` → 已标记,跳过,等人工
+- **feat(reconcile): dry-run 模式** — `cmd_reconcile(dry_run=True)` / `cmd_reconcile_dry_run()` 只诊断不动账户;CLI `autoteam reconcile [--dry-run]`,API `POST /api/admin/reconcile?dry_run=1`。`_reconcile_team_members` 返回结构化 dict(`kicked` / `orphan_kicked` / `orphan_marked` / `misaligned_fixed` / `exhausted_marked` / `ghost_kicked` / `ghost_seen` / `over_cap_kicked` / `flipped_to_active`),第二轮 over-cap kick 优先级改为 `orphan → auth_invalid → exhausted → personal → standby → 额度最低 active`。
+- **新增字段 / 状态**:
+  - `accounts.json.seat_type` ∈ `SEAT_CHATGPT` / `SEAT_CODEX` / `SEAT_UNKNOWN`,常量在 `autoteam.accounts`
+  - `accounts.json.last_quota_check_at`(epoch 秒)— standby 探测去重依据
+  - `STATUS_ORPHAN` — workspace 占席 + 本地 auth 丢失,等人工补登或 kick
+  - `STATUS_AUTH_INVALID` — `auth_file` token 已不可用(401/403),待 reconcile 清理或重登
+- **新增配置**:
+  - `RECONCILE_KICK_ORPHAN`(默认 `true`)— 残废是否自动 KICK
+  - `RECONCILE_KICK_GHOST`(默认 `true`)— ghost 是否自动 KICK
+- **测试**:`tests/unit/test_invite_member_seat_fallback.py`(5)、`tests/unit/test_cmd_check_standby.py`(5)、`tests/unit/test_reconcile_anomalies.py`(5),全过;ruff 干净。
+
 ### 后续修复（基于代码评审 + 真机验证）
 
 - **`maillab.list_emails` 漏传 `type=0`** — 上游 `service/email-service.js` 把空 `type` 翻成 `eq(email.type, NULL)`,所有 RECEIVE 类型(type=0)邮件被静默过滤,导致收件箱永远返回空。强制传 `type=0`。

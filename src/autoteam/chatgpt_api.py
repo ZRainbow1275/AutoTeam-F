@@ -1300,7 +1300,55 @@ class ChatGPTTeamAPI:
             [method, f"https://chatgpt.com{path}", headers_js, json.dumps(body) if body else None],
         )
 
+    # POST /invites 失败时的重试间隔(秒)。rate_limited / network 类错误按此序列退避。
+    _INVITE_POST_RETRY_DELAYS = (5, 15)
+    # PATCH /invites/{id} 失败时的重试间隔(秒)。次数 = len(_INVITE_PATCH_RETRY_DELAYS)
+    _INVITE_PATCH_RETRY_DELAYS = (5,)
+
+    @staticmethod
+    def _classify_invite_error(status, data, resp_body):
+        """将 POST /invites 的响应归类为 domain_blocked / rate_limited / network / other。
+
+        - status == 0 视为 network(fetch 抛异常)
+        - 429 或 body 含 rate_limit/too many 视为 rate_limited
+        - 4xx 且 body 含 domain/not allowed/blocked 视为 domain_blocked
+        - 其他非 200 为 other
+        """
+        if status == 0:
+            return "network"
+        if status == 429:
+            return "rate_limited"
+        # errored_emails 形式也算业务错误,但 HTTP 本身 200,不走这里
+        body_text = ""
+        if isinstance(data, dict):
+            # 常见字段:detail / error / message
+            for key in ("detail", "error", "message"):
+                val = data.get(key)
+                if isinstance(val, str):
+                    body_text += " " + val
+                elif isinstance(val, dict):
+                    inner = val.get("message") or val.get("code") or ""
+                    if isinstance(inner, str):
+                        body_text += " " + inner
+        if not body_text:
+            body_text = resp_body or ""
+        lowered = body_text.lower()
+        if any(kw in lowered for kw in ("rate_limit", "rate limit", "too many", "throttle")):
+            return "rate_limited"
+        if any(kw in lowered for kw in ("domain", "not allowed", "blocked", "forbidden domain")):
+            return "domain_blocked"
+        return "other"
+
     def invite_member(self, email, seat_type="usage_based"):
+        """邀请成员加入 Team。
+
+        返回 `(status, data)`,其中 `data` 一定是 dict(解析失败会封装为 `{"_raw": <text>}`),
+        并必然包含 `_seat_type` 字段,枚举:
+        - "chatgpt": PATCH seat_type=default 成功,完整 ChatGPT 席位
+        - "usage_based": PATCH 失败或未尝试,仅 codex 席位(向后兼容:旧调用方看到非 chatgpt 即可当 codex 处理)
+        - "unknown": POST 本身失败
+        `_seat_type` 与 accounts.SEAT_* 含义一致,但为了不引入循环 import,这里用字符串字面量。
+        """
         path = f"/backend-api/accounts/{self.account_id}/invites"
         body = {
             "email_addresses": [email],
@@ -1309,40 +1357,116 @@ class ChatGPTTeamAPI:
             "resend_emails": True,
         }
 
-        logger.info("[ChatGPT] 发送邀请到 %s (seat_type=%s)...", email, seat_type)
-        result = self._api_fetch("POST", path, body)
+        status = 0
+        data = {}
+        resp_body = ""
+        attempts = 1 + len(self._INVITE_POST_RETRY_DELAYS)
+        for attempt in range(attempts):
+            logger.info(
+                "[ChatGPT] 发送邀请到 %s (seat_type=%s, attempt=%d/%d)...",
+                email,
+                seat_type,
+                attempt + 1,
+                attempts,
+            )
+            result = self._api_fetch("POST", path, body)
+            status = result["status"]
+            resp_body = result["body"]
+            logger.info("[ChatGPT] 响应状态: %d", status)
 
-        status = result["status"]
-        resp_body = result["body"]
-        logger.info("[ChatGPT] 响应状态: %d", status)
+            try:
+                parsed = json.loads(resp_body)
+                logger.debug("[ChatGPT] 响应内容: %s", json.dumps(parsed, indent=2)[:500])
+            except Exception:
+                parsed = {"_raw": resp_body}
+                logger.debug("[ChatGPT] 响应内容(非 JSON): %s", (resp_body or "")[:500])
+            data = parsed if isinstance(parsed, dict) else {"_raw": parsed}
 
-        try:
-            data = json.loads(resp_body)
-            logger.debug("[ChatGPT] 响应内容: %s", json.dumps(data, indent=2)[:500])
-        except Exception:
-            data = resp_body
-            logger.debug("[ChatGPT] 响应内容: %s", resp_body[:500])
+            if status == 200:
+                break
 
-        if status == 200 and seat_type == "usage_based" and isinstance(data, dict):
-            invites = data.get("account_invites", [])
+            err_kind = self._classify_invite_error(status, data, resp_body)
+            logger.warning(
+                "[ChatGPT] 邀请 %s 失败: status=%d kind=%s body=%s",
+                email,
+                status,
+                err_kind,
+                (resp_body or "")[:200],
+            )
+            # domain_blocked / other: 不 retry,直接返回给上层换号处理
+            if err_kind in ("domain_blocked", "other"):
+                data.setdefault("_seat_type", "unknown")
+                data.setdefault("_error_kind", err_kind)
+                return status, data
+            # rate_limited / network: 按退避表 retry
+            if attempt < len(self._INVITE_POST_RETRY_DELAYS):
+                delay = self._INVITE_POST_RETRY_DELAYS[attempt]
+                logger.info("[ChatGPT] %s 类错误,%ds 后重试邀请 %s", err_kind, delay, email)
+                time.sleep(delay)
+                continue
+            # 重试耗尽
+            data.setdefault("_seat_type", "unknown")
+            data.setdefault("_error_kind", err_kind)
+            return status, data
+
+        # status == 200 走到这里。默认标 usage_based,PATCH 成功再升级为 chatgpt
+        data["_seat_type"] = "usage_based"
+
+        if seat_type == "usage_based":
+            invites = data.get("account_invites", []) if isinstance(data, dict) else []
+            # 约定:只要存在一条 invite PATCH 成功,就认为该账号拿到了 ChatGPT 席位
+            any_patched = False
+            any_invite = False
             for inv in invites:
-                invite_id = inv.get("id")
-                if invite_id:
-                    self._update_invite_seat_type(invite_id, "default")
+                invite_id = inv.get("id") if isinstance(inv, dict) else None
+                if not invite_id:
+                    continue
+                any_invite = True
+                if self._update_invite_seat_type(invite_id, "default"):
+                    any_patched = True
+            if any_invite and any_patched:
+                data["_seat_type"] = "chatgpt"
+            else:
+                # 没有 invite 节点(异常响应)或全部 PATCH 失败 → 保底 usage_based,上层按 codex-only 处理
+                if any_invite and not any_patched:
+                    logger.error(
+                        "[ChatGPT] %s PATCH seat_type 全部失败,保留 codex 席位(_seat_type=usage_based)",
+                        email,
+                    )
+        elif seat_type == "default":
+            # 直接 default 邀请,只要 POST 200 即视为完整 ChatGPT 席位
+            data["_seat_type"] = "chatgpt"
 
         return status, data
 
     def _update_invite_seat_type(self, invite_id, seat_type):
+        """PATCH 修改 invite 的 seat_type。返回 True 表示成功,False 表示重试后仍失败。"""
         path = f"/backend-api/accounts/{self.account_id}/invites/{invite_id}"
         body = {"seat_type": seat_type}
 
-        logger.info("[ChatGPT] 修改邀请 seat_type -> %s...", seat_type)
-        result = self._api_fetch("PATCH", path, body)
-
-        if result["status"] == 200:
-            logger.info("[ChatGPT] seat_type 已改为 %s", seat_type)
-        else:
-            logger.error("[ChatGPT] 修改 seat_type 失败: %d %s", result["status"], result["body"][:200])
+        attempts = 1 + len(self._INVITE_PATCH_RETRY_DELAYS)
+        for attempt in range(attempts):
+            logger.info(
+                "[ChatGPT] 修改邀请 seat_type -> %s (attempt=%d/%d)...",
+                seat_type,
+                attempt + 1,
+                attempts,
+            )
+            result = self._api_fetch("PATCH", path, body)
+            status = result["status"]
+            if status == 200:
+                logger.info("[ChatGPT] seat_type 已改为 %s", seat_type)
+                return True
+            logger.error(
+                "[ChatGPT] 修改 seat_type 失败: %d %s",
+                status,
+                (result.get("body") or "")[:200],
+            )
+            if attempt < len(self._INVITE_PATCH_RETRY_DELAYS):
+                delay = self._INVITE_PATCH_RETRY_DELAYS[attempt]
+                logger.info("[ChatGPT] PATCH 失败,%ds 后重试", delay)
+                time.sleep(delay)
+        return False
 
     def list_invites(self):
         path = f"/backend-api/accounts/{self.account_id}/invites"

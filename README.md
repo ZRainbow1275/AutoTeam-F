@@ -132,6 +132,9 @@ Linux + Docker 访问宿主机服务，详见 [Docker 部署文档](docs/docker.
 - **任务取消被静默吞掉** — `_run_task` 里 `reset()` 与 `task_id` 暴露顺序修正
 - **批量操作 300s 硬超时** — `_PlaywrightExecutor` 加 `run_with_timeout(timeout, func)`，按批次大小动态算
 - **Team fill 后面员数 401 未触发 fail-fast** — 连续 3 次 401/403 直接中止，输出 body 片段而不是干等 180s
+- **邀请 seat 兜底失败时账号被静默丢失** 🆕 — `invite_member` POST/PATCH 都加退避重试,PATCH 失败时保留 `usage_based`(codex-only) 席位,把 `seat_type` 落到 `accounts.json` 供下游差异化对待
+- **`cmd_check` 只扫 active,standby 永远没额度数据** 🆕 — `autoteam check --include-standby`(或 `POST /api/tasks/check {include_standby:true}`)追加探测 standby 池,限速 1.5s + 24h 去重;401/403 标记为 `auth_invalid`
+- **workspace 有席位但本地 auth 缺失的"残废 / 错位 / ghost"账号无人清理** 🆕 — `autoteam reconcile [--dry-run]`(或 `POST /api/admin/reconcile?dry_run=1`)一键识别残废 / 错位 / 耗尽未抛弃 / ghost,可通过 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 控制是 KICK 还是打标记
 
 若你遇到 401 "Must be part of this workspace"，不用 logout 重登：
 

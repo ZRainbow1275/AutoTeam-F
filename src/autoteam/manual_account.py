@@ -232,14 +232,18 @@ class ManualAccountFlow:
         auth_file = save_auth_file(bundle)
         plan_type = bundle.get("plan_type") or "unknown"
         account_status = STATUS_ACTIVE if plan_type == "team" else STATUS_STANDBY
+        # plan_type=team → 拿到 Team bundle,同时 PATCH 成功意味着完整 ChatGPT 席位;
+        # 其它 plan_type(free/plus/unknown)按 codex 处理,下游 fill 会据此做差异化判断。
+        seat_label = "chatgpt" if plan_type == "team" else "codex"
 
         accounts = load_accounts()
         account = find_account(accounts, email)
         if not account:
-            add_account(email, "")
+            add_account(email, "", seat_type=seat_label)
 
         update_fields = {
             "status": account_status,
+            "seat_type": seat_label,
             "auth_file": auth_file,
             "quota_exhausted_at": None,
             "quota_resets_at": None,
