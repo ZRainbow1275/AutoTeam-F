@@ -190,3 +190,95 @@ def test_extract_verification_code_inherits_from_base(monkeypatch):
     client = _make_client(monkeypatch)
     code = client.extract_verification_code({"text": "Your ChatGPT code is 314159", "content": ""})
     assert code == "314159"
+
+
+def test_list_emails_passes_type_zero_to_avoid_empty_response(monkeypatch):
+    """maillab service/email-service.js list() 把 type 当 IS NULL 处理时,所有 RECEIVE
+    类型(type=0)的邮件都会被过滤掉。这里强制断言我们传了 type=0 防止退化。"""
+    client = _make_client(monkeypatch)
+    monkeypatch.setattr(client, "_resolve_account_id", lambda v: 7)
+    monkeypatch.setattr(client, "_resolve_account_email", lambda v: "x@example.com")
+
+    captured: dict = {}
+
+    def fake_get(path, params=None):
+        captured["path"] = path
+        captured["params"] = params or {}
+        return {"code": 200, "data": {"list": []}}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    client.list_emails(7, size=10)
+    assert captured["params"]["type"] == 0
+    assert captured["params"]["accountId"] == 7
+    assert captured["params"]["size"] == 10
+
+
+def test_list_accounts_paginates_past_server_size_cap(monkeypatch):
+    """maillab account-service.js list() 服务端硬 cap 30 条。请求 size=200 必须循环翻页。"""
+    client = _make_client(monkeypatch)
+    pages = [
+        # page 1: 30 条
+        [{"accountId": i, "email": f"u{i}@e.com", "sort": 100 - i} for i in range(1, 31)],
+        # page 2: 15 条
+        [{"accountId": i, "email": f"u{i}@e.com", "sort": 70 - i} for i in range(31, 46)],
+        # page 3: 空
+        [],
+    ]
+    calls = {"i": 0}
+
+    def fake_get(path, params=None):
+        idx = calls["i"]
+        calls["i"] += 1
+        rows = pages[idx] if idx < len(pages) else []
+        return {"code": 200, "data": rows}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    out = client.list_accounts(size=200)
+    assert len(out) == 45
+
+
+def test_list_accounts_stops_paginating_when_size_satisfied(monkeypatch):
+    """请求 size <= 30 时,只调用一次,绝不继续翻页消耗服务器额度。"""
+    client = _make_client(monkeypatch)
+    calls = {"i": 0}
+
+    def fake_get(path, params=None):
+        calls["i"] += 1
+        return {
+            "code": 200,
+            "data": [{"accountId": i, "email": f"u{i}@e.com", "sort": 100 - i} for i in range(1, 31)],
+        }
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    out = client.list_accounts(size=10)
+    assert len(out) == 10
+    assert calls["i"] == 1
+
+
+def test_list_accounts_omits_phantom_mailcount_sendcount_fields(monkeypatch):
+    """entity/account.js 没有 mailCount/sendCount 列,实现里不应再暴露这两个永远为 None
+    的字段;改取真实字段 latestEmailTime / status / name。"""
+    client = _make_client(monkeypatch)
+
+    def fake_get(path, params=None):
+        return {
+            "code": 200,
+            "data": [
+                {
+                    "accountId": 1,
+                    "email": "u1@e.com",
+                    "name": "alice",
+                    "status": 0,
+                    "latestEmailTime": "2026-04-25 10:00:00",
+                    "sort": 1,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    out = client.list_accounts(size=5)
+    assert "mailCount" not in out[0]
+    assert "sendCount" not in out[0]
+    assert out[0]["name"] == "alice"
+    assert out[0]["status"] == 0
+    assert out[0]["latestEmailTime"] == 1777111200  # 2026-04-25 10:00:00 UTC

@@ -205,31 +205,69 @@ class MaillabClient(MailProvider):
         logger.info("[maillab] 临时邮箱已创建: %s (accountId=%s)", email, account_id)
         return account_id, email
 
+    # maillab service/account-service.js list() 服务端硬 cap 30。请求 size > 30 也只能
+    # 拿到 30 条,需要循环翻页(lastSort + accountId 游标)拉满。
+    _ACCOUNT_LIST_PAGE_CAP = 30
+
     def list_accounts(self, size: int = 200):
-        """GET /account/list → 返回 {accountId, email, ...}。size 在 maillab 端无约束。"""
+        """GET /account/list → 返回 [{accountId, email, ...}, ...]。
+
+        服务端单页 cap 30(account-service.js list);本方法循环翻页直到拿满 size 条
+        或服务端不再返回新行。size=None / 0 表示尽量拉全。
+        """
         self._ensure_login()
-        resp = self._get("/account/list")
-        if resp.get("code") != 200:
-            return []
-        rows = resp.get("data") or []
-        out = []
-        for row in rows:
-            out.append(
-                {
-                    "accountId": row.get("accountId") or row.get("id"),
-                    "email": row.get("email"),
-                    # maillab 不返回 password(账户体系不基于密码,登录靠主账号 jwt)
-                    "password": None,
-                    "createTime": _parse_create_time(row.get("createTime")),
-                    "updateTime": _parse_create_time(row.get("updateTime")),
-                    # TODO(maillab-verify): mailCount/sendCount 是否在 list 接口里返回?
-                    # 仓库 service/account-service.js 未明确,e2e 时确认。
-                    "mailCount": row.get("mailCount"),
-                    "sendCount": row.get("sendCount"),
-                    "raw": row,
-                }
-            )
-        return out[:size] if size else out
+        target = int(size) if size else 0
+        out: list[dict] = []
+        last_sort = 0
+        last_id = 0
+        seen_ids: set[int] = set()
+        # 防御:理论上 ceil(size / 30) 页就够,设上限避免恶意服务端无限翻页
+        max_pages = max(1, (target // self._ACCOUNT_LIST_PAGE_CAP) + 2) if target else 50
+        for _ in range(max_pages):
+            params = {"size": self._ACCOUNT_LIST_PAGE_CAP}
+            if last_sort or last_id:
+                # service 用 lastSort + accountId 做游标,首页留空走默认降序
+                params["lastSort"] = last_sort
+                params["accountId"] = last_id
+            resp = self._get("/account/list", params=params)
+            if resp.get("code") != 200:
+                break
+            rows = resp.get("data") or []
+            if not rows:
+                break
+            new_in_page = 0
+            for row in rows:
+                aid = row.get("accountId") or row.get("id")
+                if aid is None or aid in seen_ids:
+                    continue
+                seen_ids.add(aid)
+                new_in_page += 1
+                out.append(
+                    {
+                        "accountId": aid,
+                        "email": row.get("email"),
+                        # maillab 不返回 password(账户体系不基于密码,登录靠主账号 jwt)
+                        "password": None,
+                        "createTime": _parse_create_time(row.get("createTime")),
+                        "updateTime": _parse_create_time(row.get("updateTime")),
+                        # entity/account.js 实际列:accountId/email/name/status/
+                        # latestEmailTime/createTime/userId/allReceive/sort/isDel
+                        # 没有 mailCount/sendCount,只暴露真实字段
+                        "name": row.get("name"),
+                        "status": row.get("status"),
+                        "latestEmailTime": _parse_create_time(row.get("latestEmailTime")),
+                        "raw": row,
+                    }
+                )
+                if target and len(out) >= target:
+                    return out
+            if new_in_page == 0:
+                # 一整页都是已见过的 → 服务端已没新行
+                break
+            tail = rows[-1]
+            last_sort = tail.get("sort") or 0
+            last_id = tail.get("accountId") or tail.get("id") or 0
+        return out
 
     def delete_account(self, account_id):
         """DELETE /account/delete?accountId=N。account_id 允许 email,自动解析。"""
@@ -320,21 +358,24 @@ class MaillabClient(MailProvider):
         }
 
     def list_emails(self, account_id, size: int = 10):
-        """GET /email/list?accountId=N&size=10。
+        """GET /email/list?accountId=N&type=0&size=10。
 
         响应:`{code:200, data:{list:[...], total, latestEmail}}`
+
+        critical: type 必填。maillab service/email-service.js list() where 子句含
+        `eq(email.type, type)`,emailConst 中 RECEIVE=0 / SEND=1。type 缺省时 drizzle
+        翻成 IS NULL,匹配不到任何行(收件全是 type=0)→ 列表永远为空。
         """
         self._ensure_login()
         real_id = self._resolve_account_id(account_id)
         if not real_id:
             return []
 
-        # TODO(maillab-verify): timeSort 默认 0(降序)、allReceive 0、emailId 0(无游标);
-        # service/email-service.js 列出了这些参数但未给出每个的默认行为,e2e 时验证。
         resp = self._get(
             "/email/list",
             params={
                 "accountId": real_id,
+                "type": 0,  # RECEIVE = 0 (emailConst.type),不传会拿不到任何邮件
                 "size": min(int(size or 10), 50),
                 "emailId": 0,
                 "timeSort": 0,

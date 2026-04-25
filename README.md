@@ -33,7 +33,7 @@
 
 | | 功能 | 描述 |
 |---|---|---|
-| 📧 | **自动注册** | CloudMail 临时邮箱 + Playwright 自动注册 |
+| 📧 | **自动注册** | 临时邮箱（`cf_temp_email` 或 `maillab` 双后端可切换）+ Playwright 自动注册 |
 | 🆓 | **生产免费号** 🆕 | 批量注册 → 主号踢出 → Personal OAuth，一条龙 |
 | 🔐 | **Codex OAuth** | 自动登录 Codex，Team / Personal 双模式 |
 | 🔑 | **手动 OAuth 导入** | localhost 自动回调，失败可手动粘贴 |
@@ -78,7 +78,7 @@ uv run autoteam api
 uv run autoteam rotate
 ```
 
-首次启动会自动引导配置 CloudMail、CPA、API Key，并验证连通性。
+首次启动会自动引导配置 临时邮箱后端（`cf_temp_email` 默认 / `maillab` 可选）、CPA、API Key，并验证连通性。两种后端的差异见 [配置说明 · Mail Provider 切换](docs/configuration.md#mail-provider-切换)。
 
 ### Docker 部署
 

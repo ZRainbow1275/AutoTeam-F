@@ -9,7 +9,7 @@
 | 服务 | 说明 | 获取方式 |
 |------|------|---------|
 | **ChatGPT Team 订阅** | 管理员主号，需要有 Team 订阅 | [chatgpt.com](https://chatgpt.com) |
-| **CloudMail** | 临时邮箱服务，用于自动注册与收验证码 | 自建 [cloud-mail](https://github.com/maillab/cloud-mail) |
+| **临时邮箱** | 自动注册与收验证码,二选一 | ① **`cf_temp_email`(默认)** = 自建 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)<br>② **`maillab`** = 自建 [maillab/cloud-mail](https://github.com/maillab/cloud-mail) |
 | **CLIProxyAPI** | Codex 代理与认证文件同步目标 | 自建 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) |
 | **VPS / 本地机器** | 推荐 Ubuntu 22.04+；也支持 Windows / macOS | 任意云服务商 / 本地电脑 |
 | **域名** | 用于 CloudMail 临时邮箱与 Verified Domains | 任意域名注册商 |
@@ -18,14 +18,35 @@
 
 ## 准备工作
 
-### 1. 搭建 CloudMail
+### 1. 搭建临时邮箱后端（二选一）
 
-参考 CloudMail 官方文档完成搭建：https://doc.skymail.ink/guide/dashboard
+> **命名说明**:历史上配置项叫 `CLOUDMAIL_*`,但它指向的是 `dreamhunter2333/cloudflare_temp_email`,
+> **不是** `maillab/cloud-mail`(社区里另一个同名项目)。两个后端 API 完全不兼容,需要按你实际部署的那一个填配置。
 
-搭建完成后你会得到：
-- CloudMail API 地址（如 `https://your-domain.com/api`）
-- 管理员邮箱和密码
-- 邮箱域名（如 `@your-domain.com`）
+#### 选项 A:`cf_temp_email`(**默认推荐**)
+
+适配 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email),基于 Cloudflare Workers,搭建简单。
+
+按官方文档完成部署后你会得到:
+- API 地址(如 `https://your-domain.com/api`)→ `CLOUDMAIL_BASE_URL`
+- 管理员密码(`x-admin-auth`)→ `CLOUDMAIL_PASSWORD`
+- 邮箱域名(如 `@your-domain.com`)→ `CLOUDMAIL_DOMAIN`
+
+#### 选项 B:`maillab`
+
+适配 [maillab/cloud-mail](https://github.com/maillab/cloud-mail)(参考 [官方文档](https://doc.skymail.ink/guide/dashboard))。
+
+部署完成后,在 `.env` 中显式设置:
+
+```dotenv
+MAIL_PROVIDER=maillab
+MAILLAB_API_URL=https://your-maillab.example.com
+MAILLAB_USERNAME=admin@example.com
+MAILLAB_PASSWORD=your_password
+MAILLAB_DOMAIN=@your-domain.com
+```
+
+> 切换后业务调用方零改动,工厂会按 `MAIL_PROVIDER` 自动 dispatch。详见 [配置说明](configuration.md#mail-provider-切换)。
 
 ### 2. 设置 OpenAI Verified Domains
 
@@ -39,6 +60,8 @@
 6. 进入 Workspace → Identity & Access，打开 **Automatic account creation**
 
 这样使用该域名邮箱注册的 ChatGPT 账号会自动加入 Team workspace，不需要手动邀请。
+
+> 域名验证只针对 ChatGPT 侧,与你选哪个临时邮箱后端无关 — `cf_temp_email` 和 `maillab` 都需要。
 
 ### 3. 搭建 CLIProxyAPI
 
@@ -89,20 +112,22 @@ docker compose up -d
 uv run autoteam api
 ```
 
-按提示依次填入：
+按提示依次填入(以默认的 `cf_temp_email` 后端为例):
 
 ```text
 === AutoTeam 首次配置 ===
 
+  Mail Provider [cf_temp_email]:                 ← 回车用默认,或填 maillab
   CloudMail API 地址: https://your-cloudmail.com/api
-  CloudMail 登录邮箱: admin@your-domain.com
-  CloudMail 登录密码: your_password
-  CloudMail 邮箱域名（如 @example.com）: @your-domain.com
+  CloudMail 管理员密码: your_password
+  邮箱域名（如 @example.com）: @your-domain.com
   CPA 管理密钥: your_cpa_key
   API 鉴权密钥 [回车自动生成]:
 ```
 
-配置会自动验证 CloudMail 和 CPA 的连通性，失败会提示具体原因。
+> 选 `maillab` 后,需要直接编辑 `.env` 补 `MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN`(向导暂未把这几个加入交互列表)。
+
+配置会自动验证临时邮箱后端和 CPA 的连通性，失败会提示具体原因。
 
 ### Docker 部署
 
