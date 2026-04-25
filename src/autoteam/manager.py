@@ -277,6 +277,8 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                             rs = _safe_kick(email)
                             if rs in ("removed", "already_absent", "dry_run"):
                                 result["orphan_kicked"].append(email)
+                                # KICK 成功后必须同步本地状态,否则下次 fill 仍按 active 计数(回归 bug)
+                                _safe_update(acc.get("email"), status=STATUS_AUTH_INVALID)
                         else:
                             _safe_update(acc.get("email"), status=STATUS_ORPHAN)
                             result["orphan_marked"].append(email)
@@ -299,6 +301,8 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                         rs = _safe_kick(email)
                         if rs in ("removed", "already_absent", "dry_run"):
                             result["orphan_kicked"].append(email)
+                            # KICK 成功后必须同步本地状态,否则下次 fill 仍按 active 计数(回归 bug)
+                            _safe_update(acc.get("email"), status=STATUS_AUTH_INVALID)
                     else:
                         logger.warning("[对账] 残废 %s,RECONCILE_KICK_ORPHAN=false,标 STATUS_ORPHAN", email)
                         _safe_update(acc.get("email"), status=STATUS_ORPHAN)

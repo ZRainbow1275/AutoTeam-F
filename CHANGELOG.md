@@ -26,6 +26,45 @@
   - `RECONCILE_KICK_GHOST`(默认 `true`)— ghost 是否自动 KICK
 - **测试**:`tests/unit/test_invite_member_seat_fallback.py`(5)、`tests/unit/test_cmd_check_standby.py`(5)、`tests/unit/test_reconcile_anomalies.py`(5),全过;ruff 干净。
 
+### invite-hardening 回归修复(真机对账后发现)
+
+- **fix(reconcile): KICK orphan 成功后必须同步本地 `STATUS_AUTH_INVALID`** — `_reconcile_team_members` 第一轮把 workspace 残废账号 KICK 掉之后,**只动了 workspace 状态、没改 `accounts.json`**,下次 `cmd_fill` / `cmd_rotate` 仍按 `STATUS_ACTIVE` 计数,Team 席位计算飘移、出现"账号已被踢但本地仍占名额"的幽灵态。补丁:`manager.py:280-281`(STANDBY 错位降级路径)和 `manager.py:304-305`(直接残废路径)KICK 返回 `removed`/`already_absent`/`dry_run` 时,立刻 `_safe_update(email, status=STATUS_AUTH_INVALID)`。新增 `tests/unit/test_reconcile_anomalies.py::test_reconcile_orphan_kick_syncs_local_status_to_auth_invalid` 做回归保护。
+
+### invite-hardening 批判性代码评审产出(2026-04-25,5-agent team review,findings only,补丁待后续 PR)
+
+> 这一节记录 d6082ad + 上述回归修复合到 main 后,5 个 agent 各自负责一个攻击面跑批判审查得出的**待修问题清单**。本节代码未改动,只列入 backlog 供后续 PR 拆单解决。
+
+- **invite_member 重试与错误分类(`chatgpt_api.py`)**
+  - `_classify_invite_error` 把 5xx 归为 `other` → 不重试,OpenAI 网关短抖直接掉号(`chatgpt_api.py:1309-1340`)
+  - `domain` / `forbidden` / `blocked` 关键词命中面太宽,可恢复错误被吞成 `domain_blocked` 不重试(`chatgpt_api.py:1338`)
+  - `errored_emails` / `account_invites` 数组形态的内层 error 字段不被扫描(`chatgpt_api.py:1322-1334`)
+  - 重试无 jitter,批量号同步反弹放大 rate_limit;`status==0` 网络分支总耗时可能 1–2 分钟卡死调用链
+- **`invite_to_team` 是死代码**(`manager.py:1239-1268`)
+  - `invite.py:479` 直接调 `chatgpt_api.invite_member` 绕过包装,`return_detail=True` / `seat_label` 转译 / `default→usage_based` 兜底**全部从未生效**;commit msg 宣称的链路与运行时不符
+- **`seat_type` 落盘是死数据**
+  - 全仓 grep 无任何模块读 `acc.get("seat_type")`,PATCH 失败保留 codex 席位的兜底对下游零影响 — 仍按 chatgpt 席位走 OAuth + 查 `wham/usage`
+  - `_run_post_register_oauth` 的 `team_auth_missing` 分支(`manager.py:1364-1370`)+ `sync_account_states` 自动补录路径(`manager.py:479-491` / `509-521`)写新账号时跳过 `add_account` 工厂,字段不全
+- **新状态 `auth_invalid` / `orphan` 在前端/状态汇总缺失**
+  - `api.py:1529-1573` `/api/status` summary 硬编码 5 种旧状态,新状态不计数
+  - `web/src/components/Dashboard.vue:381-403` `statusClass` / `dotClass` / `statusLabel` 白名单不包含新状态,UI 看到原始英文 + 灰色样式
+- **`_reconcile_team_members` 漏洞**
+  - **dry_run 严重低估真实 KICK 数**:跳过第二轮 over-cap,审批链路被绕过(`manager.py:344-346`)
+  - **`_priority` 里 ghost 返回 `(0, 0)` 最先 kick,绕过 `RECONCILE_KICK_GHOST=False` 开关**(`manager.py:378-379`)
+  - **`_find_team_auth_file` fallback** 接受 personal/plus plan 的 auth 挂到 team 席位账号,导致下次 API 401 / org mismatch(`manager.py:124-126`)
+  - **补齐 auth_file 后 `continue` 跳过 `_is_quota_exhausted_snapshot`**:本应标 EXHAUSTED 的号当 active 留下,下次 fill 立即 429(`manager.py:269-272` / `295-298`)
+  - STANDBY 错位降级 KICK 后打 `STATUS_AUTH_INVALID`,语义被拉宽到"auth 文件压根不存在",和 accounts.py:19 的"token 失效"注释不符,可能让暂时丢 auth 的号永久从 standby 池消失
+- **`_probe_standby_quota` 网络抖动误判 + 自愈断裂**(`manager.py:1120-1122` + `codex_auth.py:1642-1656`)
+  - `check_codex_quota` 把 DNS / timeout / SSL / 5xx / 429 一律返回 `auth_error` → standby 探测看到无条件标 `STATUS_AUTH_INVALID` + 写 `last_quota_check_at` → **24h 内不复验**;若该号之后 reinvite 回 Team,reconcile 立即 KICK,自愈链路断裂
+  - 未知 `status_str` 防御分支也写 `last_quota_check_at`,异常被屏蔽 24h
+  - 主循环无 `stop_flag` / 软取消信号,中途取消会留下半截探测状态
+- **文档缺漏**
+  - `.env.example` 漏列 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 两个开关示例
+  - `docs/api.md` 未更新 `POST /api/admin/reconcile` 与 `POST /api/tasks/check {"include_standby": true}`
+  - `docs/architecture.md` 状态机图未画 "reconcile KICK orphan → STATUS_AUTH_INVALID" 转移
+  - `docs/platform-signup-protocol.md` 顶部 `Status:` 行未明确"探索性归档(需求 1 已放弃)"
+
+> 评审范围:`d6082ad` + 本节回归补丁。共 5 个 reviewer 跑出 11 high / 13 medium / 2 low / 6 文档缺漏。补丁拆单到下个 PR,**这一节用于追溯,不构成代码改动**。
+
 ### 后续修复（基于代码评审 + 真机验证）
 
 - **`maillab.list_emails` 漏传 `type=0`** — 上游 `service/email-service.js` 把空 `type` 翻成 `eq(email.type, NULL)`,所有 RECEIVE 类型(type=0)邮件被静默过滤,导致收件箱永远返回空。强制传 `type=0`。

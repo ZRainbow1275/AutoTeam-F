@@ -12,6 +12,7 @@ import types
 from autoteam import manager
 from autoteam.accounts import (
     STATUS_ACTIVE,
+    STATUS_AUTH_INVALID,
     STATUS_EXHAUSTED,
     STATUS_ORPHAN,
     STATUS_STANDBY,
@@ -170,6 +171,37 @@ def test_reconcile_dry_run_does_not_mutate(tmp_path, monkeypatch):
     assert result["dry_run"] is True
     assert "ghost-local@example.com" in result["orphan_kicked"]  # 包含 dry_run 记录
     assert "completely-unknown@example.com" in result["ghost_kicked"]
+
+
+def test_reconcile_orphan_kick_syncs_local_status_to_auth_invalid(tmp_path, monkeypatch):
+    """回归保护:残废 KICK 成功后必须把本地 status 改成 STATUS_AUTH_INVALID,
+    否则下次 fill 仍按 active 计数,workspace 实际成员数和本地不一致。
+    """
+    acc = {
+        "email": "kicked-orphan@example.com",
+        "status": STATUS_ACTIVE,
+        "auth_file": None,
+    }
+    fake = _make_fake_chatgpt([{"email": "kicked-orphan@example.com"}])
+    _common_monkeypatch(monkeypatch, [acc])
+
+    import autoteam.config as _cfg
+
+    monkeypatch.setattr(_cfg, "RECONCILE_KICK_ORPHAN", True, raising=False)
+    monkeypatch.setattr(manager, "_find_team_auth_file", lambda email: None)
+
+    monkeypatch.setattr(manager, "remove_from_team", lambda *_a, **_kw: "removed")
+
+    updates = []
+    monkeypatch.setattr(manager, "update_account", lambda email, **kw: updates.append((email, kw)))
+
+    result = manager._reconcile_team_members(chatgpt_api=fake)
+
+    assert "kicked-orphan@example.com" in result["orphan_kicked"]
+    # 关键回归断言:必须有一次 update 把 status 改成 STATUS_AUTH_INVALID
+    assert any(
+        email == "kicked-orphan@example.com" and kw.get("status") == STATUS_AUTH_INVALID for email, kw in updates
+    ), f"expected status=AUTH_INVALID write, got: {updates}"
 
 
 def test_reconcile_orphan_marked_when_kick_disabled(tmp_path, monkeypatch):
