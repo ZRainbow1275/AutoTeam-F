@@ -278,7 +278,8 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
 
             if status == STATUS_PENDING:
                 logger.info("[对账] %s pending → active(Team 里已存在)", email)
-                _safe_update(acc.get("email"), status=STATUS_ACTIVE)
+                # 同步当前 workspace 指纹,防止下轮 sync_account_states 把它误打 standby
+                _safe_update(acc.get("email"), status=STATUS_ACTIVE, workspace_account_id=account_id)
                 result["flipped_to_active"].append(email)
                 continue
 
@@ -290,7 +291,12 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                     found = _find_team_auth_file(email)
                     if found:
                         logger.info("[对账] %s 补齐 auth_file=%s", email, found)
-                        _safe_update(acc.get("email"), status=STATUS_ACTIVE, auth_file=found)
+                        _safe_update(
+                            acc.get("email"),
+                            status=STATUS_ACTIVE,
+                            auth_file=found,
+                            workspace_account_id=account_id,
+                        )
                         result["misaligned_fixed"].append(email)
                         # fallthrough:补齐 auth 后仍要做 quota 耗尽检查,
                         # 否则刚补完的 active 成员若 last_quota=0/0 会被漏标 EXHAUSTED
@@ -308,7 +314,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                             _safe_update(acc.get("email"), status=STATUS_ORPHAN)
                             result["orphan_marked"].append(email)
                 else:
-                    _safe_update(acc.get("email"), status=STATUS_ACTIVE)
+                    _safe_update(acc.get("email"), status=STATUS_ACTIVE, workspace_account_id=account_id)
                     result["misaligned_fixed"].append(email)
                     _check_and_mark_exhausted(acc, email, _safe_update, result)
                 continue
@@ -513,8 +519,24 @@ def sync_account_states(chatgpt_api=None):
 
         if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING):
             acc["status"] = STATUS_ACTIVE
+            # 把当前 workspace 指纹打到记录上,后续若母号切换可以靠这字段识别
+            if account_id:
+                acc["workspace_account_id"] = account_id
             changed = True
         elif not in_team and acc["status"] == STATUS_ACTIVE:
+            # 守卫(Bug 4A):账号记录的 workspace_account_id 与当前 workspace 不一致 →
+            # 这是母号切换造成的"前母号留下号",不是真的被踢出。保留原 active,
+            # 不要无脑刷成 standby(否则 sync_to_cpa 会把还可用的 token 文件抹掉)。
+            # 仅在两个 ID 都存在且不同时跳过 flip;字段缺失/legacy 记录走原行为。
+            acc_ws = acc.get("workspace_account_id")
+            if acc_ws and account_id and acc_ws != account_id:
+                logger.warning(
+                    "[同步] %s 在当前 workspace 不可见,但其 workspace_account_id=%s ≠ 当前 %s(母号切换遗留),保留 active 不 flip",
+                    acc["email"],
+                    acc_ws,
+                    account_id,
+                )
+                continue
             acc["status"] = STATUS_STANDBY
             changed = True
 
@@ -530,6 +552,7 @@ def sync_account_states(chatgpt_api=None):
                         "password": "",
                         "cloudmail_account_id": None,
                         "status": STATUS_ACTIVE,
+                        "workspace_account_id": account_id or None,
                         "auth_file": None,
                         "quota_exhausted_at": None,
                         "quota_resets_at": None,
@@ -854,7 +877,7 @@ def cmd_check(include_standby: bool = False):
 
                 if email_l in team_emails:
                     logger.info("[检查] pending 账号已在 Team 中，转为 active: %s", email)
-                    update_account(email, status=STATUS_ACTIVE)
+                    update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
                     continue
 
                 if email_l in invite_emails:
@@ -1073,6 +1096,65 @@ def cmd_check(include_standby: bool = False):
             else:
                 logger.error("[%s] Codex 登录失败，标记为 standby", email)
                 update_account(email, status=STATUS_STANDBY)
+
+    # 已 exhausted 但 5h 重置时间已过 → 复测,真的回血则 promote 回 active,避免轮转
+    # 多走一遍"kick → standby → re-invite"。token 仍在 Team 里时这个直接 promote 路径
+    # 节省一次 Playwright + remove_from_team + invite + OAuth 的开销。
+    accounts_now = load_accounts()
+    exhausted_to_probe = [
+        a
+        for a in accounts_now
+        if a.get("status") == STATUS_EXHAUSTED
+        and not _is_main_account_email(a.get("email"))
+        and a.get("auth_file")
+        and Path(a["auth_file"]).exists()
+        and a.get("quota_resets_at")
+        and time.time() >= a["quota_resets_at"]
+    ]
+    if exhausted_to_probe:
+        logger.info("[检查] 复测 %d 个重置时间已过的 exhausted 账号...", len(exhausted_to_probe))
+        for acc in exhausted_to_probe:
+            email = acc["email"]
+            try:
+                status_str, info = _check_and_refresh(acc)
+            except Exception as exc:
+                logger.warning("[%s] exhausted 复测异常,跳过: %s", email, exc)
+                continue
+            if status_str == "ok" and isinstance(info, dict):
+                p_remain = 100 - info.get("primary_pct", 0)
+                if p_remain >= threshold:
+                    update_account(
+                        email,
+                        status=STATUS_ACTIVE,
+                        last_quota=info,
+                        quota_exhausted_at=None,
+                        quota_resets_at=None,
+                        workspace_account_id=get_chatgpt_account_id() or None,
+                    )
+                    logger.info(
+                        "[%s] 5h 已重置(剩余 %d%%),从 exhausted 回血到 active",
+                        email,
+                        p_remain,
+                    )
+                else:
+                    update_account(email, last_quota=info)
+                    logger.info(
+                        "[%s] 复测后剩余 %d%% < %d%%,保留 exhausted",
+                        email,
+                        p_remain,
+                        threshold,
+                    )
+            elif status_str == "exhausted":
+                quota_info = quota_result_quota_info(info) or {}
+                new_resets = quota_result_resets_at(info) or acc.get("quota_resets_at")
+                if quota_info:
+                    update_account(email, last_quota=quota_info, quota_resets_at=new_resets)
+                logger.info("[%s] 复测后仍 exhausted,resets_at 已刷新", email)
+            elif status_str == "auth_error":
+                logger.warning("[%s] 复测时 token 失效,改标 AUTH_INVALID 等 reconcile 处理", email)
+                update_account(email, status=STATUS_AUTH_INVALID)
+            elif status_str == "network_error":
+                logger.info("[%s] 复测遇到临时网络错误,保留 exhausted,下一轮再试", email)
 
     # Personal 号独立扫描(不参与轮转,但用户需要看到额度)
     try:
@@ -1390,6 +1472,7 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             seat_type=seat_label,
             auth_file=auth_file,
             last_active_at=time.time(),
+            workspace_account_id=get_chatgpt_account_id() or None,
         )
         logger.info("[注册] 账号就绪: %s (seat=%s)", email, seat_label)
         _record_outcome("success", plan=bundle.get("plan_type"))
@@ -1397,7 +1480,7 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
     # 部分成功：账号已入 Team(席位被占用)但 auth_file 缺失,需要用户手动"补登录"。
     # 上游 cmd_fill 依 `if email: produced+=1` 按席位计数,所以这里仍返回 email;
     # outcome 打 team_auth_missing 让汇总能显示"这批里有 X 个需要补登录"。
-    update_account(email, status=STATUS_ACTIVE)
+    update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
     logger.warning("[注册] 账号已加入 Team 但 Codex 登录失败,需要补登录: %s", email)
     _record_outcome("team_auth_missing", reason="已入 Team 席位但 Codex OAuth 未返回 bundle,需要补登录")
     return email
@@ -1481,7 +1564,7 @@ def _check_pending_invites(chatgpt_api, mail_client, *, leave_workspace=False, o
             password = acc.get("password") or random_password()
         else:
             password = random_password()
-            add_account(inv_email, password)
+            add_account(inv_email, password, workspace_account_id=get_chatgpt_account_id() or None)
 
         # 关闭 ChatGPT 浏览器再注册
         chatgpt_api.stop()
@@ -2322,7 +2405,7 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
         _record_outcome("register_failed", reason=f"注册 {register_attempts} 次均未进入 Team")
         return None
 
-    add_account(email, password, cloudmail_account_id=account_id)
+    add_account(email, password, cloudmail_account_id=account_id, workspace_account_id=get_chatgpt_account_id() or None)
 
     return _run_post_register_oauth(
         email,
@@ -2501,7 +2584,13 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             )
         return False
 
-    update_account(email, status=STATUS_ACTIVE, last_active_at=time.time(), auth_file=auth_file)
+    update_account(
+        email,
+        status=STATUS_ACTIVE,
+        last_active_at=time.time(),
+        auth_file=auth_file,
+        workspace_account_id=get_chatgpt_account_id() or None,
+    )
     logger.info("[轮转] 旧账号已恢复: %s", email)
     return True
 

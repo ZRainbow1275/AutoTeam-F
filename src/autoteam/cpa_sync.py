@@ -584,13 +584,45 @@ def sync_to_cpa():
 
     # 删除：CPA 中有但不在同步列表的（仅限本地管理的账号 — 避免误删主号或 CPA 手动文件）
     # 注意：personal 号已计入 files_to_sync，这里不会被删掉；只有状态变成 STANDBY/EXHAUSTED 等才会清理
+    #
+    # Bug 4B 防御:删 CPA 文件之前再加一道闸 —— 若该 email 在本地 accounts.json 仍持有
+    # **同名** auth_file(物理文件存在),说明本地仍认为这份 token 有用,只是 status 暂时
+    # 不在 active/personal(可能是母号切换瞬间 sync_account_states 错刷成 standby、或者
+    # exhausted 待 rotate 处置)。这种情况下删 CPA 文件等于把"还能用的实物 token"丢掉,
+    # 即便事后状态修回来,CPA 端也得等下一次 sync_to_cpa 重新上传(且若 auth_file 期间
+    # 被刷 token 失败,这份就永久丢失)。
+    # 因此守卫规则:本地 auth_file 路径存在 + 文件名完全等于 CPA 端 name → 跳过删除,
+    # 留 WARN log 让用户知道。让删除只在"本地真的没这份文件了/换名字了"时才发生。
+    local_auth_by_email = {}
+    for acc in accounts:
+        email_l = (acc.get("email") or "").lower()
+        auth_path_str = acc.get("auth_file")
+        if not email_l or not auth_path_str:
+            continue
+        try:
+            ap = Path(auth_path_str)
+        except Exception:
+            continue
+        local_auth_by_email[email_l] = ap
+
     deleted = 0
+    skipped_protected = 0
     for name, cpa_file in cpa_names.items():
         email = cpa_file.get("email", "").lower()
         if email in local_emails and name not in files_to_sync:
+            local_path = local_auth_by_email.get(email)
+            if local_path is not None and local_path.exists() and local_path.name == name:
+                logger.warning(
+                    "[CPA] 跳过删除 %s — 本地仍持有同名 auth_file 物理文件,等下一轮状态稳定后再处理",
+                    name,
+                )
+                skipped_protected += 1
+                continue
             logger.info("[CPA] 删除非 active/personal 文件: %s (%s)", name, email)
             if delete_from_cpa(name):
                 deleted += 1
+    if skipped_protected:
+        logger.info("[CPA] 守卫保留 %d 个 CPA 文件(本地仍持有,避免误删 token)", skipped_protected)
 
     logger.info("[CPA] 同步完成: 上传 %d, 删除 %d, 本地去重 %d", uploaded, deleted, local_duplicates_deleted)
 

@@ -1491,7 +1491,9 @@ def post_account_login(params: LoginAccountParams):
                 # personal 补登录：不改状态（保持 PERSONAL），只刷新 auth_file
                 update_account(email, status=STATUS_PERSONAL)
             elif plan_type == "team":
-                update_account(email, status=STATUS_ACTIVE)
+                from autoteam.admin_state import get_chatgpt_account_id
+
+                update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
                 token = bundle.get("access_token")
                 if token:
                     st, info = check_codex_quota(token)
@@ -1939,9 +1941,9 @@ def post_fill(params: TaskParams = TaskParams()):
     from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP, cmd_fill
 
     if params.leave_workspace:
-        from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED, list_accounts
+        from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED, load_accounts
 
-        in_team_local = sum(1 for a in list_accounts() if a.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED))
+        in_team_local = sum(1 for a in load_accounts() if a.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED))
         if in_team_local >= TEAM_SUB_ACCOUNT_HARD_CAP:
             raise HTTPException(
                 status_code=409,

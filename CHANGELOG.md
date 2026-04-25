@@ -4,6 +4,17 @@
 
 ## [Unreleased] — 2026-04-25
 
+### invite-hardening round-3:母号切换鲁棒性 + exhausted 自愈 + CPA 删除守卫
+
+> 用户实测后报告 4 个问题:① "生成免费号"按钮 HTTP 500 ② exhausted 5h 重置后未回血到 active ③ 母号被吊销切换新号后,旧 workspace 留下的子号被错刷成 standby + CPA 文件被批量误删 ④ README 关于 personal 号牵连失效的结论错误。本轮逐一修复,全部为本地行为变更,不动 API/UI 协议。
+
+- **fix(api): `list_accounts` → `load_accounts`** — `api.py:post_fill` 在 `leave_workspace=True` 分支误写成 `from autoteam.accounts import list_accounts`(实际函数名 `load_accounts`),导致点 Web 面板"生成免费号"按钮直接 ImportError → 500 → 前端 toast"服务器返回了非 JSON 响应"。单点改名修复。
+- **feat(check): exhausted 自愈** — `cmd_check` 新增"复测重置时间已过的 exhausted 账号"分支:遍历 `STATUS_EXHAUSTED` 且 `quota_resets_at <= now` 的账号,调一次 `_check_and_refresh`,返回 `ok` 且 5h 剩余 ≥ 阈值 → **直接 promote 回 `STATUS_ACTIVE`**(同时清 `quota_exhausted_at` / `quota_resets_at`),省一次"kick → standby → re-invite"的 Playwright 全流程。`exhausted` 仍 `auth_error` → 标 `AUTH_INVALID`;仍 `exhausted` → 刷 `quota_resets_at`;`network_error` → 保持原状下一轮再试。
+- **feat(accounts): `workspace_account_id` 字段(母号切换防错杀)** — `accounts.json` 每条记录新增 `workspace_account_id` 字段,记录该号被邀请时所属的 ChatGPT Team workspace `account_id`。`add_account()` 接受新参数;`invite.py` / `manager._run_post_register_oauth` / `manual_account.py` / `manager.create_account_direct` / `manager.cmd_check` pending→active / `_reconcile_team_members` pending→active+standby→active / `cmd_replace_one` 旧号恢复 / api `post-login` Team 补登都把当前 `get_chatgpt_account_id()` 写入。
+- **fix(sync): sync_account_states 不再把"前母号留下号"误标 standby** — 之前 `sync_account_states` 看到 `acc.status==active` 但 `email ∉ team_emails` 就一刀刷成 standby,**完全忽略**这可能是母号切换导致 workspace 整个换了。结果:用户切换母号一瞬间,本地全部 active 子号被错刷 standby,接着 `sync_to_cpa` 把它们的 CPA 文件全删了(实测损失:319 个文件里 0 个匹配本地 4 个号,全军覆没)。新逻辑:`acc.workspace_account_id` 与当前 `account_id` 都存在且不同 → **保留 active 不 flip**,WARN log 提示用户;legacy 记录(无 `workspace_account_id`)走原行为以保持兼容。
+- **fix(cpa_sync): 删 CPA 文件前的本地 auth_file 守卫** — `sync_to_cpa()` 删除 CPA 文件前增加一道闸:若该 email 在本地 `accounts.json` 仍持有 **同名** `auth_file` 物理文件 → 跳过删除,WARN "本地仍持有同名 auth_file 物理文件,等下一轮状态稳定后再处理"。即使 sync_account_states 之外的某条路径错误把 status 改成非 active/personal,这层防御兜住"实物 token 不会被瞬时状态误判抹掉"。
+- **fix(docs): README 撤回错误"已知限制"** — 删除"母号 Team workspace 被吊销时,从该母号衍生(经 Team 邀请 → leave_workspace → personal OAuth)出来的 free plan personal 号会一起失效"这条小节。实测:`d5a9830dc1@icoulsy.asia` 的 token 完全有效,只是 5h primary 已满 — 我先前那次 auth_error 探测是误判。CHANGELOG 同步删该条。
+
 ### mail-provider 协议错配诊断(issue #1)
 
 > [issue #1](https://github.com/ZRainbow1275/AutoTeam-F/issues/1) 报告:从 `cnitlrt/AutoTeam` 迁过来的用户配的 `CLOUDMAIL_*` 实际指向 `maillab/cloud-mail` 服务器,但本 fork 默认 `MAIL_PROVIDER=cf_temp_email` 走的是 `dreamhunter2333/cloudflare_temp_email` 协议 → maillab 服务器把 `/admin/address` 用 catch-all 路由误回 200,login 假成功;后续 `/admin/new_address` 拿到 `{code:401, message:"身份认证失效"}` 才暴露问题。
@@ -12,7 +23,6 @@
 - **feat(setup_wizard): 启动前路由指纹嗅探** — `_sniff_provider_mismatch` 探测 base_url 的 `/admin/address` 与 `/login` 路由活跃度,与 `MAIL_PROVIDER` 期望不一致时打 warning(不阻断启动,真正校验仍走 login/create)。
 - **docs(README): 推荐 `cf_temp_email`** — README 启动小节明确推荐 [`dreamhunter2333/cloudflare_temp_email`](https://github.com/dreamhunter2333/cloudflare_temp_email),并提示从 cnitlrt 迁移的用户:cnitlrt 原版的 "cloudmail" 实际是 [`maillab/cloud-mail`](https://github.com/maillab/cloud-mail),需要显式 `MAIL_PROVIDER=maillab`。
 - **docs(configuration): 协议错配排查小节** — `docs/configuration.md` 新增 issue #1 错配场景的报错样例 + 切换步骤。
-- **docs(README): personal 号牵连失效真相** — "已知限制"小节新增条目:经实测,**母号 Team workspace 被吊销时,从该母号衍生(经 Team 邀请 → leave_workspace → personal OAuth)出来的 free plan personal 号会一起失效**(`/wham/usage` 401/403)。OpenAI 风控关联到 IP / device fingerprint / 邀请链路,不仅仅是 workspace 隶属。母号失效后 personal 号需要全部重新生产。
 - **真机验证**:用户当前 `apimail.icoulsy.asia` 是 cf_temp_email(`/admin/address` 401);issue #1 koast18 的服务器是 maillab(`/login` 路径活跃,响应是 `{code, message}` 格式)。
 
 

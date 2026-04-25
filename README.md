@@ -173,7 +173,6 @@ curl -s -X POST -H "Authorization: Bearer $KEY" http://localhost:8787/api/admin/
 
 ## 已知限制
 
-- **母号被吊销会牵连 personal 号** — 经实测,母号 Team workspace 被 OpenAI 吊销时,从该母号衍生(经 Team 邀请 → leave_workspace → personal OAuth)出来的 free plan personal 号会**一起失效**(`/wham/usage` 返回 401/403)。OpenAI 的风控关联到 IP / device fingerprint / 邀请链路,不仅仅是 workspace 隶属关系。母号失效后,personal 号需要全部重新生产
 - **IP 风险** — VPS 的 IP 容易被 OpenAI/Cloudflare 标记，建议使用住宅代理
 - **并发限制** — 同一时间只允许一个 Playwright 操作
 - **验证码** — OpenAI 验证码有效期短，网络延迟可能导致过期

@@ -509,9 +509,18 @@ def run():
             )
             return False
         logger.info("[邀请] 邀请已发送 (seat_type=%s → %s)", raw_seat, seat_label)
-        # 邀请发送成功就把账号入池(seat_type 落盘),即便后续注册流程失败,
-        # 至少 accounts.json 留有一条记录给上游 reconcile / fill 使用。
-        add_account(email, "", cloudmail_account_id=account_id, seat_type=seat_label)
+        # 邀请发送成功就把账号入池(seat_type / workspace_account_id 落盘),
+        # 即便后续注册流程失败,至少 accounts.json 留有一条记录给上游 reconcile / fill 使用。
+        # workspace_account_id 用于母号切换检测,详见 accounts.add_account 文档。
+        from autoteam.admin_state import get_chatgpt_account_id
+
+        add_account(
+            email,
+            "",
+            cloudmail_account_id=account_id,
+            seat_type=seat_label,
+            workspace_account_id=get_chatgpt_account_id() or None,
+        )
 
         # Step 3: 等待邀请邮件
         logger.info("[邀请] 等待邀请邮件...")

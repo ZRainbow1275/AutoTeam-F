@@ -55,13 +55,26 @@ def find_account(accounts, email):
     return None
 
 
-def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNOWN):
-    """添加新账号。seat_type 取值见 SEAT_CHATGPT / SEAT_CODEX / SEAT_UNKNOWN。"""
+def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNOWN, workspace_account_id=None):
+    """添加新账号。
+
+    seat_type 取值见 SEAT_CHATGPT / SEAT_CODEX / SEAT_UNKNOWN。
+    workspace_account_id:邀请该号时所属的母号 workspace account_id(ChatGPT Team
+    workspace 唯一 ID)。母号切换后,记录的 workspace_account_id 与当前 workspace
+    不一致 → sync_account_states 不会把这种"前母号留下来的号"误打成 standby。
+    新号不指定时为 None,旧记录走兼容回退。
+    """
     accounts = load_accounts()
-    if find_account(accounts, email):
-        # 已存在仍允许补写 seat_type,避免旧记录一直是 unknown
+    existing = find_account(accounts, email)
+    if existing:
+        # 已存在仍允许补写 seat_type / workspace_account_id,避免旧记录一直缺字段
+        patch = {}
         if seat_type and seat_type != SEAT_UNKNOWN:
-            update_account(email, seat_type=seat_type)
+            patch["seat_type"] = seat_type
+        if workspace_account_id and not existing.get("workspace_account_id"):
+            patch["workspace_account_id"] = workspace_account_id
+        if patch:
+            update_account(email, **patch)
         return
 
     accounts.append(
@@ -71,6 +84,7 @@ def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNO
             "cloudmail_account_id": cloudmail_account_id,
             "status": STATUS_PENDING,
             "seat_type": seat_type or SEAT_UNKNOWN,
+            "workspace_account_id": workspace_account_id,  # 邀请时所在的母号 workspace ID,母号切换检测用
             "auth_file": None,  # CPA 认证文件路径
             "quota_exhausted_at": None,  # 额度用完的时间
             "quota_resets_at": None,  # 额度恢复时间

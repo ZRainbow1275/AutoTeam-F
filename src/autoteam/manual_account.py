@@ -239,7 +239,14 @@ class ManualAccountFlow:
         accounts = load_accounts()
         account = find_account(accounts, email)
         if not account:
-            add_account(email, "", seat_type=seat_label)
+            from autoteam.admin_state import get_chatgpt_account_id
+
+            add_account(
+                email,
+                "",
+                seat_type=seat_label,
+                workspace_account_id=get_chatgpt_account_id() or None,
+            )
 
         update_fields = {
             "status": account_status,
