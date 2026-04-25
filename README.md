@@ -135,6 +135,7 @@ Linux + Docker 访问宿主机服务，详见 [Docker 部署文档](docs/docker.
 - **邀请 seat 兜底失败时账号被静默丢失** 🆕 — `invite_member` POST/PATCH 都加退避重试,PATCH 失败时保留 `usage_based`(codex-only) 席位,把 `seat_type` 落到 `accounts.json` 供下游差异化对待
 - **`cmd_check` 只扫 active,standby 永远没额度数据** 🆕 — `autoteam check --include-standby`(或 `POST /api/tasks/check {include_standby:true}`)追加探测 standby 池,限速 1.5s + 24h 去重;401/403 标记为 `auth_invalid`
 - **workspace 有席位但本地 auth 缺失的"残废 / 错位 / ghost"账号无人清理** 🆕 — `autoteam reconcile [--dry-run]`(或 `POST /api/admin/reconcile?dry_run=1`)一键识别残废 / 错位 / 耗尽未抛弃 / ghost,可通过 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 控制是 KICK 还是打标记
+- **子号巡检在网络抖动 / 5xx 时被错误标 auth_invalid → 整批号被踢** 🆕 — `check_codex_quota` 新增 `network_error` 分类(DNS / Timeout / SSL / 5xx / 429 / 4xx 非 401/403 / JSON 解析失败 → 临时性故障),`_probe_standby_quota` 看到 `network_error` 不写 `last_quota_check_at`、不改 status,等下一轮立即重试,不再被 24h 去重屏蔽
 
 若你遇到 401 "Must be part of this workspace"，不用 logout 重登：
 

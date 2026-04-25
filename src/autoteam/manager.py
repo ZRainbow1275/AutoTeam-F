@@ -110,7 +110,11 @@ TEAM_SUB_ACCOUNT_HARD_CAP = 4
 
 
 def _find_team_auth_file(email):
-    """在 auths 目录里找 codex-{email}-team-*.json。找到返回字符串路径,否则 None。"""
+    """在 auths 目录里找 codex-{email}-team-*.json。找到返回字符串路径,否则 None。
+
+    严格只接 -team-*.json:personal/plus/free 席位 auth 不能用于 Team 子号,
+    用错 plan 的 bundle 会被 OAuth 拒收(参考 codex-oauth personal 模式回退)。
+    """
     try:
         from autoteam.auth_storage import AUTH_DIR
     except Exception:
@@ -118,11 +122,7 @@ def _find_team_auth_file(email):
     if not AUTH_DIR.exists():
         return None
     candidates = sorted(AUTH_DIR.glob(f"codex-{email}-team-*.json"))
-    if candidates:
-        return str(candidates[0])
-    # 兜底:接受 free/personal 席位 auth 文件作为次优选
-    any_candidates = sorted(AUTH_DIR.glob(f"codex-{email}-*.json"))
-    return str(any_candidates[0]) if any_candidates else None
+    return str(candidates[0]) if candidates else None
 
 
 def _is_quota_exhausted_snapshot(acc):
@@ -134,6 +134,28 @@ def _is_quota_exhausted_snapshot(acc):
         return int(lq.get("primary_pct", 0)) >= 100 and int(lq.get("weekly_pct", 0)) >= 100
     except (TypeError, ValueError):
         return False
+
+
+def _check_and_mark_exhausted(acc, email, _safe_update, result):
+    """若本地 last_quota 显示耗尽,则标 EXHAUSTED + quota_exhausted_at,返回 True。
+
+    抽出来给两条 auth 补齐路径(STANDBY 错位 / ACTIVE 缺 auth)在补 auth 后调用,
+    防止 quota 已满的成员补完 auth 又被当成正常 active 留下,等到下一轮 cmd_check
+    才发现耗尽。
+    """
+    if not _is_quota_exhausted_snapshot(acc):
+        return False
+    logger.warning(
+        "[对账] %s 补齐 auth 后 last_quota 显示耗尽,改标 EXHAUSTED(不立即 kick)",
+        email,
+    )
+    _safe_update(
+        acc.get("email"),
+        status=STATUS_EXHAUSTED,
+        quota_exhausted_at=time.time(),
+    )
+    result["exhausted_marked"].append(email)
+    return True
 
 
 def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
@@ -270,6 +292,9 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                         logger.info("[对账] %s 补齐 auth_file=%s", email, found)
                         _safe_update(acc.get("email"), status=STATUS_ACTIVE, auth_file=found)
                         result["misaligned_fixed"].append(email)
+                        # fallthrough:补齐 auth 后仍要做 quota 耗尽检查,
+                        # 否则刚补完的 active 成员若 last_quota=0/0 会被漏标 EXHAUSTED
+                        _check_and_mark_exhausted(acc, email, _safe_update, result)
                     else:
                         # 错位且找不到 auth → 实为残废,降级
                         logger.warning("[对账] %s 错位但无 auth 文件,降级为残废分支", email)
@@ -285,6 +310,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                 else:
                     _safe_update(acc.get("email"), status=STATUS_ACTIVE)
                     result["misaligned_fixed"].append(email)
+                    _check_and_mark_exhausted(acc, email, _safe_update, result)
                 continue
 
             if status == STATUS_ACTIVE:
@@ -295,6 +321,8 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                     if found:
                         logger.info("[对账] %s active + auth_file=null,发现 %s,补上", email, found)
                         _safe_update(acc.get("email"), auth_file=found)
+                        # fallthrough:补 auth 后仍要 quota 耗尽检查,避免漏标 EXHAUSTED
+                        _check_and_mark_exhausted(acc, email, _safe_update, result)
                         continue
                     if RECONCILE_KICK_ORPHAN:
                         logger.warning("[对账] 残废 %s(workspace 有 + 本地 auth 缺失),KICK", email)
@@ -341,42 +369,52 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                     logger.error("[对账] KICK %s 失败: status=%s", email, rs)
                 continue
 
-        # dry_run 下不做第二轮 over-cap kick(避免错判膨胀,完全只读)
+        # 第二轮:硬上限 4 子号。
+        # 非 dry_run:kick 完第一轮再 GET /users 拿最新数;
+        # dry_run:**不**重新 GET /users —— 否则刚"假装 KICK"的 ghost 仍在 workspace 真实
+        # 成员里,会被算进 remaining_subs,over_cap 数量被高估。改用第一轮 team_subs
+        # 减去本轮已被标 KICK 的 email,模拟 dry_run 后的 remaining。
         if dry_run:
-            return result
-
-        # 第二轮:硬上限 4 子号。kick 完上面的,再拉一次 /users 得到最新数
-        resp2 = chatgpt_api._api_fetch("GET", path)
-        if resp2.get("status") == 200:
-            try:
-                data2 = json.loads(resp2.get("body") or "{}")
-                members2 = data2.get("items", data2.get("users", data2.get("members", [])))
-            except Exception:
-                members2 = members
+            kicked_in_round_one = set(result["kicked"] + result["orphan_kicked"] + result["ghost_kicked"])
+            remaining_subs = [email for email, _m in team_subs if email not in kicked_in_round_one]
         else:
-            members2 = members
-
-        remaining_subs = [
-            (m.get("email") or "").lower()
-            for m in members2
-            if (m.get("email") or "") and not _is_main_account_email(m.get("email"))
-        ]
+            resp2 = chatgpt_api._api_fetch("GET", path)
+            if resp2.get("status") == 200:
+                try:
+                    data2 = json.loads(resp2.get("body") or "{}")
+                    members2 = data2.get("items", data2.get("users", data2.get("members", [])))
+                except Exception:
+                    members2 = members
+            else:
+                members2 = members
+            remaining_subs = [
+                (m.get("email") or "").lower()
+                for m in members2
+                if (m.get("email") or "") and not _is_main_account_email(m.get("email"))
+            ]
         excess = len(remaining_subs) - TEAM_SUB_ACCOUNT_HARD_CAP
         if excess > 0:
             logger.warning(
-                "[对账] Team 子号 %d > 硬上限 %d,按优先级 kick %d 个",
+                "[对账%s] Team 子号 %d > 硬上限 %d,按优先级 kick %d 个",
+                "/dry-run" if dry_run else "",
                 len(remaining_subs),
                 TEAM_SUB_ACCOUNT_HARD_CAP,
                 excess,
             )
-            accounts_now = load_accounts()
-            acc_map = {(a.get("email") or "").lower(): a for a in accounts_now}
+            # dry_run 下复用第一轮 by_email,不再读 accounts.json,保持只读纯净
+            if dry_run:
+                acc_map = by_email
+            else:
+                accounts_now = load_accounts()
+                acc_map = {(a.get("email") or "").lower(): a for a in accounts_now}
 
             def _priority(email):
                 # 优先级越小越先 kick
                 a = acc_map.get(email)
                 if not a:
-                    return (0, 0)  # 不在本地的未知账号最先 kick
+                    # ghost(本地无记录):仅当 KICK_GHOST=True 才优先 kick;
+                    # 关闭时排到最后,避免绕过 RECONCILE_KICK_GHOST 开关
+                    return (0, 0) if RECONCILE_KICK_GHOST else (99, 0)
                 st = a.get("status")
                 if st == STATUS_ORPHAN:
                     return (1, 0)
@@ -396,19 +434,29 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                 return (6, 0)
 
             victims = sorted(remaining_subs, key=_priority)[:excess]
-            for email in victims:
-                try:
-                    remove_status = remove_from_team(chatgpt_api, email, return_status=True)
-                    if remove_status in ("removed", "already_absent"):
-                        acc = acc_map.get(email)
-                        if acc and acc.get("status") == STATUS_ACTIVE:
-                            update_account(acc.get("email"), status=STATUS_STANDBY)
-                        result["over_cap_kicked"].append(email)
-                        logger.info("[对账] 超员 kick %s (priority=%s)", email, _priority(email))
-                    else:
-                        logger.error("[对账] 超员 kick %s 失败: status=%s", email, remove_status)
-                except Exception as exc:
-                    logger.error("[对账] 超员 kick %s 抛异常: %s", email, exc)
+            if dry_run:
+                # 只预测,不调 _safe_kick(它内部 dry_run 也只是 log),不写 acc 状态
+                for email in victims:
+                    logger.info(
+                        "[对账/dry-run] 超员预测 kick %s (priority=%s)",
+                        email,
+                        _priority(email),
+                    )
+                    result["over_cap_kicked"].append(email)
+            else:
+                for email in victims:
+                    try:
+                        remove_status = remove_from_team(chatgpt_api, email, return_status=True)
+                        if remove_status in ("removed", "already_absent"):
+                            acc = acc_map.get(email)
+                            if acc and acc.get("status") == STATUS_ACTIVE:
+                                update_account(acc.get("email"), status=STATUS_STANDBY)
+                            result["over_cap_kicked"].append(email)
+                            logger.info("[对账] 超员 kick %s (priority=%s)", email, _priority(email))
+                        else:
+                            logger.error("[对账] 超员 kick %s 失败: status=%s", email, remove_status)
+                    except Exception as exc:
+                        logger.error("[对账] 超员 kick %s 抛异常: %s", email, exc)
     finally:
         if need_stop:
             try:
@@ -766,6 +814,8 @@ def cmd_check(include_standby: bool = False):
                     "[%s] (personal) token 失效或账号无权访问 wham/usage(伪 personal 号被踢出 Team 后常见),保留旧快照",
                     email,
                 )
+            elif status_str == "network_error":
+                logger.warning("[%s] (personal) 额度查询遇到临时网络错误,保留旧快照,等下一轮", email)
             # status_str == "no_auth" 已在 _check_and_refresh 里被 auth_file 判空挡掉
 
     # 入口先跑一次对账:凡是"Team 里挂着但本地 standby/exhausted/personal"的遗留成员,
@@ -960,6 +1010,10 @@ def cmd_check(include_standby: bool = False):
                         logger.info("[%s] token 失效但 5h 重置时间已过，需重新登录验证", email)
                 logger.warning("[%s] 认证失败，需要重新登录 Codex", email)
                 auth_error_list.append(acc)
+            elif status_str == "network_error":
+                # 网络抖动/5xx/429:不算"额度用完",也不算"token 失效"。本轮跳过,不动 status,
+                # 不进 exhausted_list,也不进 auth_error_list(避免触发昂贵的重登流程)。
+                logger.warning("[%s] 额度查询遇到临时网络错误,本轮跳过,等待下一轮重试", email)
 
     # 无认证文件的 active 账号也需要重新登录
     if no_auth_list:
@@ -1042,9 +1096,13 @@ def _probe_standby_quota():
 
     - 限速:每账号之间 sleep STANDBY_PROBE_INTERVAL_SEC,避免群访 OpenAI wham/usage 触发风控
     - 去重:last_quota_check_at 在 STANDBY_PROBE_DEDUP_SEC 秒内的跳过
-    - auth_error(401/403/token 刷新失败):标 STATUS_AUTH_INVALID,等 reconcile 处置
+    - auth_error(**仅** 401/403):标 STATUS_AUTH_INVALID,等 reconcile 处置
+    - network_error(DNS/timeout/SSL/5xx/429/JSON 解析失败/其他临时错误):
+      **不写 last_quota_check_at**(允许下一轮立刻重试),**不改 status**,只 log warning。
+      这条修复的就是"网络抖动一次,18 个号一起被误标 AUTH_INVALID 然后被 reconcile 全删"事故。
     - exhausted:刷新 quota_exhausted_at / quota_resets_at(修正过期快照),维持 standby
     - ok:仅写回 last_quota + last_quota_check_at,不改 status(standby 的 status 由 fill/rotate 决定)
+    - 未知 status:防御分支只 log,不写时间戳,避免去重逻辑卡住未来真正的探测
     """
     standby = get_standby_accounts()
     if not standby:
@@ -1120,13 +1178,20 @@ def _probe_standby_quota():
         elif status_str == "auth_error":
             update_account(email, status=STATUS_AUTH_INVALID, last_quota_check_at=probe_ts)
             logger.warning("[%s] (standby) auth_file 已失效(401/403),标记 %s", email, STATUS_AUTH_INVALID)
+        elif status_str == "network_error":
+            # 网络抖动 / 5xx / 429 / JSON 解析失败 — 临时性故障。
+            # 关键约束:不写 last_quota_check_at(允许下一轮立刻重试)、不改 status,只 log。
+            # 否则一次大规模网络故障会让整批 standby 号在 24h 内不再被探测,且如果以前
+            # 错误归到 auth_error 还会被批量误标 AUTH_INVALID(就是事故根因)。
+            logger.warning("[%s] (standby) 探测遇到临时网络错误,本轮跳过,不更新状态/时间戳", email)
         elif status_str == "no_auth":
             # 理论上入口已过滤,这里兜底:记时间戳避免下一轮重复命中
             update_account(email, last_quota_check_at=probe_ts)
             logger.info("[%s] (standby) auth_file 缺失,跳过", email)
         else:
-            update_account(email, last_quota_check_at=probe_ts)
-            logger.info("[%s] (standby) 未知探测结果 %s,仅记录时间戳", email, status_str)
+            # 未知 status 防御分支:同样不写时间戳。如果误吃了未来新加的 status,
+            # 写 last_quota_check_at 会让账号在 24h 内不再被探测,屏蔽问题。
+            logger.warning("[%s] (standby) 未知探测结果 %s,本轮跳过,不更新时间戳", email, status_str)
 
 
 def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=3, retry_interval=3.0):
@@ -1234,38 +1299,6 @@ def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=
             target_user_id,
         )
         return "failed" if return_status else False
-
-
-def invite_to_team(chatgpt_api, email, seat_type="default", return_detail=False):
-    """邀请账号加入 Team。旧账号用 default,新账号用 usage_based。
-
-    return_detail=False(默认,向后兼容): 返回 bool
-    return_detail=True: 返回 (ok, seat_label) 二元组,seat_label ∈ {"chatgpt","codex","unknown"},
-        供上游把席位类型落盘到 accounts.json。
-    """
-    status, data = chatgpt_api.invite_member(email, seat_type=seat_type)
-    # 归一化 seat_label: invite_member 返回 "chatgpt" / "usage_based" / "unknown",
-    # 映射到 accounts.SEAT_* 一致的字符串,避免跨模块对枚举值的二次翻译。
-    raw_seat = data.get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
-    seat_label = {"chatgpt": "chatgpt", "usage_based": "codex"}.get(raw_seat, "unknown")
-
-    if status == 200 and isinstance(data, dict):
-        errored = data.get("errored_emails", [])
-        if errored:
-            err_msg = errored[0].get("error", "unknown")
-            logger.warning("[Team] 邀请 %s 被拒绝: %s", email, err_msg)
-            # default 失败则尝试 usage_based
-            if seat_type == "default":
-                logger.info("[Team] 尝试 usage_based 方式...")
-                return invite_to_team(chatgpt_api, email, seat_type="usage_based", return_detail=return_detail)
-            if return_detail:
-                return False, "unknown"
-            return False
-
-    ok = status == 200
-    if return_detail:
-        return ok, seat_label if ok else "unknown"
-    return ok
 
 
 def _run_post_register_oauth(email, password, mail_client, leave_workspace=False, out_outcome=None):
@@ -2428,6 +2461,11 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                     update_account(email, last_quota=quota_info)
                 fail_reason = "exhausted"
                 logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
+            elif status_str == "network_error":
+                # 网络错误不是 token 风控也不是 quota 用尽。当作"未验证",走 exception 分支
+                # 同款处置:不锁 5h(token 还活着),让下一轮自然重试。
+                fail_reason = "network_error"
+                logger.warning("[轮转] %s 额度验证遇到临时网络错误,本轮判定未验证", email)
             else:
                 # auth_error/其他 — token 风控类,wham 401 token_revoked 落这里
                 fail_reason = "auth_error"
@@ -2572,6 +2610,11 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                     # auth_error:token 失效,不是"额度真恢复"的证据,跳过
                     elif status_str == "auth_error":
                         logger.info("[替换] 跳过 %s(token auth_error,无法验证额度)", cand_email)
+                        continue
+                    # network_error:临时网络故障,不能当"额度恢复"凭证,本轮不复用,
+                    # 等下一轮再试(不动 acc 状态)
+                    elif status_str == "network_error":
+                        logger.info("[替换] 跳过 %s(临时网络错误,本轮无法验证额度)", cand_email)
                         continue
             except Exception as exc:
                 logger.info("[替换] %s 额度验证抛异常(跳过): %s", cand_email, exc)
@@ -2844,6 +2887,12 @@ def cmd_rotate(target_seats=5):
                                 quota_skipped.append(acc)
                                 continue
                             quota_ok = True
+                        # network_error: 临时网络故障,不能当"额度已恢复"凭证。本轮跳过,
+                        # 不动 acc 状态,等下一轮再试。
+                        if status_str == "network_error":
+                            logger.info("[4/5] 跳过 %s（临时网络错误,本轮无法验证额度）", email)
+                            quota_skipped.append(acc)
+                            continue
                         # auth_error: token 失效，用 last_quota 判断（但重置时间已过的不算）
                         if status_str == "auth_error":
                             lq = acc.get("last_quota")

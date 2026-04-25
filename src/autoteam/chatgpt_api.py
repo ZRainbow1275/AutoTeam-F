@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import random
 import re
 import time
 import uuid
@@ -1305,23 +1306,39 @@ class ChatGPTTeamAPI:
     # PATCH /invites/{id} 失败时的重试间隔(秒)。次数 = len(_INVITE_PATCH_RETRY_DELAYS)
     _INVITE_PATCH_RETRY_DELAYS = (5,)
 
+    # 明确表示"目标域名被 workspace 拒绝"的短语。注意这里**不能**单独放 "domain" 这个 token —
+    # 服务端有大量包含 "domain" 字面量的无关错误(rate-limit 提示里的 "your domain ...",
+    # 甚至 errored_emails 里 email 自身的 "@gmail.com" 都会让 "domain" 命中),会把可重试错误
+    # 误判成 domain_blocked 直接返回给上层,导致整批账号被错误地放弃。
+    _DOMAIN_BLOCKED_KEYWORDS = (
+        "not allowed",
+        "domain blocked",
+        "domain is not allowed",
+        "forbidden domain",
+        "domain not permitted",
+    )
+
     @staticmethod
     def _classify_invite_error(status, data, resp_body):
-        """将 POST /invites 的响应归类为 domain_blocked / rate_limited / network / other。
+        """将 POST /invites 的响应归类为 domain_blocked / rate_limited / server_error / network / other。
 
-        - status == 0 视为 network(fetch 抛异常)
-        - 429 或 body 含 rate_limit/too many 视为 rate_limited
-        - 4xx 且 body 含 domain/not allowed/blocked 视为 domain_blocked
-        - 其他非 200 为 other
+        - status == 0 视为 network(fetch 抛异常,可重试)
+        - 429 或 body 含 rate_limit/too many 视为 rate_limited(可重试)
+        - 5xx(500/502/503/504) 视为 server_error(可重试)
+        - 4xx 且 **明确字段**(detail/error/message + errored_emails[].error/code)命中
+          domain_blocked 关键词时归为 domain_blocked
+        - 其他非 200 为 other(不重试,交上层换号)
         """
         if status == 0:
             return "network"
         if status == 429:
             return "rate_limited"
-        # errored_emails 形式也算业务错误,但 HTTP 本身 200,不走这里
+        if status in (500, 502, 503, 504):
+            return "server_error"
+        # 只在明确字段拼接 body_text;不再 fallthrough 到 resp_body —
+        # 否则 email 中的 "gmail.com" 之类会被旧逻辑的 "domain" 关键词命中。
         body_text = ""
         if isinstance(data, dict):
-            # 常见字段:detail / error / message
             for key in ("detail", "error", "message"):
                 val = data.get(key)
                 if isinstance(val, str):
@@ -1330,25 +1347,72 @@ class ChatGPTTeamAPI:
                     inner = val.get("message") or val.get("code") or ""
                     if isinstance(inner, str):
                         body_text += " " + inner
-        if not body_text:
-            body_text = resp_body or ""
+            # MEDIUM-1: errored_emails 内层 error/code 字段也算明确字段
+            for item in data.get("errored_emails", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for inner_key in ("error", "code", "message"):
+                    val = item.get(inner_key)
+                    if isinstance(val, str):
+                        body_text += " " + val
         lowered = body_text.lower()
         if any(kw in lowered for kw in ("rate_limit", "rate limit", "too many", "throttle")):
             return "rate_limited"
-        if any(kw in lowered for kw in ("domain", "not allowed", "blocked", "forbidden domain")):
+        if any(kw in lowered for kw in ChatGPTTeamAPI._DOMAIN_BLOCKED_KEYWORDS):
             return "domain_blocked"
         return "other"
 
     def invite_member(self, email, seat_type="usage_based"):
-        """邀请成员加入 Team。
+        """邀请成员加入 Team(自带 default → usage_based 兜底 + errored_emails 处理)。
 
-        返回 `(status, data)`,其中 `data` 一定是 dict(解析失败会封装为 `{"_raw": <text>}`),
-        并必然包含 `_seat_type` 字段,枚举:
-        - "chatgpt": PATCH seat_type=default 成功,完整 ChatGPT 席位
-        - "usage_based": PATCH 失败或未尝试,仅 codex 席位(向后兼容:旧调用方看到非 chatgpt 即可当 codex 处理)
-        - "unknown": POST 本身失败
-        `_seat_type` 与 accounts.SEAT_* 含义一致,但为了不引入循环 import,这里用字符串字面量。
+        返回 `(status, data)`,其中 `data` 一定是 dict(解析失败封装为 `{"_raw": <text>}`),
+        必含字段:
+        - `_seat_type` ∈ {"chatgpt","usage_based","unknown"}
+            * "chatgpt"     POST 200 + (PATCH default 成功 或 直接 default 邀请成功)
+            * "usage_based" POST 200 但 PATCH 全部失败,仅 codex 席位
+            * "unknown"     POST 本身失败/被业务拒绝(domain/errored)
+        - `_error_kind`     最后一次失败的分类(成功时不写)
+        - `_errored_emails` POST 200 但 errored_emails 非空时,原样保留 errored_emails 数组,
+                             供上游记录失败原因。
+
+        兜底逻辑(所有 fallback 都在本函数内完成,调用方拿到结果就是终态):
+        - seat_type="default" 时,若 POST 200 但 errored_emails 命中或 PATCH 失败,
+          自动重试一次 seat_type="usage_based"(整套 retry 计数重新算)。
+        - 顶层 HTTP 失败 + err_kind ∈ {network, rate_limited, server_error}:
+          按 _INVITE_POST_RETRY_DELAYS 退避(带 jitter)重试。
         """
+        # default 邀请失败时下降到 usage_based(只翻一次,避免无限递归)
+        return self._invite_member_with_fallback(email, seat_type, allow_fallback=True)
+
+    def _invite_member_with_fallback(self, email, seat_type, *, allow_fallback):
+        status, data = self._invite_member_once(email, seat_type)
+
+        # default 路径:有任何业务级失败迹象都尝试 usage_based 兜底
+        # 1) HTTP 非 200 且不是 domain_blocked(domain_blocked 直接返回让上层换号)
+        # 2) HTTP 200 但 errored_emails 非空(账号被业务规则拒绝)
+        # 3) HTTP 200 但 _seat_type=="unknown"(理论上 _invite_member_once 不会返回这种,但兜底)
+        if seat_type == "default" and allow_fallback:
+            errored = data.get("errored_emails") if isinstance(data, dict) else None
+            err_kind = data.get("_error_kind") if isinstance(data, dict) else None
+            should_fallback = False
+            if status != 200 and err_kind not in ("domain_blocked",):
+                should_fallback = True
+            elif status == 200 and errored:
+                should_fallback = True
+            if should_fallback:
+                logger.info(
+                    "[ChatGPT] %s default 邀请失败(status=%d kind=%s errored=%s),尝试 usage_based 兜底",
+                    email,
+                    status,
+                    err_kind,
+                    bool(errored),
+                )
+                return self._invite_member_with_fallback(email, "usage_based", allow_fallback=False)
+
+        return status, data
+
+    def _invite_member_once(self, email, seat_type):
+        """单一 seat_type 的完整邀请尝试(POST retry → PATCH 升级)。"""
         path = f"/backend-api/accounts/{self.account_id}/invites"
         body = {
             "email_addresses": [email],
@@ -1393,28 +1457,37 @@ class ChatGPTTeamAPI:
                 err_kind,
                 (resp_body or "")[:200],
             )
-            # domain_blocked / other: 不 retry,直接返回给上层换号处理
+            # domain_blocked / other: 不 retry,直接返回让上层换号
             if err_kind in ("domain_blocked", "other"):
                 data.setdefault("_seat_type", "unknown")
                 data.setdefault("_error_kind", err_kind)
                 return status, data
-            # rate_limited / network: 按退避表 retry
+            # rate_limited / network / server_error: 按退避表(带 jitter)retry
             if attempt < len(self._INVITE_POST_RETRY_DELAYS):
-                delay = self._INVITE_POST_RETRY_DELAYS[attempt]
-                logger.info("[ChatGPT] %s 类错误,%ds 后重试邀请 %s", err_kind, delay, email)
+                base_delay = self._INVITE_POST_RETRY_DELAYS[attempt]
+                # MEDIUM-2: 30% jitter 避免多客户端被同一 rate-limit 窗口拒绝后同时唤醒
+                delay = base_delay + random.uniform(0, base_delay * 0.3)
+                logger.info("[ChatGPT] %s 类错误,%.1fs 后重试邀请 %s", err_kind, delay, email)
                 time.sleep(delay)
                 continue
-            # 重试耗尽
             data.setdefault("_seat_type", "unknown")
             data.setdefault("_error_kind", err_kind)
             return status, data
 
-        # status == 200 走到这里。默认标 usage_based,PATCH 成功再升级为 chatgpt
-        data["_seat_type"] = "usage_based"
+        # status == 200 → 检查 errored_emails / 处理 PATCH 升级
+        errored = data.get("errored_emails", []) if isinstance(data, dict) else []
+        if errored:
+            err_msg = errored[0].get("error", "unknown") if isinstance(errored[0], dict) else "unknown"
+            logger.warning("[ChatGPT] 邀请 %s 被 errored_emails 拒绝: %s", email, err_msg)
+            data["_seat_type"] = "unknown"
+            data["_error_kind"] = "errored_emails"
+            data["_errored_emails"] = errored
+            return status, data
 
+        # 默认标 usage_based,PATCH 成功再升级为 chatgpt
+        data["_seat_type"] = "usage_based"
         if seat_type == "usage_based":
             invites = data.get("account_invites", []) if isinstance(data, dict) else []
-            # 约定:只要存在一条 invite PATCH 成功,就认为该账号拿到了 ChatGPT 席位
             any_patched = False
             any_invite = False
             for inv in invites:
@@ -1426,15 +1499,13 @@ class ChatGPTTeamAPI:
                     any_patched = True
             if any_invite and any_patched:
                 data["_seat_type"] = "chatgpt"
-            else:
-                # 没有 invite 节点(异常响应)或全部 PATCH 失败 → 保底 usage_based,上层按 codex-only 处理
-                if any_invite and not any_patched:
-                    logger.error(
-                        "[ChatGPT] %s PATCH seat_type 全部失败,保留 codex 席位(_seat_type=usage_based)",
-                        email,
-                    )
+            elif any_invite and not any_patched:
+                logger.error(
+                    "[ChatGPT] %s PATCH seat_type 全部失败,保留 codex 席位(_seat_type=usage_based)",
+                    email,
+                )
         elif seat_type == "default":
-            # 直接 default 邀请,只要 POST 200 即视为完整 ChatGPT 席位
+            # 直接 default 邀请,只要 POST 200 + 无 errored 即完整 ChatGPT 席位
             data["_seat_type"] = "chatgpt"
 
         return status, data

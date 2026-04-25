@@ -62,7 +62,7 @@ Authorization: Bearer <API_KEY>
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/tasks/rotate` | 智能轮转 `{"target": 5}` |
-| POST | `/api/tasks/check` | 检查额度 |
+| POST | `/api/tasks/check` | 检查额度，`{"include_standby": false}` 追加探测 standby 池（限速 1.5s/号 + 24h 去重） |
 | POST | `/api/tasks/add` | 自动注册并添加新账号 |
 | POST | `/api/tasks/fill` | 补满成员 `{"target": 5}` |
 | POST | `/api/tasks/cleanup` | 清理成员 `{"max_seats": null}` |
@@ -70,6 +70,12 @@ Authorization: Bearer <API_KEY>
 | GET | `/api/tasks/{task_id}` | 任务详情 |
 
 > 同一时间只允许一个 Playwright 操作；如果有任务执行中，新请求可能返回 `409 Conflict`。
+
+## 管理员运维
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/admin/reconcile?dry_run=0` | 对账修复：扫描 workspace 实际成员 vs 本地 `accounts.json`，识别**残废 / 错位 / 耗尽未抛弃 / ghost / over-cap**五类异常并按 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 决定 KICK 或打标记。`dry_run=1` 仅预测不动账户（包含第二轮 over-cap 预测），返回结构化诊断 dict（`kicked` / `orphan_kicked` / `orphan_marked` / `misaligned_fixed` / `exhausted_marked` / `ghost_kicked` / `ghost_seen` / `over_cap_kicked` / `flipped_to_active`） |
 
 ## 管理员登录
 

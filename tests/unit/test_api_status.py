@@ -49,6 +49,9 @@ def test_get_status_normalizes_main_account_status_from_saved_auth(tmp_path, mon
         "standby": 0,
         "exhausted": 0,
         "pending": 0,
+        "personal": 0,
+        "auth_invalid": 0,
+        "orphan": 0,
         "total": 1,
     }
 

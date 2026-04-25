@@ -1618,7 +1618,14 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
 def check_codex_quota(access_token, account_id=None):
     """
     通过 /backend-api/wham/usage 查询 Codex 额度状态，不消耗额度。
-    返回 ("ok", quota_info) | ("exhausted", exhausted_info) | ("auth_error", None)
+    返回:
+        ("ok", quota_info)         — HTTP 200 + 成功解析,额度未触发上限
+        ("exhausted", info)        — HTTP 200 + quota 用尽(get_quota_exhausted_info 命中)
+        ("auth_error", None)       — **仅** HTTP 401/403,token/seat 真失效
+        ("network_error", None)    — DNS/timeout/SSL/连接异常 / 5xx / 429 / json 解析失败 / 其他临时错误
+
+    auth_error 与 network_error 必须严格区分:auth_error 会触发"标记 AUTH_INVALID/重登"等
+    破坏性流程,网络抖动绝不能落入该分支(否则一次网络故障可能批量误删账号)。
     quota_info = {"primary_pct": int, "primary_resets_at": int, "weekly_pct": int, "weekly_resets_at": int}
     """
     import requests
@@ -1639,21 +1646,41 @@ def check_codex_quota(access_token, account_id=None):
             headers=headers,
             timeout=30,
         )
+    except (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.SSLError,
+    ) as e:
+        logger.warning("[Codex] 网络异常(归类 network_error): %s", e)
+        return "network_error", None
+    except requests.exceptions.RequestException as e:
+        # 其他 requests 异常(ChunkedEncodingError 等)同样归为 network_error,而不是 auth_error
+        logger.warning("[Codex] requests 异常(归类 network_error): %s", e)
+        return "network_error", None
     except Exception as e:
-        logger.error("[Codex] 请求异常: %s", e)
-        return "auth_error", None
+        # 兜底:未知异常宁可归 network_error,避免因为一次网络抖动批量误标 AUTH_INVALID
+        logger.warning("[Codex] 未知异常(归类 network_error,保守处理): %s", e)
+        return "network_error", None
 
     if resp.status_code in (401, 403):
         return "auth_error", None
 
+    # 429 限流 / 5xx 服务端错误 → 临时性故障,归为 network_error,不动账号 status
+    if resp.status_code == 429 or 500 <= resp.status_code < 600:
+        logger.warning("[Codex] wham/usage 临时错误 %d(归类 network_error): %s", resp.status_code, resp.text[:200])
+        return "network_error", None
+
     if resp.status_code != 200:
-        logger.error("[Codex] wham/usage 异常: %d %s", resp.status_code, resp.text[:200])
-        return "auth_error", None
+        # 4xx(非 401/403/429) 也归为 network_error:可能是 OpenAI 接口在调整,
+        # 不能因为一次接口变更把全部账号误判 token 失效
+        logger.warning("[Codex] wham/usage 非预期状态 %d(归类 network_error): %s", resp.status_code, resp.text[:200])
+        return "network_error", None
 
     try:
         data = resp.json()
-    except Exception:
-        return "auth_error", None
+    except Exception as e:
+        logger.warning("[Codex] wham/usage 响应 JSON 解析失败(归类 network_error): %s", e)
+        return "network_error", None
 
     rate_limit = data.get("rate_limit") or {}
     primary = rate_limit.get("primary_window") or {}

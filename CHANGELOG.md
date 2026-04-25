@@ -65,6 +65,47 @@
 
 > 评审范围:`d6082ad` + 本节回归补丁。共 5 个 reviewer 跑出 11 high / 13 medium / 2 low / 6 文档缺漏。补丁拆单到下个 PR,**这一节用于追溯,不构成代码改动**。
 
+### invite-hardening 批判审查 round 2:实际修复落地
+
+> 上一节列出的 backlog 在本轮按攻击面拆 4 个 fix task 跑完,以下逐条对照 finding 标记修复状态(✅ = 已修;(待后续) = 本轮未覆盖)。
+
+- **invite_member 重试与错误分类(`chatgpt_api.py`)**
+  - ✅ 5xx(500/502/503/504) 新增 `server_error` 分类,与 `network` / `rate_limited` 一并按退避表重试,不再被吞成 `other` 直接掉号
+  - ✅ `_DOMAIN_BLOCKED_KEYWORDS` 收窄到 `not allowed` / `domain blocked` / `domain is not allowed` / `forbidden domain` / `domain not permitted`,移除裸 `domain` / `forbidden` / `blocked`,避免命中 `errored_emails` 里 email 自身的 "@gmail.com" 之类被误判为 domain_blocked
+  - ✅ `errored_emails[].error/code/message` 内层字段进入 body_text 扫描;同时停止 fallthrough 到 `resp_body`,杜绝邮箱字面量污染分类
+  - ✅ POST 重试加 30% jitter(`time.sleep(base + random.uniform(0, base*0.3))`),批量号被同一窗口拒绝后不会同步反弹再次撞 rate_limit
+- **`invite_to_team` 死代码下沉(`manager.py` / `chatgpt_api.py`)**
+  - ✅ 把 `default → usage_based` 兜底、`errored_emails` 处理、`_seat_type` 标注全部下沉到 `chatgpt_api.invite_member` 内部(新增 `_invite_member_with_fallback` / `_invite_member_once`),`invite.py:run` 只读 `_seat_type` 字段。manager 包装层不再被绕过,链路与 commit msg 一致
+  - ✅ `invite.py` 调用 `add_account(... seat_type=seat_label)` 把 raw `_seat_type` 翻译成 `SEAT_CHATGPT` / `SEAT_CODEX` / `SEAT_UNKNOWN` 常量落盘
+- **`seat_type` 落盘是死数据**
+  - (待后续)下游 OAuth / `wham/usage` 路径暂未按 `seat_type` 分流(本轮重点是堵漏,差异化处理留给后续 PR)
+  - (待后续)`_run_post_register_oauth` 的 `team_auth_missing` 分支与 `sync_account_states` 自动补录路径仍直接拼字段,未走 `add_account` 工厂 — 字段不全的隐患未根治
+- **新状态 `auth_invalid` / `orphan` 在前端 / 状态汇总缺失**
+  - ✅ `api.py:get_status` summary dict 新增 `auth_invalid` / `orphan` 计数项
+  - ✅ `web/src/components/Dashboard.vue` 的 `statusClass` / `dotClass` / `statusLabel` 白名单加 `auth_invalid`(橙色 / "认证失效")和 `orphan`(琥珀色 / "孤立");`loginLabel` 把这两种状态归入"补登录"语境
+- **`_reconcile_team_members` 漏洞**
+  - ✅ **dry_run 第二轮 over-cap 预测**:不再 `return result` 跳过第二轮;dry_run 下用 "round-1 team_subs - 已 KICK" 模拟 remaining,避免重新 GET /users 把"假装 KICK"的 ghost 计回去高估 over_cap 数量;victims 只 log + 写 `result["over_cap_kicked"]`,不调 `remove_from_team`
+  - ✅ **ghost 不再绕过 `RECONCILE_KICK_GHOST=False` 开关**:`_priority` 中 ghost(本地无记录)的元组从 `(0, 0)` 改为按开关取值 — `True` 时仍 `(0, 0)` 优先 KICK,`False` 时降到 `(99, 0)` 排到最后,被开关压住
+  - ✅ **`_find_team_auth_file` 拒绝 personal/plus auth**:删除 `codex-{email}-*.json` 兜底分支,严格只接 `codex-{email}-team-*.json`,避免错 plan bundle 被挂到 team 席位账号导致 OAuth 401 / org mismatch
+  - ✅ **补齐 auth_file 后 fallthrough quota 检查**:抽出 `_check_and_mark_exhausted` 辅助函数,STANDBY 错位补 auth + ACTIVE 缺 auth 补齐两条路径都在补完后立刻做 `_is_quota_exhausted_snapshot`,该标 EXHAUSTED 的不再被当 active 留下
+  - (待后续)STANDBY 错位降级 KICK 后写 `STATUS_AUTH_INVALID` 与 `accounts.py` 注释"token 失效"语义不符的问题,本轮未改语义(改字段名 / 状态值需要更大面 PR)
+- **`_probe_standby_quota` 网络抖动误判 + 自愈断裂**
+  - ✅ **`check_codex_quota` 错误分类细化**:返回值新增 `("network_error", None)`,DNS / Timeout / SSL / 5xx / 429 / 4xx(非 401/403) / JSON 解析失败 / 未知异常一律归 `network_error`,只有 HTTP 401/403 才返回 `auth_error`
+  - ✅ **`_probe_standby_quota` 网络分支不再误标 AUTH_INVALID + 不再写 `last_quota_check_at`**:看到 `network_error` 只 log warning,不动 status,不写时间戳 — 下一轮立即重试,不被 24h 去重屏蔽。事故根因(一次网络抖动 18 个号被批量误标 AUTH_INVALID 后被 reconcile 全删)修复
+  - ✅ **未知 `status_str` 防御分支不写时间戳**:`cmd_check` 主路径里碰到 `network_error` 也走"本轮跳过、不进 auth_error_list"的安全分支
+  - (待后续)`_probe_standby_quota` 主循环 `stop_flag` / 软取消信号未接入,中途取消仍可能留半截探测状态
+- **文档缺漏**
+  - ✅ `.env.example` 末尾追加 `RECONCILE_KICK_ORPHAN` / `RECONCILE_KICK_GHOST` 两个开关示例(带注释说明 true / false 行为差异)
+  - ✅ `docs/api.md` 后台任务表格 `/api/tasks/check` 行注明 `{"include_standby": false}`;新增 "管理员运维" 小节,列 `POST /api/admin/reconcile?dry_run=0` 端点说明
+  - ✅ `CHANGELOG.md` 新增本节,逐条对照 backlog 标 ✅ / (待后续)
+  - ✅ `README.md` "修复了什么" 末尾追加一行"子号巡检在网络抖动 / 5xx 时被错误标 auth_invalid → 整批号被踢"
+  - (待后续)`docs/architecture.md` 状态机图未画 "reconcile KICK orphan → STATUS_AUTH_INVALID" 转移
+  - (待后续)`docs/platform-signup-protocol.md` 顶部 `Status:` 行未标"探索性归档(需求 1 已放弃)"
+
+**测试统计**:71 passed, 1 pre-existing fail。新增回归测试覆盖 `_classify_invite_error` 5xx 分类、`errored_emails` 解析、_invite_member_once 兜底、reconcile dry_run 第二轮 over-cap 预测、ghost priority 受 RECONCILE_KICK_GHOST 控制、`_find_team_auth_file` 拒绝 personal auth、补齐 auth 后 fallthrough quota、`check_codex_quota` 网络错误分类、`_probe_standby_quota` 网络抖动不写时间戳。
+
+**真机验证**:18 个被误标 AUTH_INVALID 的号已批量删除,确认本批 bug 修完后单次网络抖动不再造成整批误判。
+
 ### 后续修复（基于代码评审 + 真机验证）
 
 - **`maillab.list_emails` 漏传 `type=0`** — 上游 `service/email-service.js` 把空 `type` 翻成 `eq(email.type, NULL)`,所有 RECEIVE 类型(type=0)邮件被静默过滤,导致收件箱永远返回空。强制传 `type=0`。

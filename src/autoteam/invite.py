@@ -23,10 +23,26 @@ import time
 
 from playwright.sync_api import sync_playwright
 
+from autoteam.accounts import (
+    SEAT_CHATGPT,
+    SEAT_CODEX,
+    SEAT_UNKNOWN,
+    add_account,
+    update_account,
+)
 from autoteam.chatgpt_api import ChatGPTTeamAPI
 from autoteam.cloudmail import CloudMailClient
 from autoteam.config import get_playwright_launch_options
 from autoteam.identity import random_age, random_birthday, random_full_name, random_password
+
+
+def _seat_label_from_raw(raw_seat: str) -> str:
+    """把 invite_member 返回的 _seat_type 字面量翻译成 accounts.SEAT_* 常量。"""
+    return {
+        "chatgpt": SEAT_CHATGPT,
+        "usage_based": SEAT_CODEX,
+    }.get(raw_seat or "", SEAT_UNKNOWN)
+
 
 logger = logging.getLogger(__name__)
 
@@ -473,17 +489,29 @@ def run():
         account_id, email = mail_client.create_temp_email()
         logger.info("[邀请] 临时邮箱: %s", email)
 
-        # Step 2: 发送 Team 邀请
+        # Step 2: 发送 Team 邀请。invite_member 内部已带 default→usage_based 兜底,
+        # 我们只需读 _seat_type 字段决定落盘的 seat_type 常量。
         chatgpt = ChatGPTTeamAPI()
         chatgpt.start()
-        status, data = chatgpt.invite_member(email)
+        status, data = chatgpt.invite_member(email, seat_type="default")
 
-        if status != 200:
+        raw_seat = (data or {}).get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
+        seat_label = _seat_label_from_raw(raw_seat)
+
+        if status != 200 or raw_seat == "unknown":
             err_kind = (data or {}).get("_error_kind", "unknown") if isinstance(data, dict) else "unknown"
-            logger.error("[邀请] 邀请失败 (HTTP %d, kind=%s)", status, err_kind)
+            errored = (data or {}).get("_errored_emails") if isinstance(data, dict) else None
+            logger.error(
+                "[邀请] 邀请失败 (HTTP %d, kind=%s, errored=%s)",
+                status,
+                err_kind,
+                bool(errored),
+            )
             return False
-        invited_seat = (data or {}).get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
-        logger.info("[邀请] 邀请已发送 (seat_type=%s)", invited_seat)
+        logger.info("[邀请] 邀请已发送 (seat_type=%s → %s)", raw_seat, seat_label)
+        # 邀请发送成功就把账号入池(seat_type 落盘),即便后续注册流程失败,
+        # 至少 accounts.json 留有一条记录给上游 reconcile / fill 使用。
+        add_account(email, "", cloudmail_account_id=account_id, seat_type=seat_label)
 
         # Step 3: 等待邀请邮件
         logger.info("[邀请] 等待邀请邮件...")
@@ -527,6 +555,8 @@ def run():
 
         if result:
             logger.info("[邀请] %s 已注册并加入 ChatGPT Team", email)
+            # 注册成功后再把 seat_type 复写一次 — 防止 add_account 时账号已存在被旧值覆盖
+            update_account(email, seat_type=seat_label)
         else:
             logger.error("[邀请] 流程未完成，请查看 screenshots/ 目录")
 

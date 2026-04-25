@@ -231,3 +231,216 @@ def test_reconcile_orphan_marked_when_kick_disabled(tmp_path, monkeypatch):
     assert "stay@example.com" in result["orphan_marked"]
     # 应只被打 STATUS_ORPHAN 标记
     assert any(kw.get("status") == STATUS_ORPHAN for _e, kw in updates)
+
+
+# ---------------------------------------------------------------------------
+# task #2 新增:dry_run/ghost priority/auth_file fallback/quota fallthrough
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_dry_run_includes_over_cap_predictions(tmp_path, monkeypatch):
+    """HIGH-1:dry_run 必须**预测**第二轮 over-cap 受害者填进 over_cap_kicked,
+    但不能 GET /users 第二次,也不能调 remove_from_team / update_account。
+    """
+    # 5 子号 + 1 主号 → 超员 1
+    auth_ok = tmp_path / "codex-good@example.com-team-1.json"
+    auth_ok.write_text("{}", encoding="utf-8")
+
+    accounts = [
+        {
+            "email": f"u{i}@example.com",
+            "status": STATUS_ACTIVE,
+            "auth_file": str(auth_ok),
+            "last_quota": {"primary_pct": 10 * i, "weekly_pct": 0},
+        }
+        for i in range(1, 6)
+    ]
+    members = [{"email": f"u{i}@example.com"} for i in range(1, 6)]
+    members.append({"email": "owner@example.com"})  # 主号
+
+    fake = _make_fake_chatgpt(members)
+
+    # 包装 _api_fetch 计数,确保 dry_run 不会 GET 第二次
+    fetch_calls = []
+    real_fetch = fake._api_fetch
+
+    def counting_fetch(method, path, body_=None):
+        fetch_calls.append((method, path))
+        return real_fetch(method, path, body_)
+
+    fake._api_fetch = counting_fetch
+
+    _common_monkeypatch(monkeypatch, accounts)
+
+    def _forbid_kick(*_a, **_kw):
+        raise AssertionError("dry_run must not call remove_from_team")
+
+    def _forbid_update(*_a, **_kw):
+        raise AssertionError("dry_run must not call update_account")
+
+    monkeypatch.setattr(manager, "remove_from_team", _forbid_kick)
+    monkeypatch.setattr(manager, "update_account", _forbid_update)
+
+    result = manager._reconcile_team_members(chatgpt_api=fake, dry_run=True)
+
+    # 第二轮 GET /users 必须被跳过(只有第一轮一次)
+    user_get_calls = [c for c in fetch_calls if c[0] == "GET" and c[1].endswith("/users")]
+    assert len(user_get_calls) == 1, f"dry_run should not refetch /users, got {fetch_calls}"
+
+    # 必须有 1 个 over_cap_kicked 预测项
+    assert len(result["over_cap_kicked"]) == 1, f"expected 1 prediction, got {result['over_cap_kicked']}"
+    # 受害者按 _priority 升序,active 按 p_remain (100-primary_pct) 升序 → primary_pct 最高的先 kick
+    # u5 primary_pct=50 → p_remain=50 是最低 remain → 第一个被 kick
+    assert result["over_cap_kicked"] == ["u5@example.com"]
+
+
+def test_reconcile_priority_keeps_ghost_when_kick_disabled(tmp_path, monkeypatch):
+    """HIGH-2:RECONCILE_KICK_GHOST=False 时,_priority(本地无记录) 必须返回 (99, 0),
+    不能让 ghost 在第二轮 over-cap 排序里抢到 (0, 0) 绕过开关被 kick。
+    """
+    auth_ok = tmp_path / "codex-keep@example.com-team-1.json"
+    auth_ok.write_text("{}", encoding="utf-8")
+
+    # 4 个 active 账号 + 1 个 ghost(本地无记录) = 5,超员 1
+    accounts = [
+        {
+            "email": f"u{i}@example.com",
+            "status": STATUS_ACTIVE,
+            "auth_file": str(auth_ok),
+            "last_quota": {"primary_pct": 50, "weekly_pct": 0},
+        }
+        for i in range(1, 5)
+    ]
+    members = [
+        {"email": "u1@example.com"},
+        {"email": "u2@example.com"},
+        {"email": "u3@example.com"},
+        {"email": "u4@example.com"},
+        {"email": "ghost-extra@example.com"},  # 本地无记录
+        {"email": "owner@example.com"},
+    ]
+
+    fake = _make_fake_chatgpt(members)
+    _common_monkeypatch(monkeypatch, accounts)
+
+    import autoteam.config as _cfg
+
+    monkeypatch.setattr(_cfg, "RECONCILE_KICK_GHOST", False, raising=False)
+    monkeypatch.setattr(_cfg, "RECONCILE_KICK_ORPHAN", True, raising=False)
+
+    kicked = []
+
+    def fake_remove(_api, email, **kw):
+        kicked.append(email)
+        return "removed"
+
+    monkeypatch.setattr(manager, "remove_from_team", fake_remove)
+    monkeypatch.setattr(manager, "update_account", lambda *_a, **_kw: None)
+
+    result = manager._reconcile_team_members(chatgpt_api=fake)
+
+    # 第一轮:RECONCILE_KICK_GHOST=False,ghost-extra 不被 kick,只 ghost_seen
+    assert "ghost-extra@example.com" in result["ghost_seen"]
+    assert "ghost-extra@example.com" not in result["ghost_kicked"]
+
+    # 第二轮 over-cap 1 个:必须挑 u1-u4 中的一个 active(p_remain=50, priority=(5,50))
+    # 而不是 ghost-extra(被强制排到 (99, 0) 末尾)
+    assert "ghost-extra@example.com" not in result["over_cap_kicked"], (
+        f"ghost must not be over-cap kicked when RECONCILE_KICK_GHOST=False: {result['over_cap_kicked']}"
+    )
+    assert len(result["over_cap_kicked"]) == 1
+    assert result["over_cap_kicked"][0] in {f"u{i}@example.com" for i in range(1, 5)}
+
+
+def test_reconcile_find_team_auth_file_rejects_personal_plan(tmp_path, monkeypatch):
+    """MEDIUM-3:_find_team_auth_file 必须只接受 -team-*.json,
+    personal/plus/free 席位的 bundle 不能被误用(用错 plan 的 token 会被 OAuth 拒收)。
+    """
+    # patch AUTH_DIR to tmp_path
+    from autoteam import auth_storage
+
+    monkeypatch.setattr(auth_storage, "AUTH_DIR", tmp_path)
+
+    # 只有 personal bundle,没有 team bundle
+    (tmp_path / "codex-bob@example.com-personal-1.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "codex-bob@example.com-plus-2.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "codex-bob@example.com-free.json").write_text("{}", encoding="utf-8")
+
+    # 没有 -team- 前缀 → 必须返回 None
+    assert manager._find_team_auth_file("bob@example.com") is None
+
+    # 加一个真正的 -team- bundle → 应能找到
+    team_bundle = tmp_path / "codex-bob@example.com-team-9.json"
+    team_bundle.write_text("{}", encoding="utf-8")
+    assert manager._find_team_auth_file("bob@example.com") == str(team_bundle)
+
+
+def test_reconcile_misaligned_with_auth_repair_still_checks_exhausted(tmp_path, monkeypatch):
+    """MEDIUM-4:STANDBY 错位补 auth 后,fallthrough 到 quota 耗尽检查。
+    last_quota=100/100 时必须改标 EXHAUSTED,而不是停留在 active。
+    """
+    found_path = tmp_path / "codex-rescued@example.com-team-1.json"
+    found_path.write_text("{}", encoding="utf-8")
+
+    acc = {
+        "email": "rescued@example.com",
+        "status": STATUS_STANDBY,
+        "auth_file": None,  # 触发补 auth 路径
+        "last_quota": {"primary_pct": 100, "weekly_pct": 100},
+    }
+
+    fake = _make_fake_chatgpt([{"email": "rescued@example.com"}])
+    _common_monkeypatch(monkeypatch, [acc])
+    monkeypatch.setattr(manager, "_find_team_auth_file", lambda email: str(found_path))
+
+    def _forbid_kick(*_a, **_kw):
+        raise AssertionError("misaligned + auth repair must not KICK")
+
+    monkeypatch.setattr(manager, "remove_from_team", _forbid_kick)
+
+    updates = []
+    monkeypatch.setattr(manager, "update_account", lambda email, **kw: updates.append((email, kw)))
+
+    result = manager._reconcile_team_members(chatgpt_api=fake)
+
+    # misaligned_fixed 命中
+    assert "rescued@example.com" in result["misaligned_fixed"]
+    # **关键回归断言**:fallthrough 后 exhausted_marked 也命中
+    assert "rescued@example.com" in result["exhausted_marked"], (
+        f"补 auth 后必须 fallthrough 到 quota 检查,实际 result={result}"
+    )
+    # 必须有一次 update 把 status 改成 EXHAUSTED 且写 quota_exhausted_at
+    assert any(
+        kw.get("status") == STATUS_EXHAUSTED and kw.get("quota_exhausted_at") is not None for _e, kw in updates
+    ), f"missing EXHAUSTED+quota_exhausted_at update: {updates}"
+
+
+def test_reconcile_misaligned_orphan_kick_syncs_status_to_auth_invalid(tmp_path, monkeypatch):
+    """MEDIUM-5(reconcile-reviewer 报的测试缺口):
+    STANDBY 错位 + 找不到 auth → 走残废分支 KICK,KICK 成功后必须把本地 status 同步成
+    AUTH_INVALID,否则下次 fill 仍按 standby 计数。
+    """
+    acc = {
+        "email": "drifted-orphan@example.com",
+        "status": STATUS_STANDBY,
+        "auth_file": None,
+    }
+    fake = _make_fake_chatgpt([{"email": "drifted-orphan@example.com"}])
+    _common_monkeypatch(monkeypatch, [acc])
+    monkeypatch.setattr(manager, "_find_team_auth_file", lambda email: None)
+
+    import autoteam.config as _cfg
+
+    monkeypatch.setattr(_cfg, "RECONCILE_KICK_ORPHAN", True, raising=False)
+    monkeypatch.setattr(manager, "remove_from_team", lambda *_a, **_kw: "removed")
+
+    updates = []
+    monkeypatch.setattr(manager, "update_account", lambda email, **kw: updates.append((email, kw)))
+
+    result = manager._reconcile_team_members(chatgpt_api=fake)
+
+    assert "drifted-orphan@example.com" in result["orphan_kicked"]
+    # 关键回归断言:KICK 后 status 必须同步成 AUTH_INVALID
+    assert any(
+        email == "drifted-orphan@example.com" and kw.get("status") == STATUS_AUTH_INVALID for email, kw in updates
+    ), f"expected status=AUTH_INVALID write after misaligned KICK, got: {updates}"

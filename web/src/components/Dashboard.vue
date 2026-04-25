@@ -385,6 +385,8 @@ function statusClass(s) {
     standby: 'bg-yellow-500/10 text-yellow-400',
     pending: 'bg-gray-500/10 text-gray-400',
     personal: 'bg-fuchsia-500/10 text-fuchsia-400',
+    auth_invalid: 'bg-orange-500/10 text-orange-400',
+    orphan: 'bg-amber-500/10 text-amber-300',
   }[s] || 'bg-gray-500/10 text-gray-400'
 }
 
@@ -395,11 +397,21 @@ function dotClass(s) {
     standby: 'bg-yellow-400',
     pending: 'bg-gray-400',
     personal: 'bg-fuchsia-400',
+    auth_invalid: 'bg-orange-400',
+    orphan: 'bg-amber-300',
   }[s] || 'bg-gray-400'
 }
 
 function statusLabel(s) {
-  return { active: 'Active', exhausted: 'Used up', standby: 'Standby', pending: 'Pending', personal: 'Personal' }[s] || s
+  return {
+    active: 'Active',
+    exhausted: 'Used up',
+    standby: 'Standby',
+    pending: 'Pending',
+    personal: 'Personal',
+    auth_invalid: '认证失效',
+    orphan: '孤立',
+  }[s] || s
 }
 
 function quota(acc, type) {
@@ -500,8 +512,8 @@ function canLogin(acc) {
 }
 
 function loginLabel(acc) {
-  // personal 缺认证时文案改为"补登录"，更符合用户语境
-  if (acc.status === 'personal') return '补登录'
+  // personal 缺认证 / auth_invalid / orphan 都属于"需要补登录"语境
+  if (acc.status === 'personal' || acc.status === 'auth_invalid' || acc.status === 'orphan') return '补登录'
   return '登录'
 }
 
