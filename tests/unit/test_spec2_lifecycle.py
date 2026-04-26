@@ -1,7 +1,7 @@
 """SPEC-2 — 账号生命周期与配额(共 5 共因 + 3 独属)的单元测试。
 
 覆盖范围:
-  共因 A: plan_type 白名单(SUPPORTED_PLAN_TYPES / is_supported_plan / normalize_plan_type)
+  共因 A: plan_type 白名单 — Round 7 P2.3 已抽到 tests/unit/test_plan_type_whitelist.py
   共因 B: wham/usage 4+1 分类 — no_quota 触发条件
   共因 C: OAuth add-phone 探针(detect_phone_verification 复用契约 — 通过 import 校验,
           深度 e2e 留给 codex_auth 集成测试)
@@ -13,49 +13,6 @@
 """
 
 from unittest.mock import patch
-
-import pytest
-
-# ---------------------------------------------------------------------------
-# 共因 A — plan_type 白名单
-# ---------------------------------------------------------------------------
-
-def test_supported_plan_types_constant_is_frozenset_with_4_entries():
-    from autoteam.accounts import SUPPORTED_PLAN_TYPES
-    assert isinstance(SUPPORTED_PLAN_TYPES, frozenset)
-    assert SUPPORTED_PLAN_TYPES == frozenset({"team", "free", "plus", "pro"})
-
-
-@pytest.mark.parametrize("raw,expected", [
-    ("team", "team"),
-    ("Team", "team"),
-    ("  Free ", "free"),
-    ("PLUS", "plus"),
-    (None, "unknown"),
-    ("", "unknown"),
-    ("self_serve_business_usage_based", "self_serve_business_usage_based"),
-])
-def test_normalize_plan_type(raw, expected):
-    from autoteam.accounts import normalize_plan_type
-    assert normalize_plan_type(raw) == expected
-
-
-@pytest.mark.parametrize("raw,supported", [
-    ("team", True),
-    ("Team", True),
-    ("free", True),
-    ("plus", True),
-    ("pro", True),
-    ("self_serve_business_usage_based", False),
-    ("enterprise", False),
-    ("unknown", False),
-    ("", False),
-    (None, False),
-])
-def test_is_supported_plan_whitelist_only(raw, supported):
-    from autoteam.accounts import is_supported_plan
-    assert is_supported_plan(raw) is supported
-
 
 # ---------------------------------------------------------------------------
 # 共因 B — wham/usage no_quota 分类

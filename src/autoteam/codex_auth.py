@@ -1705,21 +1705,83 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     }
 
 
-def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0):
+# Round 7 FR-D6 — manager 24h 去重 cheap_codex_smoke。
+# 同一 account_id 在 24h 内重复调用 cheap_codex_smoke 时,直接返回上次落盘的结果,
+# 不再走网络。R2 风险缓解(fresh seat 命中率 > 5% 时 smoke 调用密度爆炸)。
+_CODEX_SMOKE_DEDUP_SECONDS = 86400
+
+
+def _read_codex_smoke_cache(account_id):
+    """从 accounts.json 读 last_codex_smoke_at + last_smoke_result。
+
+    匹配规则:account_id 优先按 workspace_account_id 比对,其次 email 比对。
+    返回 (epoch_at, result_str) 或 None(无 account_id / 无记录 / 字段缺失)。
+    """
+    if not account_id:
+        return None
+    try:
+        from autoteam.accounts import load_accounts
+        accounts = load_accounts()
+    except Exception:
+        return None
+    target = str(account_id)
+    for acc in accounts:
+        if acc.get("workspace_account_id") == target or acc.get("email") == target:
+            ts = acc.get("last_codex_smoke_at")
+            res = acc.get("last_smoke_result")
+            if ts and res:
+                try:
+                    return (float(ts), str(res))
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _write_codex_smoke_cache(account_id, result):
+    """落盘 last_codex_smoke_at + last_smoke_result,用于 24h 去重。
+
+    匹配规则同 _read_codex_smoke_cache。result 取值 alive/auth_invalid/uncertain。
+    任何异常静默吞,cache 失败不阻塞主流程。
+    """
+    if not account_id or not result:
+        return
+    try:
+        from autoteam.accounts import load_accounts, update_account
+    except Exception:
+        return
+    target = str(account_id)
+    try:
+        accounts = load_accounts()
+    except Exception:
+        return
+    for acc in accounts:
+        if acc.get("workspace_account_id") == target or acc.get("email") == target:
+            try:
+                update_account(
+                    acc["email"],
+                    last_codex_smoke_at=time.time(),
+                    last_smoke_result=str(result),
+                )
+            except Exception as exc:
+                logger.debug("[Codex smoke] cache 落盘失败(忽略): %s", exc)
+            return
+
+
+def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0, force=False):
     """SPEC-2 shared/quota-classification §4.4 — uninitialized_seat 二次验证。
 
     对 codex backend 发一个最小推理请求(reasoning.effort=none + max_output_tokens=1 + stream),
     只读第一帧 SSE 立即关流,不消耗多余 token。
 
+    Round 7 FR-D6:24h 去重 cache。account_id 在 24h 内已有 cache 时直接返回,不走网络;
+    传 force=True 可绕过 cache(用于强制刷新场景)。
+
     返回 (result, detail):
         ("alive", None)              — HTTP 200 + 第一帧含 response.created → 真活号
         ("auth_invalid", reason)     — HTTP 401/403/429 / 4xx 含 quota 关键词 → token/seat 真失效
         ("uncertain", reason)        — HTTP 5xx / network / timeout / 解析异常 → 保留原状态等下轮
-
-    24h 去重由调用方负责(读 acc.last_codex_smoke_at)。
+        cache 命中时 detail 为 "cache_hit_<原 result>"
     """
-    import requests
-
     if not access_token:
         return "auth_invalid", "empty_access_token"
 
@@ -1728,6 +1790,32 @@ def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0):
             account_id = get_chatgpt_account_id()
         except Exception:
             account_id = None
+
+    # Round 7 FR-D6 — 24h 去重 cache 命中直接返回(force=True 时绕过)
+    if not force and account_id:
+        cached = _read_codex_smoke_cache(account_id)
+        if cached:
+            cached_at, cached_result = cached
+            if (time.time() - cached_at) < _CODEX_SMOKE_DEDUP_SECONDS:
+                logger.debug(
+                    "[Codex smoke] 24h cache 命中 account_id=%s result=%s age=%.0fs",
+                    account_id, cached_result, time.time() - cached_at,
+                )
+                return cached_result, f"cache_hit_{cached_result}"
+
+    # cache miss / force=True — 调网络并写回 cache
+    result, detail = _cheap_codex_smoke_network(access_token, account_id, timeout=timeout)
+    _write_codex_smoke_cache(account_id, result)
+    return result, detail
+
+
+def _cheap_codex_smoke_network(access_token, account_id, *, timeout=15.0):
+    """实际走网络的 cheap_codex_smoke 内部函数(Round 7 FR-D6 拆出)。
+
+    与 cheap_codex_smoke 不同点:不查也不写 cache,直接调 codex backend。
+    返回值语义同 cheap_codex_smoke。
+    """
+    import requests
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -1901,6 +1989,10 @@ def check_codex_quota(access_token, account_id=None):
         "primary_remaining": primary_remaining_raw if isinstance(primary_remaining_raw, (int, float)) else None,
         "weekly_pct": secondary.get("used_percent", 0),
         "weekly_resets_at": secondary.get("reset_at", 0),
+        # Round 7 P2.5:把 wham/usage 的原始 rate_limit + primary_window 子树注入 quota_info,
+        # 让 manager 在 record_failure(no_quota_assigned) 时能附 raw_rate_limit 用于事后排查。
+        "raw_rate_limit": rate_limit,
+        "primary_window": primary,
     }
 
     # SPEC-2 shared/quota-classification §4.2 — no_quota 单独分支:rate_limit 字段

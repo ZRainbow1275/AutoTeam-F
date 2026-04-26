@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -20,10 +21,38 @@ from autoteam.textio import read_text
 
 logger = logging.getLogger(__name__)
 
+
+# Round 7 P2.4 — FastAPI 现代 lifespan handler 替代已废弃的 @app.on_event。
+# 启动期:修复 auths 认证文件权限 + 启动 _auto_check_loop 后台线程。
+# 停止期:发 _auto_check_stop 信号让线程优雅退出。
+# 引用的 _auto_check_loop / _auto_check_stop / ensure_auth_file_permissions 都在
+# module 后段定义,Python 闭包延迟绑定符合预期(yield 时才会解析名字)。
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    logger.info("[lifespan] starting")
+    try:
+        from autoteam.auth_storage import ensure_auth_file_permissions
+
+        fixed = ensure_auth_file_permissions()
+        if fixed:
+            logger.info("[启动] 已修复 %d 个 auths 认证文件权限", fixed)
+    except Exception as exc:
+        logger.warning("[启动] 修复 auths 认证文件权限失败: %s", exc)
+
+    thread = threading.Thread(target=_auto_check_loop, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        logger.info("[lifespan] stopping")
+        _auto_check_stop.set()
+
+
 app = FastAPI(
     title="AutoTeam API",
     description="ChatGPT Team 账号自动轮转管理 API",
     version="0.1.0",
+    lifespan=app_lifespan,
 )
 
 
@@ -2567,24 +2596,7 @@ def set_auto_check_config(cfg: AutoCheckConfig):
     return _auto_check_config.copy()
 
 
-@app.on_event("startup")
-def _start_auto_check():
-    try:
-        from autoteam.auth_storage import ensure_auth_file_permissions
-
-        fixed = ensure_auth_file_permissions()
-        if fixed:
-            logger.info("[启动] 已修复 %d 个 auths 认证文件权限", fixed)
-    except Exception as exc:
-        logger.warning("[启动] 修复 auths 认证文件权限失败: %s", exc)
-
-    thread = threading.Thread(target=_auto_check_loop, daemon=True)
-    thread.start()
-
-
-@app.on_event("shutdown")
-def _stop_auto_check():
-    _auto_check_stop.set()
+# Round 7 P2.4 — startup/shutdown 已迁移到顶部 app_lifespan,这里不再重复挂 handler。
 
 
 # ---------------------------------------------------------------------------

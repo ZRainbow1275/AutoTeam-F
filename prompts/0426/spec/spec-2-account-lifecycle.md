@@ -8,10 +8,10 @@
 | 名称 | 账号生命周期与配额加固 实施规范 |
 | 主笔 | prd-lifecycle |
 | 时间 | 2026-04-26 |
-| 版本 | v1.3 (2026-04-26 Round 6 quality-reviewer 终审 follow-up) |
-| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) |
+| 版本 | v1.4 (2026-04-26 Round 7 P2 follow-up — 命名归一化 + task["error"] 关键字契约 + 24h 去重接入) |
+| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) |
 | 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) |
-| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** |
+| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** |
 
 ---
 
@@ -461,24 +461,43 @@ elif status_str == "no_quota":
 **文件**:`src/autoteam/invite.py:496` + `src/autoteam/chatgpt_api.py:1414-1511` + `runtime_config.py`
 **FR**:F1~F6
 
-#### 3.4.1 `runtime_config.py` 新增
+#### 3.4.1 `runtime_config.py` 新增(Round 7 v1.4 命名归一化)
+
+**命名规则**(v1.4 修订):
+- 主名:`default`(默认值)— 行为=旧 PATCH 升级 ChatGPT 完整席位
+- 别名:`chatgpt`(转移期接受)— setter 收到 `chatgpt` normalize 为 `default`,getter 永不返回 `chatgpt`
+- 主名:`codex` — codex-only 席位,锁 usage_based,不升级
+
+**理由**:实施层 `runtime_config.py:141-142` 已使用 `default`/`codex`(用户配置 `runtime_config.json` 已写 `"preferred_seat_type": "default"` 字面量),改实施会破坏向后兼容。Round 5 verify 揭示 SPEC v1.0~1.3 与实施不一致(SPEC 写 `chatgpt`),Round 7 P2.1 选择**改 SPEC**保持向后兼容,setter 加 `chatgpt → default` 转移期支持。
 
 ```python
-# runtime_config.py 末尾追加
+# runtime_config.py(Round 7 v1.4 与实施对齐)
 
-_VALID_SEAT_TYPES = frozenset({"chatgpt", "codex"})
+_PREFERRED_SEAT_TYPE_DEFAULT = "default"
+_PREFERRED_SEAT_TYPE_VALID = frozenset({"default", "codex"})
 
 
 def get_preferred_seat_type() -> str:
-    """返回邀请席位偏好。chatgpt(默认):走 default 席位,PATCH 升级;codex:usage_based,不升级."""
-    raw = (get("preferred_seat_type") or "chatgpt").strip().lower()
-    return raw if raw in _VALID_SEAT_TYPES else "chatgpt"
+    """返回邀请席位偏好。'default'(默认/PATCH 升级 ChatGPT 完整席位)或 'codex'(锁 codex-only)。
+
+    永不返回 'chatgpt'(它是 default 的转移期别名,见 set_preferred_seat_type)。
+    """
+    raw = (get("preferred_seat_type") or _PREFERRED_SEAT_TYPE_DEFAULT).strip().lower()
+    return raw if raw in _PREFERRED_SEAT_TYPE_VALID else _PREFERRED_SEAT_TYPE_DEFAULT
 
 
 def set_preferred_seat_type(value: str) -> str:
-    cleaned = (value or "").strip().lower()
-    if cleaned not in _VALID_SEAT_TYPES:
-        raise ValueError(f"preferred_seat_type 必须是 {_VALID_SEAT_TYPES} 之一")
+    """落盘邀请席位偏好。
+
+    Round 7 v1.4:接受 'chatgpt' 作为 'default' 的转移期别名(向后兼容),
+    setter 内部 normalize 为 'default' 后落盘。
+    """
+    cleaned = (str(value or "") or _PREFERRED_SEAT_TYPE_DEFAULT).strip().lower()
+    # ★ Round 7 P2.1:chatgpt 是 default 的转移期别名
+    if cleaned == "chatgpt":
+        cleaned = "default"
+    if cleaned not in _PREFERRED_SEAT_TYPE_VALID:
+        cleaned = _PREFERRED_SEAT_TYPE_DEFAULT
     set_value("preferred_seat_type", cleaned)
     return cleaned
 
@@ -487,6 +506,15 @@ def get_runtime(key: str, default):
     """通用读取(供 sync_account_states 等使用)"""
     return get(key, default)
 ```
+
+**转移期(deprecation timeline)**:
+- 2026-04-26 起 setter 接受 `chatgpt` 别名(Round 7)
+- ≥ 1 个 release 后(2026-07 视用户反馈)考虑移除别名
+- 文档(本 SPEC + Settings.vue UI 文案)同步使用 `default` 主名
+
+**单测**:
+- `test_set_preferred_seat_type_accepts_chatgpt_alias` 验证 `set_preferred_seat_type("chatgpt") == "default"` + 落盘读回也是 `"default"`
+- `test_get_preferred_seat_type_default` 验证 getter 永不返回 `chatgpt`
 
 #### 3.4.2 `invite.py:496` 改造
 
@@ -586,6 +614,26 @@ if use_personal:
 **调用方处置**:5 处 `login_codex_via_browser` 调用方(`manager.py:1057 / 1431 / 1463 / 2466` + `api.py:1675`)必须显式 `except RegisterBlocked`,详见 `shared/add-phone-detection.md §5.2 调用方分类处置矩阵`。
 
 **验收**:`grep -rn "oauth_personal_check" src/autoteam/codex_auth.py` 必须命中 1 处(Round 6 实测 `:939` 已落地 ✅)。
+
+### 3.4.6 quota check 24h 去重(Round 7 FR-D6)
+
+**位置**:`codex_auth.py:check_codex_quota` 内 uninitialized_seat 分支
+
+**契约**:`check_codex_quota` 在收到 wham 200 + uninitialized_seat 形态后,在调用 `cheap_codex_smoke` 之前先查 `_read_codex_smoke_cache(account_id)`:
+
+- 24h cache 命中 → 直接转 5 分类返回(不调网络),`quota_info["smoke_cache_hit"] = True`
+- 24h cache miss / 过期 → 调 `cheap_codex_smoke(access_token, account_id)`,落盘 `last_codex_smoke_at` + `last_smoke_result`,再转 5 分类
+
+**accounts.json 字段扩**:
+
+| 字段 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `last_codex_smoke_at` | float \| null | null | 上次 cheap_codex_smoke 调用的 epoch seconds |
+| `last_smoke_result` | str \| null | null | `"alive"` / `"auth_invalid"` / `"uncertain"` |
+
+**详见**:`./shared/quota-classification.md §4.4`(完整工具函数代码 + I9 不变量)
+
+**调用方透明**:9+2 调用方对 `check_codex_quota` 的 5 分类处置不变,24h 去重由 `check_codex_quota` 内部消化。
 
 ### 3.5 personal 删除链短路 fetch_team_state
 
@@ -732,7 +780,53 @@ def post_account_login(email: str, ...):
     ...
 ```
 
-**前端解析**(`web/src/api.ts`):
+**前端解析**(`web/src/api.ts` 或 `web/src/api.js`,与仓库实际后缀一致):
+
+**Round 7 v1.4 task["error"] 关键字契约**:
+
+由于 `post_account_login` 是 `_start_task` 异步任务,`raise HTTPException(409, ...)` 在 `_run_task`(`api.py:488-516`)的 `except Exception as e: task["error"] = str(e)` 中被转录为字符串。`HTTPException.__str__` 输出形如:
+
+```
+"409: {'error': 'phone_required', 'step': 'oauth_consent_2', 'reason': 'add-phone url 命中'}"
+```
+
+前端 polling task status 时,需按以下子串关键字识别(顺序敏感,phone_required 优先):
+
+| 关键字串 | 语义 | UI 友好提示 |
+|---|---|---|
+| `phone_required` | OAuth 撞 add-phone 探针 | "该账号需要绑定手机才能完成 OAuth" |
+| `register_blocked` | OAuth 撞其他 RegisterBlocked(非 phone) | "该账号注册被阻断,请检查 OAuth 状态" |
+| 其他 | 通用错误 | 默认 toast(通用错误信息) |
+
+**前端 api.js 解析模板**(Round 7 FR-D7 落地):
+
+```javascript
+// web/src/api.js
+async function pollTask(taskId) {
+  const resp = await request('GET', `/tasks/${taskId}`)
+  if (resp.error) {
+    const errStr = String(resp.error)
+    if (errStr.includes('phone_required')) {
+      const e = new Error('该账号需要绑定手机才能完成 OAuth')
+      e.code = 'phone_required'
+      e.detail = errStr
+      throw e
+    }
+    if (errStr.includes('register_blocked')) {
+      const e = new Error('该账号注册被阻断,请检查 OAuth 状态')
+      e.code = 'register_blocked'
+      e.detail = errStr
+      throw e
+    }
+    throw new Error(errStr)
+  }
+  return resp
+}
+```
+
+**同步路径(直接 raise HTTPException 命中)**:
+
+如果端点改为同步路径(非 _start_task 异步包装),HTTPException(409) 会直接产生 HTTP 响应:
 
 ```ts
 if (resp.status === 409 && body.detail?.error === "phone_required") {
@@ -740,6 +834,8 @@ if (resp.status === 409 && body.detail?.error === "phone_required") {
     // 可选:跳到运营回放页查看截图
 }
 ```
+
+**契约保证**:无论同步/异步路径,`phone_required` / `register_blocked` 字面量都会出现在响应/error 中,前端可统一按子串匹配解析。
 
 **验收**:
 
@@ -1169,3 +1265,4 @@ Phase 6 (灰度上线)
 | v1.1 | 2026-04-26 Round 6 | 加 §3.4.5 OAuth 4 探针接入清单(强调 C-P4 必修);§3.5.1 short_circuit 强调 STATUS_AUTH_INVALID 必含;§3.5.2 加 `bool(targets)` 守卫与混合场景说明;新增 §3.5.3 `api.post_account_login` 409 phone_required 详细契约(对应 Story Map S-2.2)。关联 PRD-5 FR-P0 / P1.1 / P1.2 / P1.3 / P1.4 |
 | v1.2 | 2026-04-26 Round 6 finalize | user 确认 Q-3 决策:§3.5.3 验收清单加 1 条 — 409 body 不带截图相对路径,前端自己拉 `/api/screenshots/...` 或读 `register_failures.json` 字段 |
 | v1.3 | 2026-04-26 Round 6 quality-reviewer 终审 follow-up | §3.4.5 C-P4 探针位置描述对齐实施(`codex_auth.py:939`):由"`if use_personal:` 这行**之前**"修订为"callback for-loop 之后,`browser.close()` 之前,`_exchange_auth_code` 之前"。理由:`if use_personal:` 在 `browser.close()` 之后,page 已 close,assert_not_blocked 异常会被吞为 False。表格"插入位置"列 + 实施代码段全部对齐;落地状态由 ❌ 改为 ✅;同步规范 try/except 关 browser 后 raise 的资源释放要求。详见 `prompts/0426/verify/round6-review-report.md` §3.1 决策 1 审查 |
+| v1.4 | 2026-04-26 Round 7 P2 follow-up | (1) §3.4.1 PREFERRED_SEAT_TYPE 命名归一化:主名 `default`(默认) / `codex`,加 `chatgpt` 转移期别名(setter 接受并 normalize 为 default,getter 永不返 chatgpt);(2) §3.4.6 加 quota check 24h 去重接入说明(Round 7 FR-D6,详见 quota-classification §4.4 + I9);(3) §3.5.3 加 task["error"] 关键字契约(phone_required / register_blocked 字符串子串匹配,前端 api.js 模板);(4) 引用方加 PRD-6;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.1 / §5.6 / §5.7 |

@@ -75,6 +75,35 @@ logger = logging.getLogger(__name__)
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 
 
+# Round 7 P2.5 — 把 wham/usage 原始 rate_limit 子树序列化为字符串,
+# 供 record_failure(no_quota_assigned, raw_rate_limit=...) 落 register_failures.json,
+# 便于事后排查 OpenAI 协议变化。截断 2000 字符防止 register_failures.json 膨胀(NFR-6)。
+_RAW_RATE_LIMIT_MAX_CHARS = 2000
+
+
+def _extract_raw_rate_limit_str(quota_info) -> str:
+    """从 check_codex_quota 返回的 quota_info / exhausted_info 中提取原始 rate_limit 子树并 JSON 序列化。
+
+    输入既可能是 ok 形态的 quota_info(顶层 raw_rate_limit / primary_window),
+    也可能是 exhausted/no_quota 形态的 exhausted_info(raw_rate_limit 顶层 + 子层 quota_info)。
+    序列化失败时返回空串,不阻塞 record_failure 主流程(R5 缓解)。
+    """
+    if not isinstance(quota_info, dict):
+        return ""
+    raw = (
+        quota_info.get("raw_rate_limit")
+        or (quota_info.get("quota_info") or {}).get("raw_rate_limit")
+        or quota_info.get("primary_window")
+        or (quota_info.get("quota_info") or {}).get("primary_window")
+    )
+    if not raw:
+        return ""
+    try:
+        return json.dumps(raw, ensure_ascii=False)[:_RAW_RATE_LIMIT_MAX_CHARS]
+    except Exception:
+        return ""
+
+
 def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
@@ -1595,6 +1624,7 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
                             email, "no_quota_assigned",
                             "personal free plan 无 codex 配额",
                             stage="run_post_register_oauth_personal",
+                            raw_rate_limit=_extract_raw_rate_limit_str(quota_info),
                         )
                 except Exception as exc:
                     record_failure(
@@ -1728,7 +1758,8 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
                 record_failure(email, "no_quota_assigned",
                                "wham/usage 返回 no_quota(workspace 未分配 codex 配额)",
                                plan_type=bundle_plan,
-                               stage="run_post_register_oauth_team")
+                               stage="run_post_register_oauth_team",
+                               raw_rate_limit=_extract_raw_rate_limit_str(quota_info))
             elif quota_status == "auth_error":
                 update_fields["status"] = STATUS_AUTH_INVALID
                 record_failure(email, "auth_error_at_oauth",
@@ -2890,7 +2921,8 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             try:
                 from autoteam.register_failures import record_failure
                 record_failure(email, "no_quota_assigned", stage="reinvite_account",
-                               detail="primary_total=0 or rate_limit_empty")
+                               detail="primary_total=0 or rate_limit_empty",
+                               raw_rate_limit=_extract_raw_rate_limit_str(info))
             except Exception:
                 pass
         else:

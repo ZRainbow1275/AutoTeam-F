@@ -110,3 +110,39 @@ export const api = {
   removeTeamMember: (payload) => request('POST', '/team/members/remove', payload),
   getLogs: (limit = 100, since = 0) => request('GET', `/logs?limit=${limit}&since=${since}`),
 }
+
+// Round 7 FR-D7 — 把后端 task["error"] 字符串关键字解析为 UI 可消费的语义错误。
+// Round 6 P1.3 决策让 manager 在 task["error"] 中携带 `phone_required` / `register_blocked`
+// 关键字串。前端 UI 在 getTask 轮询命中 task.error 后调用本函数,根据 category 给出
+// 友好 toast 而不是裸字符串。
+//
+// 入参:task — 后端 GET /api/tasks/{id} 的响应对象(含可选 error 字段)
+// 返回:
+//   { category: 'phone_required',     friendly_message: '该账号需要绑定手机才能完成 OAuth', detail }
+//   { category: 'register_blocked',   friendly_message: '...',                              detail }
+//   { category: 'generic',            friendly_message: '<原 error 字符串>',                detail }
+//   null — task 没有 error 字段(任务进行中或成功)
+export function parseTaskError(task) {
+  if (!task || !task.error) return null
+  const errStr = String(task.error)
+  const lower = errStr.toLowerCase()
+  if (lower.includes('phone_required')) {
+    return {
+      category: 'phone_required',
+      friendly_message: '该账号需要绑定手机才能完成 OAuth',
+      detail: errStr,
+    }
+  }
+  if (lower.includes('register_blocked')) {
+    return {
+      category: 'register_blocked',
+      friendly_message: '该账号注册被阻断,请检查 OAuth 状态',
+      detail: errStr,
+    }
+  }
+  return {
+    category: 'generic',
+    friendly_message: errStr,
+    detail: errStr,
+  }
+}

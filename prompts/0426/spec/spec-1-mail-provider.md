@@ -4,10 +4,10 @@
 
 | 字段       | 值                                                                                  |
 | ---------- | ----------------------------------------------------------------------------------- |
-| 版本       | v1.0                                                                                |
+| 版本       | v1.1 (2026-04-26 Round 7 P2 follow-up — MailProviderCard.vue 抽组件路径明确)         |
 | 日期       | 2026-04-26                                                                          |
 | 主笔       | prd-mail                                                                            |
-| 对应 PRD   | `prompts/0426/prd/prd-1-mail-provider.md` v1.0                                      |
+| 对应 PRD   | `prompts/0426/prd/prd-1-mail-provider.md` v1.0 + `prompts/0426/prd/prd-6-p2-followup.md` v1.0 |
 | 状态       | Draft → Ready-for-Implementation                                                    |
 | 关联 spec  | (无依赖 PRD-2 shared spec;`spec/shared/account-state-machine.md` 仅作弱引用)        |
 
@@ -23,9 +23,9 @@
 | `src/autoteam/mail/maillab.py`                        | 修改     | +60      | `_with_login_retry`(新增), `_get`/`_post`/`_delete`/`_put`(改造调用), `MaillabAuthFailed`(新异常类) |
 | `src/autoteam/setup_wizard.py`                        | 修改     | +35 / -8 | `REQUIRED_CONFIGS`(扩 4 字段), `_sniff_provider_mismatch`(强阻断), `_verify_cloudmail`(嗅探前置 + 错配即返 False) |
 | `.env.example`                                        | 修改     | +5 / -3  | `MAIL_PROVIDER` 注释强化, MAILLAB_* 取消注释                                |
-| `web/src/components/SetupPage.vue`                    | 重写     | ~250     | 由平铺字段重构为 `<MailProviderCard>` + 4 卡片                              |
-| `web/src/components/MailProviderCard.vue`             | 新增     | ~280     | 3 步 wizard 状态机                                                          |
-| `web/src/components/Settings.vue`                     | 修改     | +60      | 新增「邮箱后端」区块                                                        |
+| `web/src/components/SetupPage.vue`                    | 重写     | ~250     | 由平铺字段重构为 `<MailProviderCard>` + 4 卡片(**v1.0 阶段实施落到 inline,Round 7 P2.2 抽出**) |
+| `web/src/components/MailProviderCard.vue`             | 新增     | ~280     | 3 步 wizard 状态机 — **Round 7 抽出共享组件**(v1.0 SPEC 列出但 v1.0 实施合并到 SetupPage/Settings.vue 内联,Round 7 PRD-6 FR-P2.2 抽出去重) |
+| `web/src/components/Settings.vue`                     | 修改     | +60      | 新增「邮箱后端」区块(**Round 7 P2.2 改用 `<MailProviderCard mode="settings">`**) |
 | `web/src/api.js`                                      | 修改     | +6       | 新增 `probeMailProvider(payload)`                                           |
 | `tests/test_mail_cf_temp_email_sniff.py`              | 新增     | ~80      | 4 个嗅探用例                                                                |
 | `tests/test_mail_maillab_self_heal.py`                | 新增     | ~120     | 401 自愈 + 递归守卫                                                         |
@@ -1042,4 +1042,13 @@ def test_existing_cf_user_not_broken(monkeypatch, mock_cf_server):
 > - OQ-1:不让前端持 token(SPEC §4.2)
 > - OQ-3:`AUTOTEAM_SKIP_PROVIDER_SNIFF=1` 逃生口写入 SPEC §3.4
 > - OQ-6:domainList 空时 error_code=`EMPTY_DOMAIN_LIST`(SPEC §3.1 异常表)
+
+---
+
+## 附录 A:修订记录
+
+| 版本 | 时间 | 变更 |
+|---|---|---|
+| v1.0 | 2026-04-26 | 初版,21 文件清单 + Pydantic 模型 + 4 步 wizard 状态机 + probe 9 类 error_code |
+| v1.1 | 2026-04-26 Round 7 P2 follow-up | §1 文件清单显式说明 `MailProviderCard.vue` 在 v1.0 阶段实施合并到 SetupPage/Settings.vue 内联(Wave 2 verify 偏差 Dev-1),Round 7 PRD-6 FR-P2.2 抽出共享组件去除 ~80 行双修代码;`MailProviderCard.vue` props `mode: 'setup' \| 'settings'` 区分父组件场景;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.2 + `prompts/0426/verify/wave1-4-integration-report.md` §4.3 Dev-1 |
 

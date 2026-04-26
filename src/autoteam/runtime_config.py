@@ -138,22 +138,31 @@ def set_sync_probe_cooldown_minutes(value):
 # SPEC-2 FR-G — 邀请席位偏好。
 #   "default" 走 default→usage_based 兜底 + PATCH 升级,优先 ChatGPT 完整席位(老行为,默认)
 #   "codex"   直接 usage_based 邀请,跳过 PATCH,锁 codex-only 席位(节约 ChatGPT 席位时使用)
+#   "chatgpt" 别名,Round 7 P2.1 转移期支持,setter/getter 内部归一化为 "default"
 _PREFERRED_SEAT_TYPE_DEFAULT = "default"
-_PREFERRED_SEAT_TYPE_VALID = {"default", "codex"}
+_PREFERRED_SEAT_TYPE_VALID = {"default", "chatgpt", "codex"}
+_PREFERRED_SEAT_TYPE_NORMALIZE = {"chatgpt": "default"}
 
 
-def get_preferred_seat_type():
-    """返回邀请席位偏好。'default'(默认/优先 PATCH 升级 ChatGPT 席位) 或 'codex'(锁 codex-only)。"""
-    raw = get("preferred_seat_type", _PREFERRED_SEAT_TYPE_DEFAULT)
+def _normalize_preferred_seat_type(raw):
+    """把任意输入归一化为 {default, codex} 之一(chatgpt 别名 → default,非法/空 → default)。"""
     val = (str(raw or "") or _PREFERRED_SEAT_TYPE_DEFAULT).strip().lower()
     if val not in _PREFERRED_SEAT_TYPE_VALID:
         return _PREFERRED_SEAT_TYPE_DEFAULT
-    return val
+    return _PREFERRED_SEAT_TYPE_NORMALIZE.get(val, val)
+
+
+def get_preferred_seat_type():
+    """返回邀请席位偏好。'default'(默认/优先 PATCH 升级 ChatGPT 席位) 或 'codex'(锁 codex-only)。
+
+    Round 7 P2.1:已落盘的 'chatgpt' 旧值在读取时也归一化为 'default'。
+    """
+    raw = get("preferred_seat_type", _PREFERRED_SEAT_TYPE_DEFAULT)
+    return _normalize_preferred_seat_type(raw)
 
 
 def set_preferred_seat_type(value):
-    val = (str(value or "") or _PREFERRED_SEAT_TYPE_DEFAULT).strip().lower()
-    if val not in _PREFERRED_SEAT_TYPE_VALID:
-        val = _PREFERRED_SEAT_TYPE_DEFAULT
+    """写入席位偏好;接受 'chatgpt' 作为 'default' 的转移期别名(Round 7 P2.1)。"""
+    val = _normalize_preferred_seat_type(value)
     set_value("preferred_seat_type", val)
     return val

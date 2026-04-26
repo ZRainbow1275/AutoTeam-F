@@ -5,9 +5,9 @@
 | 字段 | 内容 |
 |---|---|
 | 名称 | 账号 7 状态完整状态机与转移规则 |
-| 版本 | v1.0 (2026-04-26) |
-| 主题归属 | `accounts.py` STATUS_* 常量 + 各转移点的触发函数 + 不变量 |
-| 引用方 | PRD-2 / spec-2-account-lifecycle.md / FR-D1~D4、FR-E1~E4、FR-H1~H3 |
+| 版本 | v1.1 (2026-04-26 Round 7 P2 follow-up — Round 6 落地的 cheap_codex_smoke / uninitialized_seat / AUTH_INVALID 短路语义同步) |
+| 主题归属 | `accounts.py` STATUS_* 常量 + 各转移点的触发函数 + 不变量 + uninitialized_seat 中间态(Round 6 引入) |
+| 引用方 | PRD-2 / PRD-5 / PRD-6 / spec-2-account-lifecycle.md / FR-D1~D4、FR-E1~E4、FR-H1~H3、FR-P0、FR-P1.2 / FR-P1.4 / FR-D6 / FR-D8 |
 | 共因 | synthesis §1 共因 D、E + Issue#6 |
 | 不在范围 | seat_type 字段(见 PRD-2 FR-F1~F6)、cpa_sync 同步细节(参考 `cpa_sync.py`) |
 
@@ -146,6 +146,35 @@ class AccountRecord(BaseModel):
 | 工作池(轮转参与) | `active`、`exhausted`、`standby`、`pending` |
 | 终态(不参与轮转) | `personal`、`auth_invalid`、`orphan` |
 
+### 3.3 uninitialized_seat 中间态(Round 6 引入,Round 7 文档同步)
+
+**语义**:`uninitialized_seat` **不是** 7 个 status 枚举之一,而是 STATUS_ACTIVE / STATUS_PENDING 的"待验证"子态。当 wham/usage 返回半空载形态(`primary_total=null + reset_at>0`)时,`check_codex_quota` 标记 `quota_info.window=="uninitialized_seat"` + `needs_codex_smoke=True`,在内部完成 cheap_codex_smoke 二次验证之前,**该账号在状态机层面仍记为原 status**(PENDING 或 ACTIVE)。
+
+**生命周期**:
+
+```
+PENDING (or ACTIVE)
+  │
+  │ wham/usage 200 + primary_total=null + reset>0 命中 I5
+  │ → check_codex_quota 内部判定 uninitialized_seat,准备 smoke
+  │
+  ├─ 24h cache 命中 (Round 7 FR-D6)
+  │   ├─ cached="alive"        → ("ok", quota_info[smoke_cache_hit=True]) → STATUS_ACTIVE
+  │   ├─ cached="auth_invalid" → ("auth_error", None) → STATUS_AUTH_INVALID
+  │   └─ cached="uncertain"    → ("network_error", None) → 保留原 status
+  │
+  └─ cache miss → cheap_codex_smoke 网络调用
+      ├─ "alive"        → ("ok", quota_info[smoke_verified=True]) → STATUS_ACTIVE,落 last_codex_smoke_at + last_smoke_result
+      ├─ "auth_invalid" → ("auth_error", None) → STATUS_AUTH_INVALID,同上落盘
+      └─ "uncertain"    → ("network_error", None) → 保留原 status,同上落盘
+```
+
+**不变量保证**:
+- 账号永远不会停留在 "uninitialized_seat" 中间态超过一次 check_codex_quota 调用周期;调用结束时必有 5 分类 status 之一返回
+- `last_codex_smoke_at` / `last_smoke_result` 字段反映最近一次实际 smoke 网络调用,用于 24h 去重
+- `quota_info.smoke_verified` / `quota_info.last_smoke_result` 反映本次 quota check 的结果(可能是 cache 命中复用)
+- 详见 `./quota-classification.md §4.4 / I8 / I9`
+
 ---
 
 ## 4. 状态/分类规则
@@ -155,10 +184,12 @@ class AccountRecord(BaseModel):
 | 触发函数 | 文件:行号 | 触发条件 | from → to |
 |---|---|---|---|
 | `add_account` | `accounts.py:58` | 新增账号(invite 成功) | (none) → PENDING |
-| `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + quota ok | PENDING → ACTIVE |
+| `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + quota ok(经 cheap_codex_smoke 24h cache 验证或 alive,Round 6/7) | PENDING → ACTIVE |
 | `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + quota exhausted(新) | PENDING → EXHAUSTED |
 | `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + quota no_quota(新) | PENDING → AUTH_INVALID |
-| `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + quota auth_error(新) | PENDING → AUTH_INVALID |
+| `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + quota auth_error(新)| PENDING → AUTH_INVALID |
+| `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + uninitialized_seat 中间态 + cheap_codex_smoke=auth_invalid(Round 6 FR-P0)| PENDING → AUTH_INVALID(经 check_codex_quota 内部消化为 auth_error 路径)|
+| `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle ok + uninitialized_seat 中间态 + cheap_codex_smoke=uncertain(Round 6 FR-P0)| PENDING → ACTIVE(保留原状态,由下轮 sync 校准;经 check_codex_quota 内部转 network_error)|
 | `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle 但 plan_supported=False(新) | PENDING → AUTH_INVALID |
 | `_run_post_register_oauth` Team 分支 | `manager.py:1463` | bundle 失败但已 invite | PENDING → ACTIVE(team_auth_missing,旧行为保留) |
 | `_run_post_register_oauth` Team 分支 | `manager.py:1463` | RegisterBlocked(is_phone=True)(新) | PENDING → AUTH_INVALID |
@@ -169,6 +200,7 @@ class AccountRecord(BaseModel):
 | `sync_account_states` | `manager.py:520` | standby/pending 在 Team 中 | STANDBY/PENDING → ACTIVE |
 | `sync_account_states` | `manager.py:540` | active 不在 Team + workspace_account_id 不一致 | ACTIVE → ACTIVE(母号切换守卫,旧行为保留) |
 | `sync_account_states` | `manager.py:540`(新) | active 不在 Team + wham 401/403 | ACTIVE → AUTH_INVALID |
+| `sync_account_states` | `manager.py:540`(Round 6 FR-P0)| active 在 Team + wham uninitialized_seat + cheap_codex_smoke=auth_invalid | ACTIVE → AUTH_INVALID(短路 check_codex_quota 内部消化路径) |
 | `sync_account_states` | `manager.py:540`(新) | active 不在 Team + wham ok / network_error | ACTIVE → STANDBY(自然待机,保留旧行为) |
 | `cmd_check` quota 探测 | `manager.py:715/748/760` | wham 状态变化 | active → exhausted/auth_invalid/standby |
 | `reinvite_account` | `manager.py:2466` | OAuth 成功 + plan=team + quota verified | STANDBY → ACTIVE |
@@ -196,6 +228,29 @@ sync_account_states 看到 acc.status == ACTIVE 且 email 不在当前 workspace
   │   └─ ("network_error", _) → 保持 ACTIVE 等下轮(避免抖动误标)
   └─ acc.auth_file 缺失 → STATUS_STANDBY(降级,无法验证)
 ```
+
+### 4.3a 删除链短路(Round 6 FR-P1.2 / FR-P1.4 落地,Round 7 文档同步)
+
+**语义**:`STATUS_AUTH_INVALID` 与 `STATUS_PERSONAL` 在删除链中**等价处置** — 都跳过 ChatGPTTeamAPI 远端同步,直接走本地清理。
+
+**触发条件**:
+
+| 触发函数 | 文件:行号 | 条件 | 行为 |
+|---|---|---|---|
+| `account_ops.delete_managed_account` | `account_ops.py:79` | `acc.status in (STATUS_PERSONAL, STATUS_AUTH_INVALID)` | short_circuit=True,跳过 fetch_team_state / 不实例化 ChatGPTTeamAPI |
+| `api.delete_accounts_batch` | `api.py:1582` | `bool(targets) and all(a.status in (PERSONAL, AUTH_INVALID) for a in targets)` | all_local_only=True,整批不启动 ChatGPTTeamAPI |
+| `api.delete_account` 单点 | 复用 `delete_managed_account` | 同 §4.3a 第 1 行 | 同上 |
+
+**理由**:
+- AUTH_INVALID 账号的 token 已 401,继续走 fetch_team_state 也很可能 401 拖累整个删除流程
+- 主号 session 失效场景下,启动 ChatGPTTeamAPI 会卡死 30s
+- 删除 AUTH_INVALID 不需要远端 KICK(reconcile 已经 KICK 过或正在排队),只需清本地 records / auth_file
+- PERSONAL 账号已 leave_workspace,远端席位早已不存在
+
+**单测覆盖**:`tests/unit/test_round6_patches.py`:
+- `test_auth_invalid_short_circuit_skips_fetch_team_state`(FR-P1.2)
+- `test_auth_invalid_short_circuit_does_not_start_chatgpt_api`(FR-P1.2)
+- `test_all_personal_short_circuit_skips_chatgpt_api_start`(FR-P1.4)
 
 ### 4.3 reinvite_account fail_reason 分支(扩 FR-H1)
 
@@ -501,6 +556,11 @@ def test_pydantic_account_record_round_trip():
 - **I6**:`last_kicked_at` 字段一旦写入,后续状态转移不能清掉(用于 reconcile 历史回放;只在 delete_account 时随记录一起删)
 - **I7**:reconcile_anomalies(`manager.py:161-471`)对 `auth_invalid` 的 KICK 行为必须保持幂等(重复 KICK 不抛异常,`kick_status="already_absent"` 视为成功)
 - **I8**:状态白名单变更(新增枚举)需要全局检查 4 处:`Dashboard.vue` statusClass / `cpa_sync.py` 同步规则 / `sync_account_states` 处置 / 本 spec §4.2
+- **I9**(Round 6 落地,Round 7 文档同步):**add-phone 探针必须接入 7 处**(invite 4 + OAuth 3,Round 6 P1.1 后 OAuth 扩为 4 处,合计 8 处)。具体清单:
+  - **invite 阶段 4 处**(`invite.py:247/282/364/446`):`invite_filling`、`invite_confirm`、`invite_pre_submit`、`invite_post_submit`
+  - **OAuth 阶段 4 处**(`codex_auth.py:586/638/910/939`,Round 6 加 C-P4):`oauth_about_you`(C-P1)、`oauth_consent_{step}`(C-P2)、`oauth_callback_wait`(C-P3)、`oauth_personal_check`(C-P4,Round 6 PRD-5 FR-P1.1 引入)
+  - 任一探针缺失即视为 bug;新增 personal/team 邀请路径必须复用 `assert_not_blocked` + `RegisterBlocked` 复用语义
+  - 详见 `./add-phone-detection.md §4.1` 探针接入清单
 
 ---
 
@@ -512,6 +572,7 @@ def test_pydantic_account_record_round_trip():
 | v0.2 | round-2 | 加 personal |
 | v0.3 | round-3 | 加 auth_invalid + orphan(commit cf2f7d3) |
 | v1.0 | 2026-04-26 PRD-2 | 加 last_kicked_at / plan_supported / plan_type_raw 字段;补全转移规则;不新增 STATUS_PHONE_REQUIRED(复用 auth_invalid + register_failures) |
+| v1.1 | 2026-04-26 Round 7 P2 follow-up | (1) §3.3 加 uninitialized_seat 中间态(Round 6 引入,STATUS_ACTIVE/PENDING 的"待验证"子态,经 cheap_codex_smoke 二次验证后转 5 分类);(2) §4.1 转移矩阵加 cheap_codex_smoke 触发条件(uninitialized_seat + smoke=auth_invalid → AUTH_INVALID;smoke=uncertain → 保留原状态);(3) §4.3a 加删除链短路语义(STATUS_AUTH_INVALID 与 STATUS_PERSONAL 等价处置;Round 6 FR-P1.2 / FR-P1.4 落地);(4) §6 加 I9 不变量 — add-phone 探针 7 处接入(invite 4 + OAuth C-P1~C-P4 共 4 处,Round 6 加 C-P4);(5) 引用方加 PRD-5/PRD-6 + FR-P0/P1.2/P1.4/D6/D8;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.8 |
 
 ---
 
