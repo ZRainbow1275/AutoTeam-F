@@ -37,6 +37,11 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CALLBACK_PORT = 1455
 CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 
+# SPEC-2 shared/quota-classification §4.4 I5 — Codex backend 最小推理端点(用于 uninitialized_seat 二次验证)
+_CODEX_SMOKE_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+# quota 关键词:codex backend 返回 4xx 时若 body 含这些词同样视为 auth_invalid(可能是配额相关 API 错误)
+_CODEX_SMOKE_QUOTA_HINTS = ("quota", "no_quota", "rate_limit", "billing", "exceeded")
+
 
 def _generate_pkce():
     """生成 PKCE code_verifier 和 code_challenge"""
@@ -926,6 +931,21 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             _screenshot(page, "codex_05_no_callback.png")
             logger.warning("[Codex] 未获取到 auth code，当前 URL: %s", page.url)
 
+        # SPEC-2 §3.4.5 (位点 C-P4) + Round 6 PRD-5 FR-P1.1:personal 拒收 bundle 之前的最后一道关卡。
+        # 防御性 — 通常 C-P1~C-P3 已拦下,但 add-phone 可能在 callback 阶段后晚到一两秒;
+        # 此处在 browser.close() 之前做最后一次探针,确保 page 仍可读。命中即抛 RegisterBlocked,
+        # 上游 5 个调用方按 add-phone-detection.md §5.2 矩阵分类处置(personal/team/reinvite/api 各异)。
+        try:
+            assert_not_blocked(page, "oauth_personal_check")
+        except Exception:
+            # assert_not_blocked 命中 add-phone 会抛 RegisterBlocked — 必须传播给上层
+            # 但要保证 browser 资源被释放
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
+
         browser.close()
 
     if not auth_code:
@@ -1628,6 +1648,27 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
             "no_quota_signals": no_quota_signals,
         }
 
+    # SPEC-2 shared/quota-classification §4.4 I5 (Round 6 PRD-5 FR-P0) — uninitialized_seat 形态。
+    # OpenAI fresh seat 懒初始化:wham 给了占位 reset_at>0 但 total/remaining=null,且 pct=0。
+    # 此形态在 wham 层无法与"真无配额"区分,**不**直接判 no_quota,而是返回 window=
+    # "uninitialized_seat" + needs_codex_smoke=True,要求上游调 cheap_codex_smoke 二次验证。
+    if (
+        primary_total is None
+        and primary_remaining is None
+        and primary_pct == 0
+        and weekly_pct == 0
+        and primary_reset > 0
+        and not limit_reached
+    ):
+        return {
+            "window": "uninitialized_seat",
+            "resets_at": int(time.time() + 86400),
+            "quota_info": quota_info,
+            "limit_reached": False,
+            "needs_codex_smoke": True,
+            "no_quota_signals": ["workspace_uninitialized"],
+        }
+
     primary_exhausted = primary_pct >= 100
     weekly_exhausted = weekly_pct >= 100
     if not (limit_reached or primary_exhausted or weekly_exhausted):
@@ -1662,6 +1703,120 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
         "quota_info": quota_info,
         "limit_reached": bool(limit_reached),
     }
+
+
+def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0):
+    """SPEC-2 shared/quota-classification §4.4 — uninitialized_seat 二次验证。
+
+    对 codex backend 发一个最小推理请求(reasoning.effort=none + max_output_tokens=1 + stream),
+    只读第一帧 SSE 立即关流,不消耗多余 token。
+
+    返回 (result, detail):
+        ("alive", None)              — HTTP 200 + 第一帧含 response.created → 真活号
+        ("auth_invalid", reason)     — HTTP 401/403/429 / 4xx 含 quota 关键词 → token/seat 真失效
+        ("uncertain", reason)        — HTTP 5xx / network / timeout / 解析异常 → 保留原状态等下轮
+
+    24h 去重由调用方负责(读 acc.last_codex_smoke_at)。
+    """
+    import requests
+
+    if not access_token:
+        return "auth_invalid", "empty_access_token"
+
+    if not account_id:
+        try:
+            account_id = get_chatgpt_account_id()
+        except Exception:
+            account_id = None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
+    payload = {
+        "model": "gpt-5",
+        "input": "ping",
+        "max_output_tokens": 1,
+        "stream": True,
+        "reasoning": {"effort": "none"},
+    }
+
+    try:
+        resp = requests.post(
+            _CODEX_SMOKE_ENDPOINT,
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        )
+    except (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.SSLError,
+    ) as exc:
+        logger.warning("[Codex smoke] 网络异常(uncertain): %s", exc)
+        return "uncertain", f"network:{type(exc).__name__}"
+    except Exception as exc:
+        logger.warning("[Codex smoke] 未知异常(uncertain): %s", exc)
+        return "uncertain", f"exception:{type(exc).__name__}"
+
+    try:
+        status_code = resp.status_code
+        if status_code in (401, 403, 429):
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return "auth_invalid", f"http_{status_code}"
+
+        if 500 <= status_code < 600:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return "uncertain", f"http_{status_code}"
+
+        if status_code != 200:
+            # 4xx 非 401/403/429:body 含 quota 关键词视为 auth_invalid;否则 uncertain
+            try:
+                body_preview = (resp.text or "").lower()[:1500]
+            except Exception:
+                body_preview = ""
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if any(hint in body_preview for hint in _CODEX_SMOKE_QUOTA_HINTS):
+                return "auth_invalid", f"http_{status_code}_quota_hint"
+            return "uncertain", f"http_{status_code}"
+
+        # HTTP 200 — 读 SSE 第一帧
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if "response.created" in line:
+                    return "alive", None
+                # 安全兜底:读取多于 8 行仍未见 response.created 视为 uncertain
+        except Exception as exc:
+            logger.debug("[Codex smoke] iter_lines 异常(uncertain): %s", exc)
+            return "uncertain", f"stream:{type(exc).__name__}"
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        return "uncertain", "no_response_created_frame"
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
 
 
 def check_codex_quota(access_token, account_id=None):
@@ -1766,6 +1921,23 @@ def check_codex_quota(access_token, account_id=None):
         # window="no_quota" 是 get_quota_exhausted_info 内部短路出的形态;独立分类返回
         if exhausted_info.get("window") == "no_quota":
             return "no_quota", exhausted_info
+        # window="uninitialized_seat"(I5)— Round 6 PRD-5 FR-P0:必须用 cheap_codex_smoke 二次验证
+        if exhausted_info.get("window") == "uninitialized_seat":
+            smoke_result, smoke_detail = cheap_codex_smoke(access_token, account_id=account_id)
+            exhausted_info["last_smoke_result"] = smoke_result
+            if smoke_detail is not None:
+                exhausted_info["last_smoke_detail"] = smoke_detail
+            if smoke_result == "alive":
+                # fresh seat 真活,token 有效 → 维持 ok,但带 smoke_verified 标记
+                quota_info_verified = dict(quota_info)
+                quota_info_verified["smoke_verified"] = True
+                quota_info_verified["last_smoke_result"] = "alive"
+                return "ok", quota_info_verified
+            if smoke_result == "auth_invalid":
+                # codex backend 401/403/quota → 当作真 auth_error,触发 reconcile 重登
+                return "auth_error", None
+            # uncertain (5xx/network/timeout) → 保持原状态等下轮,归 network_error
+            return "network_error", None
         return "exhausted", exhausted_info
 
     return "ok", quota_info

@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 
-from autoteam.accounts import STATUS_PERSONAL, find_account, load_accounts, save_accounts
+from autoteam.accounts import STATUS_AUTH_INVALID, STATUS_PERSONAL, find_account, load_accounts, save_accounts
 from autoteam.admin_state import get_chatgpt_account_id
 from autoteam.cloudmail import CloudMailClient
 from autoteam.cpa_sync import delete_from_cpa, list_cpa_files, sync_to_cpa
@@ -71,10 +71,12 @@ def delete_managed_account(
 
     try:
         account_id = get_chatgpt_account_id()
-        # SPEC-2 FR-H1 (issue #2 独属):personal 状态账号已退出 Team,删除时不需要拉
-        # remote_state(members/invites)。这条短路同时避免 ChatGPTTeamAPI 浏览器启动 +
-        # 30s 网络往返,纯本地操作。
-        is_personal = bool(acc and acc.get("status") == STATUS_PERSONAL)
+        # SPEC-2 FR-H1 (issue #2 独属) + Round 6 PRD-5 FR-P1.2:personal / auth_invalid 账号
+        # 删除时不需要拉 remote_state(members/invites)。auth_invalid 的 token 已失效,继续走
+        # ChatGPTTeamAPI 会在 wham/usage 401 时拖累整个删除链路;主号 session 失效场景下,
+        # 启动 ChatGPTTeamAPI 还会卡死 30s。这条短路同时规避两类资源浪费,纯本地操作。
+        # 注意:变量名仍保留 is_personal 以最小化下游契约变化,但语义已扩到"本地清理即可"。
+        is_personal = bool(acc and acc.get("status") in (STATUS_PERSONAL, STATUS_AUTH_INVALID))
         skip_remote = is_personal
         if remove_remote and not skip_remote:
             if remote_state is not None:

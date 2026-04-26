@@ -8,9 +8,10 @@
 | 名称 | 账号生命周期与配额加固 实施规范 |
 | 主笔 | prd-lifecycle |
 | 时间 | 2026-04-26 |
-| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) |
+| 版本 | v1.3 (2026-04-26 Round 6 quality-reviewer 终审 follow-up) |
+| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) |
 | 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) |
-| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 |
+| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** |
 
 ---
 
@@ -531,6 +532,61 @@ def _invite_member_with_fallback(self, email, seat_type, *, allow_fallback):
     # 现行 chatgpt 偏好兜底链路保留
 ```
 
+#### 3.4.5 `login_codex_via_browser` 4 处 OAuth add-phone 探针(Round 6 强制要求)
+
+**FR**:C1~C5、FR-P1.1(Round 6)
+
+**位置**:`src/autoteam/codex_auth.py` `login_codex_via_browser` 函数体
+
+**4 处探针接入点(完整清单)**:
+
+| 探针 | step 名 | 插入位置 | Round 5 verify 落地状态 |
+|---|---|---|---|
+| C-P1 | `oauth_about_you` | `if "about-you" in page.url:` 之前(实测 codex_auth.py:581) | ✅ 已落地 |
+| C-P2 | `oauth_consent_{step}` | `for step in range(10):` 内每轮第一行(实测 codex_auth.py:633) | ✅ 已落地 |
+| C-P3 | `oauth_callback_wait` | `for _ in range(30):` 等 callback 之前(实测 codex_auth.py:905) | ✅ 已落地 |
+| C-P4 | `oauth_personal_check` | **callback for-loop 后,`browser.close()` 之前,`_exchange_auth_code` 之前**(v1.3 实施对齐 — 不可放在 `if use_personal:` 之前,该位置 `browser.close()` 已执行,page 不可用) | ✅ **已落地**(`codex_auth.py:939`,Round 6 PRD-5 FR-P1.1) |
+
+**实施代码(v1.3 与 codex_auth.py:939 对齐)**:
+
+```python
+# src/autoteam/codex_auth.py:929-949 区
+# 位置:callback for-loop 后,browser.close() 之前,_exchange_auth_code 之前
+# 不可放在 use_personal 分支前 — 该位置 browser 已 close,page 不可用
+
+# (callback for-loop 结束)
+if not auth_code:
+    _screenshot(page, "codex_05_no_callback.png")
+    logger.warning("[Codex] 未获取到 auth code,当前 URL: %s", page.url)
+
+# ★ C-P4 探针(Round 6 PRD-5 FR-P1.1)
+try:
+    assert_not_blocked(page, "oauth_personal_check")
+except Exception:
+    # 命中 add-phone 抛 RegisterBlocked — 必须传播给上层,
+    # 但要保证 browser 资源被释放
+    try:
+        browser.close()
+    except Exception:
+        pass
+    raise
+
+browser.close()
+
+if not auth_code:
+    return None
+
+bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
+# personal 模式 plan_type 校验在 bundle 拿到后进行
+if use_personal:
+    plan = (bundle.get("plan_type") or "").lower()
+    ...  # plan_type 校验
+```
+
+**调用方处置**:5 处 `login_codex_via_browser` 调用方(`manager.py:1057 / 1431 / 1463 / 2466` + `api.py:1675`)必须显式 `except RegisterBlocked`,详见 `shared/add-phone-detection.md §5.2 调用方分类处置矩阵`。
+
+**验收**:`grep -rn "oauth_personal_check" src/autoteam/codex_auth.py` 必须命中 1 处(Round 6 实测 `:939` 已落地 ✅)。
+
 ### 3.5 personal 删除链短路 fetch_team_state
 
 **文件**:`src/autoteam/account_ops.py:40-162` + `src/autoteam/api.py:1306-1404`
@@ -538,12 +594,15 @@ def _invite_member_with_fallback(self, email, seat_type, *, allow_fallback):
 
 #### 3.5.1 `account_ops.delete_managed_account` 短路
 
+**Round 6 PRD-5 FR-P1.2 强制要求**:short_circuit 条件**必须**同时覆盖 `STATUS_PERSONAL` 和 `STATUS_AUTH_INVALID`(Round 5 verify 实测 `account_ops.py:77` 仅判 STATUS_PERSONAL,违背 FR-G2)。
+
 ```python
 # account_ops.py:72 起
 from autoteam.accounts import STATUS_PERSONAL, STATUS_AUTH_INVALID
 
 try:
     account_id = get_chatgpt_account_id()
+    # ★Round 6 必修:短路条件必须同时含 STATUS_PERSONAL 和 STATUS_AUTH_INVALID
     short_circuit = (
         remove_remote
         and acc
@@ -571,15 +630,31 @@ try:
     # 后续 auth_file / cpa / local 删除链路与现行一致
 ```
 
+**为什么 AUTH_INVALID 必须短路**:
+
+- AUTH_INVALID 账号的 token 已失效 → wham/usage 401 → 调用 `fetch_team_state` 也很可能 401 拖累整个删除流程
+- 主号 session 失效场景下,启动 ChatGPTTeamAPI 会卡死 30s
+- 删除 AUTH_INVALID 不需要远端 KICK(因为 reconcile 已经 KICK 过或正在排队),只需清本地 records / auth_file
+- 与 FR-G2(personal/auth_invalid 不需要拉 remote_state)契约一致
+
+**验收**:`grep -A3 "short_circuit = " src/autoteam/account_ops.py` 必须显示 `STATUS_AUTH_INVALID` 字面量。
+
 #### 3.5.2 `api.delete_accounts_batch` 全 personal 短路
 
+**Round 6 PRD-5 FR-P1.4 强制要求**:批量删除路径必须先做 `all_personal` 检查,如果整批都是 personal/auth_invalid 则**整批跳过 ChatGPTTeamAPI 启动**(Round 5 verify 实测 `api.py:1573-1577` 无条件 `chatgpt_api.start()`,违背 FR-G3)。
+
 ```python
-# api.py:1306-1404 之间(伪代码,实施时见现行)
+# api.py:1306-1404 之间(实施代码,Round 6 必修)
+from autoteam.accounts import STATUS_PERSONAL, STATUS_AUTH_INVALID
+
 def delete_accounts_batch(emails: list[str]):
     accounts = load_accounts()
     targets = [a for a in accounts if a["email"].lower() in {e.lower() for e in emails}]
 
-    all_personal = all(a["status"] in (STATUS_PERSONAL, STATUS_AUTH_INVALID) for a in targets)
+    # ★Round 6 关键:bool(targets) 防空 list 误判 all=True
+    all_personal = bool(targets) and all(
+        a["status"] in (STATUS_PERSONAL, STATUS_AUTH_INVALID) for a in targets
+    )
 
     chatgpt_api = None
     if not all_personal:
@@ -593,7 +668,7 @@ def delete_accounts_batch(emails: list[str]):
             try:
                 cleanup = delete_managed_account(
                     acc["email"],
-                    chatgpt_api=chatgpt_api,
+                    chatgpt_api=chatgpt_api,        # all_personal=True 时为 None
                     sync_cpa_after=False,
                 )
                 results.append({"email": acc["email"], "success": True, "cleanup": cleanup})
@@ -605,6 +680,73 @@ def delete_accounts_batch(emails: list[str]):
         if chatgpt_api:
             chatgpt_api.stop()
 ```
+
+**注意点**:
+
+- `bool(targets) and all(...)`:空 targets 时 Python `all([])` 返回 True,会让短路路径误判成功 — 必须显式守卫
+- `chatgpt_api=None` 传入 `delete_managed_account`:依赖 §3.5.1 short_circuit 同时支持 `STATUS_AUTH_INVALID`(否则 auth_invalid 进 `fetch_team_state` 路径会因 chatgpt_api=None 抛错)。**所以 §3.5.1 必须先于 / 同步 §3.5.2 落地**
+- mixed 场景(2 personal + 1 active):`all_personal=False`,正常启动 ChatGPTTeamAPI,active 走完整删除链路,personal/auth_invalid 因 §3.5.1 short_circuit 跳过远端
+
+**验收**:单测 mock `ChatGPTTeamAPI`,批量传 5 个 STATUS_AUTH_INVALID 邮箱,断言 `ChatGPTTeamAPI.__init__` 0 次调用、`ChatGPTTeamAPI.start()` 0 次调用。
+
+#### 3.5.3 `api.post_account_login` 409 phone_required 详细契约(对应 Story Map S-2.2,Round 6 PRD-5 FR-P1.3 必修)
+
+**位置**:`src/autoteam/api.py:1675`(`@app.post("/api/accounts/{email}/login")` 的 `post_account_login` 函数体)
+
+**FR**:C5 + FR-P1.3(Round 6)
+
+**端点契约**:
+
+| 维度 | 规格 |
+|---|---|
+| Method / Path | `POST /api/accounts/{email}/login` |
+| Auth | 需要管理员 Bearer(同其他 /api 端点) |
+| Body | `{"password": "..."}` 或 `{}`(从 acc 读密码) |
+| 成功响应 | 200 OK,body `{"email": ..., "status": ...}`(同现行) |
+| 409 phone_required(★Round 6 新增) | body `{"detail": {"error": "phone_required", "step": "<C-P1..C-P4 step 名>", "reason": "<blocked.reason>"}}` |
+| 500 oauth_failed | 通用 OAuth 失败兜底(非 phone) |
+| 422 no_quota_assigned(SPEC §5 既有) | body `{"detail": {"error": "no_quota_assigned", "plan_type": ...}}` |
+
+**实施代码**(完整版见 `shared/add-phone-detection.md §5.5`):
+
+```python
+@app.post("/api/accounts/{email}/login")
+def post_account_login(email: str, ...):
+    ...
+    try:
+        bundle = login_codex_via_browser(email, password, mail_client=mail_client,
+                                         use_personal=use_personal)
+    except RegisterBlocked as blocked:
+        if blocked.is_phone:
+            record_failure(email, category="oauth_phone_blocked",
+                           reason=f"补登录触发 add-phone (step={blocked.step})",
+                           step=blocked.step, stage="api_login")
+            raise HTTPException(status_code=409, detail={
+                "error": "phone_required",
+                "step": blocked.step,
+                "reason": blocked.reason,
+            })
+        record_failure(email, "exception", f"补登录意外 RegisterBlocked: {blocked.reason}")
+        raise HTTPException(status_code=500, detail={"error": "oauth_failed",
+                                                      "reason": str(blocked)})
+    ...
+```
+
+**前端解析**(`web/src/api.ts`):
+
+```ts
+if (resp.status === 409 && body.detail?.error === "phone_required") {
+    showToast("该账号需要绑定手机才能继续", "error")
+    // 可选:跳到运营回放页查看截图
+}
+```
+
+**验收**:
+
+- 单测 mock `login_codex_via_browser` 抛 `RegisterBlocked("oauth_consent_2", "...", is_phone=True)`,断言响应 status_code=409 + body detail error=phone_required + step=oauth_consent_2
+- record_failure 必须先于 HTTPException 抛出(否则统计丢一条),用 mock 验证调用顺序
+- 不可放行 500 路径(若 is_phone=True 走 500 视为 bug)
+- **(Round 6 Q-3 决策 user 已确认)** 409 body 不带截图相对路径,保持端点 lean。前端如需截图自己 GET `/api/screenshots/...` 或从 `register_failures.json` 读 `step + url + screenshot_path`(`record_failure` 已记)
 
 ### 3.6 UI removeAccount toast 改造
 
@@ -1016,3 +1158,14 @@ Phase 6 (灰度上线)
 ---
 
 **文档结束。** 工程师参照本 spec + 4 份 shared spec,无需查询 PRD 即可完成代码实施。
+
+---
+
+## 附录 A:修订记录
+
+| 版本 | 时间 | 变更 |
+|---|---|---|
+| v1.0 | 2026-04-26 | 初版 PRD-2 同步落地;A~H 共 8 组 FR |
+| v1.1 | 2026-04-26 Round 6 | 加 §3.4.5 OAuth 4 探针接入清单(强调 C-P4 必修);§3.5.1 short_circuit 强调 STATUS_AUTH_INVALID 必含;§3.5.2 加 `bool(targets)` 守卫与混合场景说明;新增 §3.5.3 `api.post_account_login` 409 phone_required 详细契约(对应 Story Map S-2.2)。关联 PRD-5 FR-P0 / P1.1 / P1.2 / P1.3 / P1.4 |
+| v1.2 | 2026-04-26 Round 6 finalize | user 确认 Q-3 决策:§3.5.3 验收清单加 1 条 — 409 body 不带截图相对路径,前端自己拉 `/api/screenshots/...` 或读 `register_failures.json` 字段 |
+| v1.3 | 2026-04-26 Round 6 quality-reviewer 终审 follow-up | §3.4.5 C-P4 探针位置描述对齐实施(`codex_auth.py:939`):由"`if use_personal:` 这行**之前**"修订为"callback for-loop 之后,`browser.close()` 之前,`_exchange_auth_code` 之前"。理由:`if use_personal:` 在 `browser.close()` 之后,page 已 close,assert_not_blocked 异常会被吞为 False。表格"插入位置"列 + 实施代码段全部对齐;落地状态由 ❌ 改为 ✅;同步规范 try/except 关 browser 后 raise 的资源释放要求。详见 `prompts/0426/verify/round6-review-report.md` §3.1 决策 1 审查 |

@@ -5,10 +5,10 @@
 | 字段 | 内容 |
 |---|---|
 | 名称 | OAuth 流程 add-phone 探针接入与异常分类 |
-| 版本 | v1.0 (2026-04-26) |
+| 版本 | v1.3 (2026-04-26 Round 6 quality-reviewer 终审 follow-up) |
 | 主题归属 | `login_codex_via_browser` 中的 4 个探针接入点 + 5 个调用方分类处置 |
-| 引用方 | PRD-2 / spec-2-account-lifecycle.md / FR-C1~C5 |
-| 共因 | synthesis §1 共因 C;Issue#4 + Issue#6 |
+| 引用方 | PRD-2 / PRD-5 / spec-2-account-lifecycle.md / FR-C1~C5、FR-P1.1、FR-P1.3 |
+| 共因 | synthesis §1 共因 C;Issue#4 + Issue#6 + Round 5 verify 揭示 C-P4 / api.post_account_login 缺失 |
 | 不在范围 | invite 注册阶段的 add-phone 检测(已实现,见 `invite.py:106-145`)、SMS pool 自动绑定(违反 ToS,非目标) |
 
 ---
@@ -178,9 +178,14 @@ login_codex_via_browser(email, password, mail_client, *, use_personal)  # codex_
   │
   ├─ step-5  等 30s callback(L884-906)
   │
-  ├─ ★ C-P4: assert_not_blocked(page, "oauth_personal_check")   [L920 personal 拒收 bundle 之前]
-  │           插入位置:`if use_personal:` 这行**之前**
-  │           理由:防御性 — 通常 callback 前已拦截,但作为最后一道关卡
+  ├─ ★ C-P4: assert_not_blocked(page, "oauth_personal_check")   [callback for-loop 后 / browser.close() 前]
+  │           插入位置(v1.3 实施对齐):**callback for-loop 之后,`browser.close()` 之前,_exchange_auth_code 之前**
+  │           不可放在 `if use_personal:` 之前 — 该分支位于 `browser.close()` 之后,page 已不可用
+  │           (assert_not_blocked 会因 Playwright 异常被吞为 False,探针失效)
+  │           命中即抛 RegisterBlocked,但要保证 browser 资源被释放(except: browser.close() + raise)
+  │           理由:防御性 — 通常 C-P1~C-P3 已拦下;add-phone 可能在 callback 阶段后晚到一两秒
+  │           **【Round 6 落地】**实施位置:`codex_auth.py:939`(grep `oauth_personal_check` 命中 1 处)
+  │           4 处探针完整链:`:586 (C-P1)` → `:638 (C-P2)` → `:910 (C-P3)` → `:939 (C-P4)`
   │
   └─ _exchange_auth_code(auth_code) → bundle
 ```
@@ -215,8 +220,24 @@ for _ in range(30):
         break
     ...
 
-# 位点 C-P4(在 codex_auth.py:920 之前,personal 模式校验 plan_type 之前)
-assert_not_blocked(page, "oauth_personal_check")  # ★新增,防御性
+# 位点 C-P4(v1.3 实施对齐:callback for-loop 后,browser.close() 之前,_exchange_auth_code 之前)
+# 实施位置:codex_auth.py:939(NOT use_personal 分支前 — page 在 close 后失效)
+try:
+    assert_not_blocked(page, "oauth_personal_check")  # ★Round 6 新增 C-P4
+except Exception:
+    # 命中 add-phone 抛 RegisterBlocked — 必须传播给上层
+    # 但要保证 browser 资源被释放
+    try:
+        browser.close()
+    except Exception:
+        pass
+    raise
+
+browser.close()
+if not auth_code:
+    return None
+bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
+# personal 模式 plan_type 校验在 bundle 拿到后进行
 if use_personal:
     plan = (bundle.get("plan_type") or "").lower()
     ...
@@ -229,7 +250,7 @@ if use_personal:
 | C-P1 (about-you 前) | OpenAI 在新账号注册的 about-you 页之后**最频繁**拉 add-phone。在切到 about-you 之前先拦,可在最早时间发现风控 |
 | C-P2 (consent 循环每轮) | consent 循环 10 次,每一步都可能跳 add-phone;不在循环里拦,会被当作"workspace 没选好"反复重试 |
 | C-P3 (callback 等待前) | add-phone 阻塞会让 callback 永远不来,30s 等待白白耗费;在等之前先判 |
-| C-P4 (personal 拒收前) | 防御性:正常情况下前 3 个位点已拦下;万一漏过(consent 循环之外的页面),最后兜底 |
+| C-P4 (callback for-loop 后 / browser.close() 前)| 防御性:正常情况下前 3 个位点已拦下;万一漏过(consent 循环之外的页面/callback 阶段后晚到的 add-phone),最后兜底。**v1.3 实施对齐**:不可放在 `if use_personal:` 之前 — 该位置 `browser.close()` 已执行,page 不可用 |
 
 ---
 
@@ -253,7 +274,7 @@ if use_personal:
 | 2 | `delete_account(email)` + `record_failure(...)` | category="oauth_phone_blocked", stage="run_post_register_oauth_personal" |
 | 3 | `update_account(email, status=STATUS_AUTH_INVALID)` + `record_failure(...)` + 不删账号(已在 Team) | category="oauth_phone_blocked", stage="run_post_register_oauth_team" |
 | 4 | `_cleanup_team_leftover("oauth_phone_blocked")` + `update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)` | category="oauth_phone_blocked", stage="reinvite_account" |
-| 5 | 转 HTTP 409 + body `{"error": "phone_required", "step": ..., "reason": ...}` + record_failure | category="oauth_phone_blocked", stage="api_login" |
+| 5 | 转 HTTP 409 + body `{"error": "phone_required", "step": <blocked.step>, "reason": <blocked.reason>}` + record_failure;**不**抛 500;前端 api.ts 据 status==409 显示"账号需要绑定手机才能继续"(Round 6 PRD-5 FR-P1.3) | category="oauth_phone_blocked", stage="api_login" |
 
 ### 5.3 通用 try/except 模板
 
@@ -281,6 +302,54 @@ except RegisterBlocked as blocked:
         return None
     raise  # 其他 RegisterBlocked 子分类暂不可能,raise 让上层兜底
 ```
+
+### 5.5 `api.post_account_login` 端点完整契约(Round 6 新增明确化)
+
+**位置**:`src/autoteam/api.py:1675`(`post_account_login` 函数体内调用 `login_codex_via_browser` 处)
+
+**实施代码(必须落地)**:
+
+```python
+from fastapi import HTTPException
+from autoteam.invite import RegisterBlocked
+from autoteam.register_failures import record_failure
+
+@app.post("/api/accounts/{email}/login")
+def post_account_login(email: str, ...):
+    acc = get_account(email)
+    use_personal = (acc and acc.get("status") == STATUS_PERSONAL)
+    try:
+        bundle = login_codex_via_browser(
+            email, password, mail_client=mail_client, use_personal=use_personal,
+        )
+    except RegisterBlocked as blocked:
+        if blocked.is_phone:
+            record_failure(
+                email,
+                category="oauth_phone_blocked",
+                reason=f"补登录触发 add-phone (step={blocked.step})",
+                step=blocked.step,
+                stage="api_login",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "phone_required",
+                    "step": blocked.step,
+                    "reason": blocked.reason,
+                },
+            )
+        record_failure(email, "exception", f"补登录意外 RegisterBlocked: {blocked.reason}")
+        raise HTTPException(status_code=500, detail={"error": "oauth_failed", "reason": str(blocked)})
+    # bundle 处理逻辑后续保留
+```
+
+**关键不变量**:
+
+- `is_phone=True` → 必返 409(不可放行 500)
+- `is_duplicate=True` 在补登录场景不应出现(账号已存在);若出现按 exception 兜底走 500
+- record_failure 必须先于 HTTPException 抛出,否则失败统计丢一条
+- **(Round 6 Q-3 决策 user 已确认)** 409 body **不**带截图相对路径,保持端点 lean。前端如需截图自己 GET `/api/screenshots/...` 或从 `register_failures.json` 取 `step + url + screenshot_path`(`record_failure` 已记)
 
 ### 5.4 主号路径(不在范围)
 
@@ -382,6 +451,24 @@ def test_about_you_page_does_not_trigger():
     """about-you 页应当通过(避免在过早位点误报)"""
     page = make_about_you_page()
     assert detect_phone_verification(page) is False
+
+
+# Round 6 新增:C-P4 oauth_personal_check 落地验证
+def test_login_codex_via_browser_calls_oauth_personal_check(monkeypatch):
+    """
+    断言 codex_auth.login_codex_via_browser 在 personal 拒收 bundle 之前
+    调用了 assert_not_blocked(page, 'oauth_personal_check')。
+    """
+    calls = []
+
+    def fake_assert(page, step):
+        calls.append(step)
+
+    monkeypatch.setattr("autoteam.codex_auth.assert_not_blocked", fake_assert)
+    # 用 mock page 跑到 personal 分支
+    ...
+    assert "oauth_personal_check" in calls, \
+        "C-P4 探针(oauth_personal_check)未接入 — Round 6 PRD-5 FR-P1.1 必修"
 ```
 
 ### 6.3 集成测试样本
@@ -412,6 +499,23 @@ def test_post_register_oauth_team_phone_blocked():
 def test_reinvite_account_phone_blocked_kicks_team_leftover():
     """reinvite 命中 add-phone → _cleanup_team_leftover + STATUS_AUTH_INVALID(不进 STANDBY)"""
     # 略,见 spec-2-account-lifecycle.md §5
+
+
+# Round 6 新增:api.post_account_login 409 phone_required
+def test_post_account_login_returns_409_on_phone_blocked(test_client):
+    """
+    api.post_account_login 撞 add-phone 时必须返回 HTTP 409,body 含 phone_required。
+    Round 6 PRD-5 FR-P1.3 必修。
+    """
+    with patch("autoteam.api.login_codex_via_browser") as mock_login:
+        mock_login.side_effect = RegisterBlocked(
+            "oauth_consent_2", "add-phone 手机验证", is_phone=True,
+        )
+        resp = test_client.post("/api/accounts/test@example.com/login", json={"password": "x"})
+        assert resp.status_code == 409
+        body = resp.json()
+        assert body["detail"]["error"] == "phone_required"
+        assert body["detail"]["step"] == "oauth_consent_2"
 ```
 
 ---
@@ -439,3 +543,14 @@ def test_reinvite_account_phone_blocked_kicks_team_leftover():
 ---
 
 **文档结束。** 工程师据此可直接编写 4 处 `assert_not_blocked` 接入 + 5 处调用方 try/except + 单元/集成测试,无需额外决策。
+
+---
+
+## 附录 B:修订记录
+
+| 版本 | 时间 | 变更 |
+|---|---|---|
+| v1.0 | 2026-04-26 | 初版,4 处探针 + 5 个调用方分类处置 |
+| v1.1 | 2026-04-26 Round 6 | 强化 C-P4 `oauth_personal_check` 必落地(Round 5 verify 实测仅 3/4 已落地);§5.5 加 `api.post_account_login` 完整 try/except 模板(Round 6 PRD-5 FR-P1.1 + FR-P1.3 必修);§6 测试套件加 2 个新 case(C-P4 接入断言 + 409 phone_required 响应) |
+| v1.2 | 2026-04-26 Round 6 finalize | user 确认 Q-3 决策:409 phone_required body **不**带截图相对路径,保持端点 lean(§5.5 关键不变量列表新增 1 条) |
+| v1.3 | 2026-04-26 Round 6 quality-reviewer 终审 follow-up | C-P4 探针位置描述对齐实施(`codex_auth.py:939`):由"`if use_personal:` 这行**之前**"修订为"callback for-loop 之后,`browser.close()` 之前,`_exchange_auth_code` 之前"。理由:`if use_personal:` 在 `browser.close()` 之后,page 不可用,assert_not_blocked 会因 Playwright 异常被吞为 False。§4.1 接入位置图 + §4.2 实施代码示例 + §4.3 位点选择理由表全部对齐。同步规范 try/except 关 browser 后 raise 的资源释放要求。详见 `prompts/0426/verify/round6-review-report.md` §3.1 决策 1 审查 |

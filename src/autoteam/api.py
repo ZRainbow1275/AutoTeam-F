@@ -1564,19 +1564,47 @@ def delete_accounts_batch(params: DeleteBatchParams):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再批量删除"))
 
     def _run():
+        from autoteam.accounts import STATUS_AUTH_INVALID, STATUS_PERSONAL
+
         accounts = load_accounts()
         existing = {(a.get("email") or "").lower(): a for a in accounts}
+
+        # SPEC-2 §3.5.2 + Round 6 PRD-5 FR-P1.4:批量删除若整批都是 personal/auth_invalid,
+        # 整批跳过 ChatGPTTeamAPI 启动 — 这两类不需要 remote_state(成员/邀请),纯本地清理。
+        # 关键:bool(targets_in_pool) 守卫空 list,避免 all([]) == True 误判;
+        # 同时如果传入 emails 全部不存在(existing 没匹配),也不应短路(走原 chatgpt_api 路径
+        # 让循环里给每条返回"账号不存在")。
+        targets_in_pool = [
+            existing[e.lower()]
+            for e in emails
+            if e.lower() in existing
+        ]
+        all_local_only = bool(targets_in_pool) and all(
+            (a.get("status") in (STATUS_PERSONAL, STATUS_AUTH_INVALID))
+            for a in targets_in_pool
+        )
 
         chatgpt_api = None
         mail_client = None
         results = []
         try:
-            chatgpt_api = ChatGPTTeamAPI()
-            chatgpt_api.start()
-            mail_client = CloudMailClient()
-            mail_client.login()
-            # 整批共享一次 Team 状态快照,避免每个删除都重查一次
-            remote_state = fetch_team_state(chatgpt_api)
+            remote_state = None
+            if not all_local_only:
+                # 至少一个号需要 Team 远端同步 — 启动共享 ChatGPTTeamAPI / mail_client
+                chatgpt_api = ChatGPTTeamAPI()
+                chatgpt_api.start()
+                mail_client = CloudMailClient()
+                mail_client.login()
+                # 整批共享一次 Team 状态快照,避免每个删除都重查一次
+                remote_state = fetch_team_state(chatgpt_api)
+            else:
+                # 全 personal/auth_invalid 路径:cloudmail 仍可能要清理(personal 有 cloudmail_account_id),
+                # 但 mail_client 由 delete_managed_account 内部按需懒加载(own_mail_client 路径),
+                # 这里不预启动 ChatGPTTeamAPI。
+                logger.info(
+                    "[批量删除] 整批 %d 个账号均为 personal/auth_invalid,跳过 ChatGPTTeamAPI 启动(FR-P1.4 短路)",
+                    len(targets_in_pool),
+                )
 
             for email in emails:
                 if email.lower() not in existing:
@@ -1587,10 +1615,10 @@ def delete_accounts_batch(params: DeleteBatchParams):
                 try:
                     cleanup = delete_managed_account(
                         email,
-                        chatgpt_api=chatgpt_api,
-                        mail_client=mail_client,
-                        remote_state=remote_state,
-                        sync_cpa_after=False,  # 整批结束后统一同步
+                        chatgpt_api=chatgpt_api,        # all_local_only=True 时为 None
+                        mail_client=mail_client,        # 同上,delete_managed_account 内部懒加载
+                        remote_state=remote_state,      # 同上
+                        sync_cpa_after=False,            # 整批结束后统一同步
                     )
                     results.append({"email": email, "ok": True, "cleanup": cleanup})
                 except Exception as exc:
@@ -1695,18 +1723,56 @@ def post_account_login(params: LoginAccountParams):
             quota_result_resets_at,
             save_auth_file,
         )
+        from autoteam.invite import RegisterBlocked
+        from autoteam.register_failures import record_failure
 
         # 账号状态决定登录模式：PERSONAL 走 use_personal=True 补个人号 OAuth；其他走 Team 模式
         use_personal = acc.get("status") == STATUS_PERSONAL
 
         mail_client = CloudMailClient()
         mail_client.login()
-        bundle = login_codex_via_browser(
-            email,
-            acc.get("password", ""),
-            mail_client=mail_client,
-            use_personal=use_personal,
-        )
+        # SPEC-2 §3.5.3 + Round 6 PRD-5 FR-P1.3:RegisterBlocked 转 409 phone_required / register_blocked
+        # 注意:此函数在 _run_task 后台线程中运行,raise HTTPException 由 _run_task 转录到 task["error"];
+        # task error 字符串携带 "phone_required" / "register_blocked" 关键字供前端解析(api.ts §SPEC-2 §1)
+        try:
+            bundle = login_codex_via_browser(
+                email,
+                acc.get("password", ""),
+                mail_client=mail_client,
+                use_personal=use_personal,
+            )
+        except RegisterBlocked as blocked:
+            if blocked.is_phone:
+                record_failure(
+                    email,
+                    category="oauth_phone_blocked",
+                    reason=f"补登录触发 add-phone (step={blocked.step})",
+                    step=blocked.step,
+                    stage="api_login",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "phone_required",
+                        "step": blocked.step,
+                        "reason": blocked.reason,
+                    },
+                )
+            record_failure(
+                email,
+                category="exception",
+                reason=f"补登录意外 RegisterBlocked: {blocked.reason}",
+                step=blocked.step,
+                stage="api_login",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "register_blocked",
+                    "step": blocked.step,
+                    "reason": blocked.reason,
+                },
+            )
         if bundle:
             auth_file = save_auth_file(bundle)
             update_account(email, auth_file=auth_file, last_active_at=time.time())
