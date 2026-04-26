@@ -12,6 +12,7 @@ Authorization: Bearer <API_KEY>
 - `/api/auth/check`
 - `/api/setup/status`
 - `/api/setup/save`
+- `/api/version`
 
 ## 即时返回接口
 
@@ -22,6 +23,7 @@ Authorization: Bearer <API_KEY>
 | GET | `/api/auth/check` | 验证 API Key |
 | GET | `/api/setup/status` | 检查配置是否完整 |
 | POST | `/api/setup/save` | 保存初始配置 |
+| GET | `/api/version` | 镜像版本指纹（`git_sha` + `build_time`，免鉴权，用于排查 docker 镜像是否过期） |
 | GET | `/api/status` | 账号状态 + 实时额度 |
 | GET | `/api/accounts` | 所有账号列表 |
 | GET | `/api/accounts/active` | 活跃账号 |

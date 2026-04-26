@@ -26,6 +26,8 @@ import sys
 import time
 from pathlib import Path
 
+from playwright.sync_api import sync_playwright
+
 from autoteam.account_ops import delete_managed_account, fetch_team_state
 from autoteam.accounts import (
     STATUS_ACTIVE,
@@ -1488,8 +1490,6 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
 
 def _complete_registration(email, password, invite_link, mail_client, *, leave_workspace=False, out_outcome=None):
     """完成注册 + Codex 登录（从已有邀请链接继续）。out_outcome 透传给 _run_post_register_oauth。"""
-    from playwright.sync_api import sync_playwright
-
     from autoteam.invite import register_with_invite
 
     logger.info("[注册] 开始注册 %s...", email)
@@ -1966,8 +1966,6 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
     在邮箱/密码/验证码/about-you 四个提交节点调用 assert_not_blocked，
     一旦命中 add-phone / duplicate 就抛 RegisterBlocked，由 create_account_direct 分流处理。
     """
-    from playwright.sync_api import sync_playwright
-
     from autoteam.invite import RegisterBlocked, assert_not_blocked
 
     logger.info("[直接注册] %s", email)

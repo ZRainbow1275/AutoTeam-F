@@ -13,6 +13,15 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
+# === SPEC-3 §3: 镜像版本指纹注入 ===
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.created="${BUILD_TIME}"
+ENV AUTOTEAM_GIT_SHA="${GIT_SHA}"
+ENV AUTOTEAM_BUILD_TIME="${BUILD_TIME}"
+# === SPEC-3 §3 end ===
+
 # 复制项目文件
 COPY pyproject.toml uv.lock ./
 RUN uv sync --no-dev

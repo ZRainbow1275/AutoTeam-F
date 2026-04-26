@@ -1,6 +1,10 @@
 services:
   autoteam:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
     ports:
       - "8787:8787"
     volumes:

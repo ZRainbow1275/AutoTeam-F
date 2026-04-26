@@ -110,3 +110,88 @@ uv run autoteam pull-cpa
 ```
 
 即可重新整理。
+
+---
+
+## 代码更新后的 rebuild SOP(SPEC-3 §8)
+
+> **关键认知**:本项目 `Dockerfile` 用 `COPY src/`(非 volume mount),
+> **`git pull` 后必须 rebuild 镜像**,代码改动才会进入容器。
+
+### 标准更新流程(4 步)
+
+```bash
+# 1. 拉取新代码
+cd /path/to/AutoTeam && git pull
+
+# 2. 停掉旧容器
+docker compose down
+
+# 3. 重建镜像(--no-cache 防意外缓存命中,GIT_SHA 注入版本指纹)
+GIT_SHA=$(git rev-parse --short HEAD) \
+BUILD_TIME=$(date -u +%FT%TZ) \
+docker compose build --no-cache
+
+# 4. 启动
+docker compose up -d
+```
+
+### 验证镜像版本(三选一,结果应一致)
+
+```bash
+# 方式 A:HTTP 端点(免鉴权)
+curl http://localhost:8787/api/version
+# 期望:{"git_sha":"cf2f7d3","build_time":"2026-04-26T..."}
+
+# 方式 B:进容器查环境变量
+docker compose exec autoteam env | grep AUTOTEAM_GIT_SHA
+
+# 方式 C:看镜像 OCI label(无需启动容器)
+docker image inspect autoteam-autoteam --format '{{json .Config.Labels}}'
+```
+
+### 启动期 self-check
+
+容器每次启动都会执行 `[self-check]` 段,白名单 import 任一失败立即 `exit 1` → docker 进入 crash-loop。
+
+```bash
+docker compose logs autoteam | head -20
+# 期望看到:
+# [self-check] verifying critical imports...
+# [self-check] OK: 11 critical symbols imported.
+# [self-check] passed.
+```
+
+### 故障排查:为什么修了代码 bug 还在?
+
+**99% 是镜像没 rebuild**。先跑这条快速诊断:
+
+```bash
+# 对比 image 内 sha 与 repo HEAD
+echo "image:" && curl -s http://localhost:8787/api/version | python -m json.tool
+echo "repo HEAD:" && git rev-parse --short HEAD
+```
+
+如果 `image.git_sha` 与 `repo HEAD` 不一致 → 重做上面 4 步 SOP。
+
+如果 self-check 报 `FATAL: critical import failed`:
+- 说明镜像里的源码与最新代码的契约符号对不上(典型 typo 引入未定义名)
+- 解决:回退最近 commit 或修复 typo,再 rebuild
+
+### lint 守卫(开发期)
+
+`pyproject.toml` 已配置 ruff(F401/F811/F821 三条规则),`.pre-commit-config.yaml` 也接入了同样的检查。
+
+首次启用:
+
+```bash
+uv sync                           # 装 dev 依赖(pre-commit、ruff 已声明)
+uv run pre-commit install         # 注入 .git/hooks/pre-commit
+uv run pre-commit run --all-files # 一次性扫全仓,确认基线干净
+```
+
+之后每次 `git commit` 会自动跑 ruff;手动检查可:
+
+```bash
+uv run ruff check src/
+```

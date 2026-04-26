@@ -2,6 +2,31 @@
 
 本文档记录 AutoTeam-F 相对上游 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的差异以及版本演进。日期采用 ISO 8601。
 
+## [Unreleased] — 2026-04-26
+
+### docker-guard:镜像守卫四道防线(SPEC-3)
+
+> 起因:issue #3 的 `list_accounts` ImportError 代码层已修(commit cf2f7d3),但用户 docker 容器没重建仍报错。本轮落地"防回归 + 用户操作 SOP + 镜像可观察性"。
+
+- **feat(docker): entrypoint self-check** — `docker-entrypoint.sh` 在 `exec uv run autoteam` 前增加白名单 import 自检(`autoteam.api.app` + `autoteam.accounts` 9 个对外契约符号 + `autoteam.manager.sync_account_states` 共 11 项),失败即 `exit 1` 触发 docker `restart: unless-stopped` 的 crash-loop;失败提示文案直接给出 rebuild 命令。
+- **feat(docker): 镜像 git-sha 指纹** — `Dockerfile` 增 `ARG GIT_SHA` / `ARG BUILD_TIME`,落到 `LABEL org.opencontainers.image.revision/created` + `ENV AUTOTEAM_GIT_SHA/BUILD_TIME`;`docker-compose.yml` 用 `${GIT_SHA:-unknown}` 降级,不传 build-arg 也能跑。
+- **feat(api): `/api/version` 端点** — `src/autoteam/api.py` 新增免鉴权 `GET /api/version`,返回 `{git_sha, build_time}`,`_AUTH_SKIP_PATHS` 已加白名单;Pydantic `VersionResponse` 模型,与 OpenAPI/Swagger 集成。
+- **feat(lint): ruff F401/F811/F821 守卫** — `pyproject.toml` 新增 `[tool.ruff.lint]` 段,只启三条零误报规则;`.pre-commit-config.yaml` 接入同规则,堵住 typo 类 ImportError 在 commit 前。
+- **docs(docker): rebuild SOP** — `docs/docker.md` 增加"代码更新后的 rebuild SOP"+"版本验证"+"启动期 self-check"+"故障排查"+"lint 守卫"五个章节;`docs/api.md` 把 `/api/version` 加入即时返回接口表与免鉴权清单。
+
+### playwright-hardening:async/sync 一致性硬化(SPEC-4)
+
+> 起因:issue #5 用户报告"playwright 中大量 async 函数里误用 sync API"。研究阶段对全项目 5 处 `sync_playwright` 调用点 + 1 处 `async def` 完整审计后**结论反转** — 0 处实际混用、5 处全部位于 sync `def` + 经由 `_PlaywrightExecutor` 单例 + 专用 worker 线程串行,严格符合 Playwright 官方推荐模式。用户决定走 hardening only,落 3 道防线杜绝未来回归。
+
+- **feat(guard): 新增 `src/autoteam/_playwright_guard.py`** — 单一信源(SSOT)模块:9 个 sync 白名单符号 `ALLOWED_SYNC_NAMES`(sync_playwright/Playwright/Browser/BrowserContext/BrowserType/Page/Locator/Error/TimeoutError)+ `FORBIDDEN_MODULES={"playwright.async_api"}` + `EXEMPTION_MARKER="autoteam: allow-async-playwright"` + `assert_sync_context()` 函数(在 asyncio loop 内调用立即抛 `RuntimeError`,异常消息含 thread 名 + loop_id 便于诊断)。
+- **feat(api): `_PlaywrightExecutor` 双入口 guard** — `api.py` 在 `run_with_timeout` 主线程入口 + `_worker` 专用线程入口分别调 `assert_sync_context()`,防止未来某次重构把 sync_playwright 误植入 async 上下文(撞 Playwright 内部 "Sync API inside asyncio loop" 静默失败)。
+- **refactor(manager): 函数内 import 上提** — `manager.py:_complete_registration` / `_register_direct_once` 两处 `from playwright.sync_api import sync_playwright` 上提至模块顶层(全仓 sync_api import 现在统一在 4 个文件的模块顶层 + manager.py 1 处)。
+- **test(static): AST 守卫 + 反例验证** — `tests/static/test_playwright_hygiene.py` 4 个测试:① 禁止 `from playwright.async_api`;② `async def` 函数体内不允许任何 playwright 符号;③ `playwright.sync_api` 导入仅限白名单 9 符号;④ 豁免登记表 `expected_exempt = set()` 当前期望 0 个豁免。`tests/static/test_playwright_hygiene_negative.py` 5 个反例验证守卫真能拦下违规模式。
+- **test(unit): runtime guard 验证** — `tests/unit/test_playwright_guard.py` 3 个测试:① 普通线程放行;② `asyncio.run()` 内调用必抛;③ 异常消息含 `thread=` + `loop_id=0x...`。
+- **chore(pytest): testpaths 显式列入 tests/static** — `pyproject.toml` `[tool.pytest.ini_options]` 把 `tests/static` / `tests/unit` / `tests/integration` 全部显式列入 `testpaths`,避免未来 collect-only 配置误排除静态守卫。
+
+> SPEC-4 范围严格限定 hardening only,**不动业务逻辑**:`chatgpt_api.py` / `codex_auth.py` / `invite.py` / 5 处 `with sync_playwright() as p:` 块本体一行未改。
+
 ## [Unreleased] — 2026-04-25
 
 ### invite-hardening round-3:母号切换鲁棒性 + exhausted 自愈 + CPA 删除守卫

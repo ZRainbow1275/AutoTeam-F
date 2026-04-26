@@ -24,11 +24,37 @@ app = FastAPI(
     version="0.1.0",
 )
 
+
+# ---------------------------------------------------------------------------
+# 版本端点 (SPEC-3 §5) - 不鉴权,纯只读
+# ---------------------------------------------------------------------------
+
+
+class VersionResponse(BaseModel):
+    """镜像版本指纹响应 - 来自 Dockerfile build args。"""
+
+    git_sha: str
+    build_time: str
+
+
+@app.get(
+    "/api/version",
+    response_model=VersionResponse,
+    summary="返回镜像构建期注入的 git-sha 与时间戳",
+    tags=["meta"],
+)
+def api_version() -> VersionResponse:
+    return VersionResponse(
+        git_sha=os.getenv("AUTOTEAM_GIT_SHA", "unknown"),
+        build_time=os.getenv("AUTOTEAM_BUILD_TIME", "unknown"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # API Key 鉴权中间件
 # ---------------------------------------------------------------------------
 
-_AUTH_SKIP_PATHS = {"/api/auth/check", "/api/setup/status", "/api/setup/save"}
+_AUTH_SKIP_PATHS = {"/api/auth/check", "/api/setup/status", "/api/setup/save", "/api/version"}
 
 
 @app.middleware("http")
@@ -169,6 +195,8 @@ MAX_TASK_HISTORY = 50
 
 import queue as _queue
 
+from autoteam._playwright_guard import assert_sync_context
+
 
 class _PlaywrightExecutor:
     """将 Playwright 操作派发到专用线程执行，避免跨线程错误"""
@@ -178,6 +206,8 @@ class _PlaywrightExecutor:
         self._thread: threading.Thread | None = None
 
     def _worker(self):
+        # SPEC-4 §3.2: worker 线程入口必须在普通线程,不允许 asyncio loop
+        assert_sync_context()
         while True:
             item = self._queue.get()
             if item is None:
@@ -207,6 +237,8 @@ class _PlaywrightExecutor:
         后续通过 _pw_executor 提交的调用会在队列里等它自然完成。调用方需要自己
         确保不会越过 _playwright_lock 边界并发触发这种情况。
         """
+        # SPEC-4 §3.2: 主线程前置检查,拦下 asyncio loop 误入
+        assert_sync_context()
         self.ensure_started()
         result_event = threading.Event()
         result_holder: dict = {}

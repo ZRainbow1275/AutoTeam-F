@@ -1,7 +1,14 @@
+# SPEC-3 §7: pre-commit ruff hook
+# 安装:uv run pre-commit install
+# 手动跑全仓:uv run pre-commit run --all-files
+
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.10
     hooks:
       - id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
-      - id: ruff-format
+        name: ruff (F401/F811/F821)
+        args:
+          - --select
+          - F401,F811,F821
+          - --exit-non-zero-on-fix
