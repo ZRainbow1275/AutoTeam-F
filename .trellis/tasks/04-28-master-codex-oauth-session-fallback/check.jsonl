@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/prd.md", "reason": "AC1-6 是 quality gate 源真相,特别 AC6 实测自验 6 项硬指标"}
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/research/upstream-master-codex-oauth.md", "reason": "对照上游实施基线 + comparison table 确认对齐"}
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/research/local-impl-trace.md", "reason": "本地 6 假设可作 dry-run 诊断指引"}
+{"file": "prompts/0426/spec/shared/oauth-workspace-selection.md", "reason": "v1.0 既有,SessionCodexAuthFlow 行为不被破坏的回归点"}

@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/prd.md", "reason": "本任务 PRD,Approach A 决策,AC1-6,Decision/Consequences/实施大纲"}
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/research/upstream-master-codex-oauth.md", "reason": "上游 cnitlrt/AutoTeam 主号 OAuth 完整路径 + 25 行 thin wrapper 模板代码 + comparison table"}
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/research/local-impl-trace.md", "reason": "本地 login_codex_via_session 调用栈 + cookie inventory + 6 假设排序(H1 issuer session 50% / H2 oai-oauth-session 30%)"}
+{"file": ".trellis/tasks/04-28-master-codex-oauth-session-fallback/research/_upstream_codex_auth.py", "reason": "上游 src/autoteam/codex_auth.py 完整 1648 行原文,wrapper 实现在 1017-1043"}
+{"file": "prompts/0426/spec/shared/account-state-machine.md", "reason": "v2.0 现有,本任务不动该状态机但保留参考(主号 OAuth 不进账号池)"}
+{"file": "prompts/0426/spec/shared/oauth-workspace-selection.md", "reason": "Round 8 v1.0 现有,SessionCodexAuthFlow workspace 选择行为参考"}

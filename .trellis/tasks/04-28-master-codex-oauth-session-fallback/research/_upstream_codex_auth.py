@@ -13,7 +13,6 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import autoteam.display  # noqa: F401
-from autoteam.accounts import is_supported_plan, normalize_plan_type
 from autoteam.admin_state import (
     get_admin_email,
     get_admin_session_token,
@@ -22,7 +21,6 @@ from autoteam.admin_state import (
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
 from autoteam.config import get_playwright_launch_options
-from autoteam.invite import assert_not_blocked  # SPEC-2 shared/add-phone-detection §3 — OAuth 流程复用
 from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
@@ -36,11 +34,6 @@ CODEX_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CALLBACK_PORT = 1455
 CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
-
-# SPEC-2 shared/quota-classification §4.4 I5 — Codex backend 最小推理端点(用于 uninitialized_seat 二次验证)
-_CODEX_SMOKE_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
-# quota 关键词:codex backend 返回 4xx 时若 body 含这些词同样视为 auth_invalid(可能是配额相关 API 错误)
-_CODEX_SMOKE_QUOTA_HINTS = ("quota", "no_quota", "rate_limit", "billing", "exceeded")
 
 
 def _generate_pkce():
@@ -67,6 +60,34 @@ def _parse_jwt_payload(token):
 def _screenshot(page, name):
     SCREENSHOT_DIR.mkdir(exist_ok=True)
     page.screenshot(path=str(SCREENSHOT_DIR / name), full_page=True)
+
+
+def _page_excerpt(page, limit=240):
+    try:
+        text = page.locator("body").inner_text(timeout=1500)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:limit]
+    except Exception:
+        return ""
+
+
+def _classify_oauth_failure(url, body_excerpt=""):
+    url = (url or "").lower()
+    body = (body_excerpt or "").lower()
+
+    if "add-phone" in url:
+        return "add_phone", "需要手机号验证", False
+    if "verify you are human" in body or "captcha" in body:
+        return "human_verification", "命中人机验证", False
+    if "unable to load site" in body or "try again later" in body or "status page" in body:
+        return "site_unavailable", "站点暂时不可用或代理异常", True
+    if "email-verification" in url:
+        return "email_verification", "卡在邮箱验证码页", True
+    if "workspace" in url:
+        return "workspace_selection", "卡在 workspace 选择页", True
+    if "/auth/login" in url or "log-in-or-create-account" in url:
+        return "login_state_lost", "登录态丢失或回到了登录页", True
+    return "auth_code_missing", f"未获取到 auth code（停留在 {url or 'unknown'}）", True
 
 
 def _build_auth_url(code_challenge, state):
@@ -109,28 +130,17 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
     claims = _parse_jwt_payload(id_token)
     auth_claims = claims.get("https://api.openai.com/auth", {})
 
-    raw_plan = auth_claims.get("chatgpt_plan_type", "unknown")
     bundle = {
         "access_token": token_data.get("access_token"),
         "refresh_token": token_data.get("refresh_token"),
         "id_token": id_token,
         "account_id": auth_claims.get("chatgpt_account_id", ""),
         "email": claims.get("email", fallback_email or ""),
-        # SPEC-2 shared/plan-type-whitelist §2.3:plan_type 已归一化为小写;
-        # plan_type_raw 保留 OpenAI 原始字面量便于事后排查;
-        # plan_supported 是白名单判定结果,下游消费方应只读该字段不再自己 .lower() 比对。
-        "plan_type": normalize_plan_type(raw_plan),
-        "plan_type_raw": raw_plan,
-        "plan_supported": is_supported_plan(raw_plan),
+        "plan_type": auth_claims.get("chatgpt_plan_type", "unknown"),
         "expired": time.time() + token_data.get("expires_in", 3600),
     }
 
-    logger.info(
-        "[Codex] 登录成功: %s (plan: %s, supported: %s)",
-        bundle["email"],
-        bundle["plan_type"],
-        bundle["plan_supported"],
-    )
+    logger.info("[Codex] 登录成功: %s (plan: %s)", bundle["email"], bundle["plan_type"])
     return bundle
 
 
@@ -222,6 +232,46 @@ _OTP_INVALID_HINTS = (
     "验证码已过期",
 )
 
+_WORKSPACE_PAGE_HINTS = (
+    "choose a workspace",
+    "select a workspace",
+    "launch a workspace",
+    "workspace",
+    "personal workspace",
+    "personal account",
+    "选择一个工作空间",
+    "选择工作空间",
+)
+_WORKSPACE_IGNORE_LABELS = {
+    "choose a workspace",
+    "select a workspace",
+    "workspace",
+    "terms of use",
+    "privacy policy",
+    "continue",
+    "继续",
+    "allow",
+    "log in",
+    "cancel",
+    "back",
+    "resend email",
+    "use password",
+    "continue with password",
+    "log in with a one-time code",
+    "login with a one-time code",
+    "one-time code",
+    "email code",
+}
+_WORKSPACE_IGNORE_SUBSTRINGS = (
+    "new organization",
+    "finish setting up",
+    "set up on the next page",
+    "one-time code",
+    "email code",
+    "continue with password",
+    "use password",
+)
+
 
 def _is_otp_input_visible(page, timeout=500):
     try:
@@ -265,26 +315,133 @@ def _wait_for_otp_submit_result(page, timeout=12):
     return "pending", None
 
 
-def login_codex_via_browser(email, password, mail_client=None, *, use_personal=False):
+def _is_workspace_ignored_label(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if lowered in _WORKSPACE_IGNORE_LABELS:
+        return True
+    return any(token in lowered for token in _WORKSPACE_IGNORE_SUBSTRINGS)
+
+
+def _is_workspace_selection_page(page) -> bool:
+    url = (page.url or "").lower()
+    if "workspace" in url:
+        return True
+
+    try:
+        body = page.locator("body").inner_text(timeout=1200).lower()
+    except Exception:
+        body = ""
+
+    hint_hits = sum(1 for hint in _WORKSPACE_PAGE_HINTS if hint in body)
+    if "organization" in url:
+        return hint_hits >= 2
+    return hint_hits >= 2 or "launch a workspace" in body
+
+
+def _workspace_label_candidates(page):
+    if not _is_workspace_selection_page(page):
+        return []
+
+    selectors = (
+        "button",
+        "a",
+        '[role="button"]',
+        '[role="option"]',
+        '[aria-selected="true"]',
+        '[aria-selected="false"]',
+        "[data-state]",
+        "li",
+        "label",
+        "div",
+    )
+    seen = set()
+    candidates = []
+    for selector in selectors:
+        try:
+            for loc in page.locator(selector).all():
+                try:
+                    if not loc.is_visible(timeout=100):
+                        continue
+                    text = re.sub(r"\s+", " ", loc.inner_text(timeout=200)).strip()
+                except Exception:
+                    continue
+                lowered = text.lower()
+                if not text or lowered in seen or len(text) > 80 or _is_workspace_ignored_label(lowered):
+                    continue
+                seen.add(lowered)
+                candidates.append((text, loc))
+        except Exception:
+            continue
+    return candidates
+
+
+def _click_workspace_locator(loc) -> bool:
+    try:
+        loc.click(timeout=3000)
+        return True
+    except Exception:
+        try:
+            loc.click(force=True, timeout=3000)
+            return True
+        except Exception:
+            return False
+
+
+def _select_team_workspace(page, workspace_name: str) -> bool:
+    preferred_name = str(workspace_name or "").strip()
+    if not preferred_name:
+        return False
+
+    preferred_name_lower = preferred_name.lower()
+    for text, loc in _workspace_label_candidates(page):
+        if text.strip().lower() != preferred_name_lower:
+            continue
+        if not _click_workspace_locator(loc):
+            continue
+        logger.info("[Codex] 选择 Team workspace: %s", text)
+        time.sleep(3)
+        return True
+
+    # fallback: 某些页面里的 workspace 项是普通 div / span 包裹文本，不带 button/option role
+    for selector in (
+        f'text="{preferred_name}"',
+        f"text=/{re.escape(preferred_name)}/i",
+    ):
+        try:
+            loc = page.locator(selector).first
+            if not loc.is_visible(timeout=500):
+                continue
+            if not _click_workspace_locator(loc):
+                continue
+            logger.info("[Codex] 选择 Team workspace: %s", preferred_name)
+            time.sleep(3)
+            return True
+        except Exception:
+            continue
+
+    return False
+
+
+def login_codex_via_browser(email, password, mail_client=None, *, return_result=False):
     """
     通过 Playwright 自动完成 Codex OAuth 登录。
     mail_client: CloudMailClient 实例，用于自动读取登录验证码。
-    use_personal: 若为 True，则走"个人账号"流程 —— 不注入 Team _account cookie，
-                  workspace 选择时跳过 Team 直接用 Personal。用于已退出 Team 的子账号生成 free plan 的 rt/at。
     返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type}
+    return_result=True 时返回:
+      {ok: bool, bundle: dict|None, error_type: str|None, error_detail: str|None, retryable: bool}
     """
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(16)
     _used_email_ids: set[int] = set()  # 记录已尝试过的邮件，避免重复提交同一封验证码邮件
 
-    # personal 模式下不引导到 Team workspace
-    chatgpt_account_id = "" if use_personal else get_chatgpt_account_id()
+    chatgpt_account_id = get_chatgpt_account_id()
 
     auth_url = _build_auth_url(code_challenge, state)
 
     logger.info("[Codex] 开始 OAuth 登录: %s", email)
 
     auth_code = None
+    failure_result = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(**get_playwright_launch_options())
@@ -294,13 +451,31 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
         )
 
         # === Step 0: 先登录 ChatGPT 并切换到 Team workspace ===
-        # 仅 Team 模式需要:登录前注入 _account cookie 引导登录进入 Team workspace。
-        # personal 模式 chatgpt_account_id="" 无 cookie 可注入,step-0 反而会留下半成品
-        # session(新账号 ChatGPT 登录 12s 内通常走不完) → auth_url 在同 context 下会看到
-        # "欢迎回来"页,邮箱灰禁、consent 循环误点 Continue → OpenAI 返回 Operation timed out。
-        # 所以 personal 模式直接跳过 step-0,auth_url 在干净 context 里自己走邮箱/密码/OTP。
+        # 登录前就注入 _account cookie，引导登录流程进入 Team workspace
+        if chatgpt_account_id:
+            context.add_cookies(
+                [
+                    {
+                        "name": "_account",
+                        "value": chatgpt_account_id,
+                        "domain": "chatgpt.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "_account",
+                        "value": chatgpt_account_id,
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
+            logger.debug("[Codex] 登录前已注入 _account cookie = %s", chatgpt_account_id)
 
-        # 在登录开始前记录当前最新邮件 ID,后续只接受比这个更新的
+        # 在登录开始前记录当前最新邮件 ID，后续只接受比这个更新的
         _email_id_before_login = 0
         if mail_client:
             try:
@@ -310,153 +485,106 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             except Exception:
                 pass
 
-        if use_personal:
-            logger.info("[Codex] personal 模式: 跳过 step-0 ChatGPT 预登录,直接走 auth_url")
-        else:
-            if chatgpt_account_id:
-                context.add_cookies(
-                    [
-                        {
-                            "name": "_account",
-                            "value": chatgpt_account_id,
-                            "domain": "chatgpt.com",
-                            "path": "/",
-                            "secure": True,
-                            "sameSite": "Lax",
-                        },
-                        {
-                            "name": "_account",
-                            "value": chatgpt_account_id,
-                            "domain": "auth.openai.com",
-                            "path": "/",
-                            "secure": True,
-                            "sameSite": "Lax",
-                        },
-                    ]
-                )
-                logger.debug("[Codex] 登录前已注入 _account cookie = %s", chatgpt_account_id)
+        logger.info("[Codex] 先登录 ChatGPT 选择 Team workspace...")
+        _page = context.new_page()
+        _page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
 
-            logger.info("[Codex] 先登录 ChatGPT 选择 Team workspace...")
-            _page = context.new_page()
-            _page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
+        # Cloudflare
+        for _i in range(12):
+            if "verify you are human" not in _page.content()[:2000].lower():
+                break
             time.sleep(5)
 
-            # Cloudflare
-            for _i in range(12):
-                if "verify you are human" not in _page.content()[:2000].lower():
-                    break
-                time.sleep(5)
+        # 点击登录
+        try:
+            _page.locator('button:has-text("登录"), button:has-text("Log in")').first.click()
+            time.sleep(3)
+        except Exception:
+            pass
 
-            # 点击登录
-            try:
-                _page.locator('button:has-text("登录"), button:has-text("Log in")').first.click()
+        # 输入邮箱（避免误点 Google/Microsoft 第三方登录按钮）
+        try:
+            ei = _page.locator('input[name="email"], input[id="email-input"], input[id="email"]').first
+            if ei.is_visible(timeout=5000):
+                ei.fill(email)
+                time.sleep(0.5)
+                _click_primary_auth_button(_page, ei, ["Continue", "继续"])
                 time.sleep(3)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-            # 输入邮箱（避免误点 Google/Microsoft 第三方登录按钮）
-            try:
-                ei = _page.locator('input[name="email"], input[id="email-input"], input[id="email"]').first
-                if ei.is_visible(timeout=5000):
-                    ei.fill(email)
+        # 输入密码 / 点击一次性验证码登录
+        try:
+            pi = _page.locator('input[type="password"]').first
+            if pi.is_visible(timeout=5000):
+                if password:
+                    pi.fill(password)
                     time.sleep(0.5)
-                    _click_primary_auth_button(_page, ei, ["Continue", "继续"])
-                    time.sleep(3)
-            except Exception:
-                pass
-
-            # 输入密码 / 点击一次性验证码登录
-            try:
-                pi = _page.locator('input[type="password"]').first
-                if pi.is_visible(timeout=5000):
-                    if password:
-                        pi.fill(password)
-                        time.sleep(0.5)
+                    _click_primary_auth_button(_page, pi, ["Continue", "继续", "Log in"])
+                else:
+                    # 没有密码，点击"使用一次性验证码登录"
+                    otp_btn = _page.locator(
+                        'button:has-text("一次性验证码"), button:has-text("one-time"), button:has-text("email login")'
+                    ).first
+                    if otp_btn.is_visible(timeout=3000):
+                        logger.info("[Codex] 无密码，点击一次性验证码登录")
+                        otp_btn.click()
+                    else:
+                        # fallback: 提交空密码让页面报错，然后找验证码按钮
                         _click_primary_auth_button(_page, pi, ["Continue", "继续", "Log in"])
-                    else:
-                        # 没有密码，点击"使用一次性验证码登录"
-                        otp_btn = _page.locator(
-                            'button:has-text("一次性验证码"), button:has-text("one-time"), button:has-text("email login")'
-                        ).first
-                        if otp_btn.is_visible(timeout=3000):
-                            logger.info("[Codex] 无密码，点击一次性验证码登录")
-                            otp_btn.click()
-                        else:
-                            # fallback: 提交空密码让页面报错，然后找验证码按钮
-                            _click_primary_auth_button(_page, pi, ["Continue", "继续", "Log in"])
-                    time.sleep(8)
-            except Exception:
-                pass
+                time.sleep(8)
+        except Exception:
+            pass
 
-            # 可能需要邮箱验证码
-            try:
-                ci = _page.locator('input[name="code"]').first
-                if ci.is_visible(timeout=5000) and mail_client:
-                    logger.info("[Codex] ChatGPT 登录需要验证码，等待 emailId > %d 的新邮件...", _email_id_before_login)
-                    otp = None
-                    otp_email_id = 0
-                    t0 = time.time()
-                    while time.time() - t0 < 120:
-                        for em in mail_client.search_emails_by_recipient(email, size=5):
-                            email_id = em.get("emailId", 0)
-                            if email_id <= _email_id_before_login or email_id in _used_email_ids:
-                                continue
-                            otp = mail_client.extract_verification_code(em)
-                            if otp:
-                                otp_email_id = email_id
-                                break
+        # 可能需要邮箱验证码
+        try:
+            ci = _page.locator('input[name="code"]').first
+            if ci.is_visible(timeout=5000) and mail_client:
+                logger.info("[Codex] ChatGPT 登录需要验证码，等待 emailId > %d 的新邮件...", _email_id_before_login)
+                otp = None
+                otp_email_id = 0
+                t0 = time.time()
+                while time.time() - t0 < 120:
+                    for em in mail_client.search_emails_by_recipient(email, size=5):
+                        email_id = em.get("emailId", 0)
+                        if email_id <= _email_id_before_login or email_id in _used_email_ids:
+                            continue
+                        otp = mail_client.extract_verification_code(em)
                         if otp:
+                            otp_email_id = email_id
                             break
-                        time.sleep(3)
                     if otp:
-                        _used_email_ids.add(otp_email_id)
-                        ci.fill(otp)
-                        time.sleep(0.5)
-                        _page.locator('button[type="submit"]').first.click()
-                        time.sleep(5)
+                        break
+                    time.sleep(3)
+                if otp:
+                    _used_email_ids.add(otp_email_id)
+                    ci.fill(otp)
+                    time.sleep(0.5)
+                    _page.locator('button[type="submit"]').first.click()
+                    time.sleep(5)
+        except Exception:
+            pass
+
+        _screenshot(_page, "codex_00_chatgpt_login.png")
+        logger.info("[Codex] ChatGPT 登录后 URL: %s", _page.url)
+
+        # 如果是 workspace 选择页面，选择配置的 Team workspace
+        if _is_workspace_selection_page(_page):
+            workspace_name = get_chatgpt_workspace_name()
+            logger.info("[Codex] 检测到 workspace 选择页面...")
+            try:
+                if not _select_team_workspace(_page, workspace_name):
+                    logger.warning("[Codex] 未匹配到目标 Team workspace: %s", workspace_name or "<empty>")
             except Exception:
                 pass
+            _screenshot(_page, "codex_00_after_workspace.png")
+            logger.info("[Codex] 选择 workspace 后 URL: %s", _page.url)
 
-            _screenshot(_page, "codex_00_chatgpt_login.png")
-            logger.info("[Codex] ChatGPT 登录后 URL: %s", _page.url)
+        # _account cookie 已在登录前注入
 
-            # 如果是 workspace 选择页面，Team 模式选配置的 workspace
-            if "workspace" in _page.url:
-                workspace_name = get_chatgpt_workspace_name()
-                logger.info("[Codex] 检测到 workspace 选择页面...")
-                try:
-                    ws_btn = _page.locator(f'text="{workspace_name}"').first
-                    if workspace_name and ws_btn.is_visible(timeout=3000):
-                        logger.info("[Codex] 选择 workspace: %s", workspace_name)
-                        ws_btn.click()
-                        time.sleep(5)
-                    else:
-                        # fallback: 选第二个选项（第一个通常是"个人"）
-                        options = _page.locator('a, button, [role="button"]').all()
-                        for opt in options:
-                            try:
-                                text = opt.inner_text(timeout=1000).strip()
-                                if (
-                                    text
-                                    and "个人" not in text
-                                    and "Personal" not in text
-                                    and text not in ("ChatGPT", "")
-                                ):
-                                    logger.info("[Codex] 选择 workspace: %s", text)
-                                    opt.click()
-                                    time.sleep(5)
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-                _screenshot(_page, "codex_00_after_workspace.png")
-                logger.info("[Codex] 选择 workspace 后 URL: %s", _page.url)
-
-            # _account cookie 已在登录前注入
-
-            # 关闭 ChatGPT 页面但保留 context
-            _page.close()
+        # 关闭 ChatGPT 页面但保留 context
+        _page.close()
 
         # 通过监听请求来捕获 OAuth callback redirect
         def on_request(request):
@@ -583,10 +711,6 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
         elif code_input:
             logger.warning("[Codex] 需要验证码但无 mail_client，无法自动获取")
 
-        # SPEC-2 shared/add-phone-detection §4 (位点 C-P1):about-you 入口前先探针。
-        # 注册流程提交 OTP 后 OpenAI 经常把账号引到 add-phone,等切到 about-you 再发现就太晚。
-        assert_not_blocked(page, "oauth_about_you")
-
         # 处理 about-you 页面（可能出现在 OAuth 流程中）
         if "about-you" in page.url:
             logger.info("[Codex] 检测到 about-you 页面，填写个人信息...")
@@ -635,102 +759,17 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             if auth_code:
                 break
 
-            # SPEC-2 shared/add-phone-detection §4 (位点 C-P2):consent 循环每轮开头探针。
-            # 不在循环里拦,会被当作"workspace 没选好"反复重试,30s callback 等待白白耗费。
-            assert_not_blocked(page, f"oauth_consent_{step}")
-
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
 
-            # 在任何页面中，如果有 workspace/组织选择，先选 Team（personal 模式下选个人）
+            # 在任何页面中，如果有 workspace/组织选择，先选 Team
             try:
-                page_text = page.inner_text("body")[:1000]
-
-                # personal 模式：检测到工作空间选择页时，直接选 Personal
-                if use_personal and (
-                    "选择一个工作空间" in page_text or "Select a workspace" in page_text or "选择工作空间" in page_text
-                ):
-                    _screenshot(page, f"codex_04_personal_ws_{step + 1}_before.png")
-                    logger.info("[Codex] 检测到工作空间选择页 (step %d, personal 模式)", step + 1)
-                    personal_selected = False
-                    try:
-                        personal_btn = page.locator("text=/个人|Personal/").first
-                        if personal_btn.is_visible(timeout=2000):
-                            personal_btn.click(force=True)
-                            time.sleep(1)
-                            personal_selected = True
-                            logger.info("[Codex] 已选择 Personal workspace (step %d)", step + 1)
-                    except Exception as e:
-                        logger.warning("[Codex] 选择 Personal 失败: %s", e)
-                    _screenshot(page, f"codex_04_personal_ws_{step + 1}_after.png")
-                    if personal_selected:
-                        try:
-                            cont_btn = page.locator('button:has-text("继续"), button:has-text("Continue")').first
-                            if cont_btn.is_visible(timeout=3000):
-                                cont_btn.click()
-                                time.sleep(3)
-                        except Exception:
-                            pass
-                        continue
-
-                # 选择 Team workspace（用配置的名称精确匹配）
-                workspace_name = "" if use_personal else get_chatgpt_workspace_name()
+                workspace_name = get_chatgpt_workspace_name()
                 # 检测"选择一个工作空间"页面，点击 Team workspace
-                if workspace_name and (
-                    "选择一个工作空间" in page_text or "Select a workspace" in page_text or "选择工作空间" in page_text
-                ):
+                if _is_workspace_selection_page(page):
                     selected = False
                     _screenshot(page, f"codex_04_workspace_{step + 1}_before.png")
                     logger.info("[Codex] 检测到工作空间选择页 (step %d)，尝试选择: %s", step + 1, workspace_name)
-
-                    # 用 JS 直接点击包含 workspace 名称的元素（最可靠）
-                    try:
-                        clicked = page.evaluate(
-                            """(name) => {
-                            const els = document.querySelectorAll('*');
-                            for (const el of els) {
-                                const text = (el.textContent || '').trim();
-                                if (text === name && !text.includes('个人') && !text.includes('Personal')) {
-                                    // 找到最近的可点击父元素
-                                    let target = el;
-                                    while (target && target.tagName !== 'BODY') {
-                                        const tag = target.tagName.toLowerCase();
-                                        if (['button', 'a', 'li', 'label'].includes(tag)
-                                            || target.getAttribute('role')
-                                            || target.onclick
-                                            || target.classList.length > 0) {
-                                            target.click();
-                                            return true;
-                                        }
-                                        target = target.parentElement;
-                                    }
-                                    el.click();
-                                    return true;
-                                }
-                            }
-                            return false;
-                        }""",
-                            workspace_name,
-                        )
-                        if clicked:
-                            time.sleep(1)
-                            selected = True
-                            logger.info("[Codex] 已选择 workspace (JS): %s (step %d)", workspace_name, step + 1)
-                    except Exception as e:
-                        logger.warning("[Codex] JS 选择 workspace 失败: %s", e)
-
-                    if not selected:
-                        # fallback: Playwright 选择器
-                        try:
-                            ws_el = page.locator(f"text={workspace_name}").first
-                            if ws_el.is_visible(timeout=2000):
-                                ws_el.click(force=True)
-                                time.sleep(1)
-                                selected = True
-                                logger.info(
-                                    "[Codex] 已选择 workspace (force click): %s (step %d)", workspace_name, step + 1
-                                )
-                        except Exception:
-                            pass
+                    selected = _select_team_workspace(page, workspace_name)
 
                     _screenshot(page, f"codex_04_workspace_{step + 1}_after.png")
                     if selected:
@@ -746,17 +785,6 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                         continue
                     else:
                         logger.warning("[Codex] 无法选择 workspace '%s' (step %d)", workspace_name, step + 1)
-
-                elif workspace_name:
-                    # 非工作空间选择页，但可能有 workspace 文本（如 organization 页）
-                    try:
-                        ws_btn = page.locator(f'text="{workspace_name}"').first
-                        if ws_btn.is_visible(timeout=1000):
-                            ws_btn.click()
-                            time.sleep(1)
-                            logger.info("[Codex] 已选择 workspace: %s (step %d)", workspace_name, step + 1)
-                    except Exception:
-                        pass
 
                 # Organization 页面的下拉选择
                 if "organization" in page.url:
@@ -907,37 +935,6 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             except Exception:
                 break
 
-        # Round 8 — SPEC-2 v1.5 §3.4.7 + shared/oauth-workspace-selection.md §4.1:
-        # personal OAuth 需要在 consent 循环之后、callback 之前**主动**选 personal workspace,
-        # 否则 issuer 按 default_workspace_id(sticky 指向 Team)颁 token,拿到 plan_type=team。
-        # 三层兜底:HTTP /api/accounts/workspace/select(主路径)→ Playwright UI fallback →
-        # 失败则返回 fail_category 由外层 5 次重试承担。
-        # Team 路径(use_personal=False)完全跳过 — 默认 default_workspace_id 已指向 Team。
-        if use_personal and not auth_code:
-            try:
-                from autoteam.oauth_workspace import ensure_personal_workspace_selected
-
-                consent_url_for_select = page.url or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
-                ws_ok, ws_fail_category, ws_evidence = ensure_personal_workspace_selected(
-                    page,
-                    consent_url=consent_url_for_select,
-                )
-                if ws_ok:
-                    logger.info("[Codex] personal workspace 选择成功,继续等 callback")
-                else:
-                    logger.warning(
-                        "[Codex] personal workspace 选择失败 fail_category=%s evidence=%s",
-                        ws_fail_category,
-                        json.dumps(ws_evidence, ensure_ascii=False)[:300],
-                    )
-                _screenshot(page, "codex_04b_after_workspace_select.png")
-            except Exception as exc:
-                logger.warning("[Codex] ensure_personal_workspace_selected 异常: %s", exc)
-
-        # SPEC-2 shared/add-phone-detection §4 (位点 C-P3):等 callback 前探针。
-        # add-phone 阻塞 = "callback 永远不来"的根因,30s 等待白白浪费。
-        assert_not_blocked(page, "oauth_callback_wait")
-
         # 等待 redirect callback 获取 auth code
         for _ in range(30):
             if auth_code:
@@ -958,64 +955,67 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
 
         if not auth_code:
             _screenshot(page, "codex_05_no_callback.png")
+            body_excerpt = _page_excerpt(page)
             logger.warning("[Codex] 未获取到 auth code，当前 URL: %s", page.url)
-
-        # SPEC-2 §3.4.5 (位点 C-P4) + Round 6 PRD-5 FR-P1.1:personal 拒收 bundle 之前的最后一道关卡。
-        # 防御性 — 通常 C-P1~C-P3 已拦下,但 add-phone 可能在 callback 阶段后晚到一两秒;
-        # 此处在 browser.close() 之前做最后一次探针,确保 page 仍可读。命中即抛 RegisterBlocked,
-        # 上游 5 个调用方按 add-phone-detection.md §5.2 矩阵分类处置(personal/team/reinvite/api 各异)。
-        try:
-            assert_not_blocked(page, "oauth_personal_check")
-        except Exception:
-            # assert_not_blocked 命中 add-phone 会抛 RegisterBlocked — 必须传播给上层
-            # 但要保证 browser 资源被释放
-            try:
-                browser.close()
-            except Exception:
-                pass
-            raise
+            error_type, error_detail, retryable = _classify_oauth_failure(page.url, body_excerpt)
+            failure_result = {
+                "ok": False,
+                "bundle": None,
+                "error_type": error_type,
+                "error_detail": error_detail,
+                "retryable": retryable,
+                "current_url": page.url,
+                "body_excerpt": body_excerpt,
+            }
 
         browser.close()
 
     if not auth_code:
-        logger.error("[Codex] OAuth 登录失败: 未获取到 authorization code")
+        detail = (
+            failure_result.get("error_detail") if isinstance(failure_result, dict) else "未获取到 authorization code"
+        )
+        logger.error("[Codex] OAuth 登录失败: %s", detail)
+        if return_result:
+            return failure_result or {
+                "ok": False,
+                "bundle": None,
+                "error_type": "auth_code_missing",
+                "error_detail": "未获取到 authorization code",
+                "retryable": True,
+            }
         return None
 
     bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
-    if not bundle:
-        return None
-
-    # Personal 模式强校验 plan_type:当子号还挂在 Team workspace(OpenAI 后端 kick 同步延迟 /
-    # default workspace 为 Team)时,auth.openai.com 会默认选 Team 颁发 token,拿到 plan_type=team
-    # 的 bundle —— 这个 token 绑在 Team account_id 上,一旦子号离开 Team 就作废(refresh 401),
-    # 本地却标成 PERSONAL,用户看到的是"可用免费号"但 Codex 跑不动。必须在这里拒收。
-    if use_personal:
-        plan = (bundle.get("plan_type") or "").lower()
-        if plan != "free":
-            logger.error(
-                "[Codex] personal 模式拿到 plan_type=%s(期望 free),account_id=%s。"
-                "说明账号仍在 Team workspace,OAuth 默认选了 Team → token 绑 Team 后会随踢出作废。"
-                "拒收本次 bundle,触发上游 oauth_failed 分类。",
-                plan or "unknown",
-                bundle.get("account_id"),
-            )
+    if bundle:
+        plan_type = str(bundle.get("plan_type") or "").lower()
+        if plan_type != "team":
+            detail = f"登录后 plan={plan_type or 'unknown'}，未进入 Team workspace"
+            logger.error("[Codex] OAuth 登录失败: %s", detail)
+            if return_result:
+                return {
+                    "ok": False,
+                    "bundle": None,
+                    "error_type": "non_team_plan",
+                    "error_detail": detail,
+                    "retryable": True,
+                }
             return None
 
+    if return_result:
+        if bundle:
+            return {"ok": True, "bundle": bundle, "error_type": None, "error_detail": None, "retryable": False}
+        return {
+            "ok": False,
+            "bundle": None,
+            "error_type": "token_exchange_failed",
+            "error_detail": "Token 交换失败",
+            "retryable": True,
+        }
     return bundle
 
 
 def login_codex_via_session():
-    """使用管理员 session 复用统一流程完成主号 Codex OAuth 登录。
-
-    Round 10 重构(2026-04-28):删除 1003-1177 行的遗留 inline 实现,改为 thin wrapper
-    委托给 SessionCodexAuthFlow(对齐 upstream cnitlrt/AutoTeam:1017-1043)。
-    遗留实现的 chatgpt.com/auth/login 重试 fallback 实测无效(只刷新 chatgpt.com 域,
-    不影响 auth.openai.com session),且漏了"落 email-input 页时自动填 admin email"这步,
-    导致主号 OAuth 必失败。
-
-    SessionCodexAuthFlow 内 _advance → _auto_fill_email 会在 email-input 页自动填
-    admin email 并继续 consent 流程,这是 upstream 已经实证的解法。
-    """
+    """使用管理员 session 复用统一流程完成主号 Codex OAuth 登录。"""
     logger.info("[Codex] 开始使用 session 登录主号 Codex...")
 
     flow = SessionCodexAuthFlow(
@@ -1228,12 +1228,9 @@ class SessionCodexAuthFlow:
         acted = False
 
         try:
-            if "workspace" in self.page.url and self.workspace_name:
-                ws_btn = self.page.locator(f'text="{self.workspace_name}"').first
-                if ws_btn.is_visible(timeout=1000):
-                    ws_btn.click()
-                    logger.info("[Codex] 主号选择 workspace: %s", self.workspace_name)
-                    time.sleep(2)
+            if self.workspace_name and _is_workspace_selection_page(self.page):
+                if _select_team_workspace(self.page, self.workspace_name):
+                    logger.info("[Codex] 主号已选择目标 workspace")
                     acted = True
         except Exception:
             pass
@@ -1328,7 +1325,12 @@ class SessionCodexAuthFlow:
         from autoteam.chatgpt_api import ChatGPTTeamAPI
 
         self.chatgpt = ChatGPTTeamAPI()
-        self.chatgpt.start_with_session(self.session_token, self.account_id, self.workspace_name)
+        self.chatgpt.start_with_session(
+            self.session_token,
+            self.account_id,
+            self.workspace_name,
+            require_browser=True,
+        )
         self.page = self.chatgpt.context.new_page()
         self._attach_callback_listeners()
         self._inject_auth_cookies()
@@ -1384,7 +1386,7 @@ class SessionCodexAuthFlow:
         self.page = None
 
 
-class MainCodexSyncFlow(SessionCodexAuthFlow):
+class MainCodexLoginFlow(SessionCodexAuthFlow):
     def __init__(self):
         super().__init__(
             email=get_admin_email(),
@@ -1398,10 +1400,20 @@ class MainCodexSyncFlow(SessionCodexAuthFlow):
 
     def complete(self):
         info = super().complete()
+        return {
+            "email": info.get("email"),
+            "auth_file": info.get("auth_file"),
+            "plan_type": info.get("plan_type"),
+        }
 
-        from autoteam.cpa_sync import sync_main_codex_to_cpa
 
-        sync_main_codex_to_cpa(info["auth_file"])
+class MainCodexSyncFlow(MainCodexLoginFlow):
+    def complete(self):
+        info = super().complete()
+
+        from autoteam.sync_targets import sync_main_codex_to_configured_targets
+
+        sync_main_codex_to_configured_targets(info["auth_file"])
         return {
             "email": info.get("email"),
             "auth_file": info.get("auth_file"),
@@ -1504,12 +1516,7 @@ def quota_result_resets_at(info):
 
 
 def get_quota_exhausted_info(quota_info, *, limit_reached=False):
-    """根据额度快照判断是否已耗尽，并返回耗尽详情。
-
-    SPEC-2 shared/quota-classification §4.2:no_quota 优先级**高于** exhausted。
-    `primary_total == 0` / `reset_at == 0 + used_pct == 0` 表示 workspace 未分配配额,
-    返回 window="no_quota" 形态,resets_at 给 24h 占位(不应被用作重试依据)。
-    """
+    """根据额度快照判断是否已耗尽，并返回耗尽详情。"""
     if not isinstance(quota_info, dict):
         return None
 
@@ -1517,48 +1524,6 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     weekly_pct = int(quota_info.get("weekly_pct", 0) or 0)
     primary_reset = int(quota_info.get("primary_resets_at", 0) or 0)
     weekly_reset = int(quota_info.get("weekly_resets_at", 0) or 0)
-    primary_total = quota_info.get("primary_total")
-    primary_remaining = quota_info.get("primary_remaining")
-
-    # SPEC-2 shared/quota-classification I4 — no_quota 短路必须先于 exhausted 判定
-    no_quota_signals = []
-    if primary_total == 0:
-        no_quota_signals.append("primary_total==0")
-    elif primary_total is None and primary_pct == 0 and primary_reset == 0 and not limit_reached:
-        # rate_limit 字段缺失 / primary_window 缺失走这一支(上游 quota_info 取值都是 0)
-        no_quota_signals.append("rate_limit_empty")
-    if primary_remaining == 0 and (primary_total == 0 or primary_total is None) and primary_pct == 0:
-        no_quota_signals.append("remaining==0+total==0")
-
-    if no_quota_signals and not limit_reached and primary_pct < 100 and weekly_pct < 100:
-        return {
-            "window": "no_quota",
-            "resets_at": int(time.time() + 86400),  # 24h 占位
-            "quota_info": quota_info,
-            "limit_reached": False,
-            "no_quota_signals": no_quota_signals,
-        }
-
-    # SPEC-2 shared/quota-classification §4.4 I5 (Round 6 PRD-5 FR-P0) — uninitialized_seat 形态。
-    # OpenAI fresh seat 懒初始化:wham 给了占位 reset_at>0 但 total/remaining=null,且 pct=0。
-    # 此形态在 wham 层无法与"真无配额"区分,**不**直接判 no_quota,而是返回 window=
-    # "uninitialized_seat" + needs_codex_smoke=True,要求上游调 cheap_codex_smoke 二次验证。
-    if (
-        primary_total is None
-        and primary_remaining is None
-        and primary_pct == 0
-        and weekly_pct == 0
-        and primary_reset > 0
-        and not limit_reached
-    ):
-        return {
-            "window": "uninitialized_seat",
-            "resets_at": int(time.time() + 86400),
-            "quota_info": quota_info,
-            "limit_reached": False,
-            "needs_codex_smoke": True,
-            "no_quota_signals": ["workspace_uninitialized"],
-        }
 
     primary_exhausted = primary_pct >= 100
     weekly_exhausted = weekly_pct >= 100
@@ -1596,222 +1561,10 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     }
 
 
-# Round 7 FR-D6 — manager 24h 去重 cheap_codex_smoke。
-# 同一 account_id 在 24h 内重复调用 cheap_codex_smoke 时,直接返回上次落盘的结果,
-# 不再走网络。R2 风险缓解(fresh seat 命中率 > 5% 时 smoke 调用密度爆炸)。
-_CODEX_SMOKE_DEDUP_SECONDS = 86400
-
-
-def _read_codex_smoke_cache(account_id):
-    """从 accounts.json 读 last_codex_smoke_at + last_smoke_result。
-
-    匹配规则:account_id 优先按 workspace_account_id 比对,其次 email 比对。
-    返回 (epoch_at, result_str) 或 None(无 account_id / 无记录 / 字段缺失)。
-    """
-    if not account_id:
-        return None
-    try:
-        from autoteam.accounts import load_accounts
-
-        accounts = load_accounts()
-    except Exception:
-        return None
-    target = str(account_id)
-    for acc in accounts:
-        if acc.get("workspace_account_id") == target or acc.get("email") == target:
-            ts = acc.get("last_codex_smoke_at")
-            res = acc.get("last_smoke_result")
-            if ts and res:
-                try:
-                    return (float(ts), str(res))
-                except (TypeError, ValueError):
-                    return None
-    return None
-
-
-def _write_codex_smoke_cache(account_id, result):
-    """落盘 last_codex_smoke_at + last_smoke_result,用于 24h 去重。
-
-    匹配规则同 _read_codex_smoke_cache。result 取值 alive/auth_invalid/uncertain。
-    任何异常静默吞,cache 失败不阻塞主流程。
-    """
-    if not account_id or not result:
-        return
-    try:
-        from autoteam.accounts import load_accounts, update_account
-    except Exception:
-        return
-    target = str(account_id)
-    try:
-        accounts = load_accounts()
-    except Exception:
-        return
-    for acc in accounts:
-        if acc.get("workspace_account_id") == target or acc.get("email") == target:
-            try:
-                update_account(
-                    acc["email"],
-                    last_codex_smoke_at=time.time(),
-                    last_smoke_result=str(result),
-                )
-            except Exception as exc:
-                logger.debug("[Codex smoke] cache 落盘失败(忽略): %s", exc)
-            return
-
-
-def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0, force=False):
-    """SPEC-2 shared/quota-classification §4.4 — uninitialized_seat 二次验证。
-
-    对 codex backend 发一个最小推理请求(reasoning.effort=none + max_output_tokens=1 + stream),
-    只读第一帧 SSE 立即关流,不消耗多余 token。
-
-    Round 7 FR-D6:24h 去重 cache。account_id 在 24h 内已有 cache 时直接返回,不走网络;
-    传 force=True 可绕过 cache(用于强制刷新场景)。
-
-    返回 (result, detail):
-        ("alive", None)              — HTTP 200 + 第一帧含 response.created → 真活号
-        ("auth_invalid", reason)     — HTTP 401/403/429 / 4xx 含 quota 关键词 → token/seat 真失效
-        ("uncertain", reason)        — HTTP 5xx / network / timeout / 解析异常 → 保留原状态等下轮
-        cache 命中时 detail 为 "cache_hit_<原 result>"
-    """
-    if not access_token:
-        return "auth_invalid", "empty_access_token"
-
-    if not account_id:
-        try:
-            account_id = get_chatgpt_account_id()
-        except Exception:
-            account_id = None
-
-    # Round 7 FR-D6 — 24h 去重 cache 命中直接返回(force=True 时绕过)
-    if not force and account_id:
-        cached = _read_codex_smoke_cache(account_id)
-        if cached:
-            cached_at, cached_result = cached
-            if (time.time() - cached_at) < _CODEX_SMOKE_DEDUP_SECONDS:
-                logger.debug(
-                    "[Codex smoke] 24h cache 命中 account_id=%s result=%s age=%.0fs",
-                    account_id,
-                    cached_result,
-                    time.time() - cached_at,
-                )
-                return cached_result, f"cache_hit_{cached_result}"
-
-    # cache miss / force=True — 调网络并写回 cache
-    result, detail = _cheap_codex_smoke_network(access_token, account_id, timeout=timeout)
-    _write_codex_smoke_cache(account_id, result)
-    return result, detail
-
-
-def _cheap_codex_smoke_network(access_token, account_id, *, timeout=15.0):
-    """实际走网络的 cheap_codex_smoke 内部函数(Round 7 FR-D6 拆出)。
-
-    与 cheap_codex_smoke 不同点:不查也不写 cache,直接调 codex backend。
-    返回值语义同 cheap_codex_smoke。
-    """
-    import requests
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
-    if account_id:
-        headers["Chatgpt-Account-Id"] = account_id
-
-    payload = {
-        "model": "gpt-5",
-        "input": "ping",
-        "max_output_tokens": 1,
-        "stream": True,
-        "reasoning": {"effort": "none"},
-    }
-
-    try:
-        resp = requests.post(
-            _CODEX_SMOKE_ENDPOINT,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=timeout,
-        )
-    except (
-        requests.exceptions.ConnectionError,
-        requests.exceptions.Timeout,
-        requests.exceptions.SSLError,
-    ) as exc:
-        logger.warning("[Codex smoke] 网络异常(uncertain): %s", exc)
-        return "uncertain", f"network:{type(exc).__name__}"
-    except Exception as exc:
-        logger.warning("[Codex smoke] 未知异常(uncertain): %s", exc)
-        return "uncertain", f"exception:{type(exc).__name__}"
-
-    try:
-        status_code = resp.status_code
-        if status_code in (401, 403, 429):
-            try:
-                resp.close()
-            except Exception:
-                pass
-            return "auth_invalid", f"http_{status_code}"
-
-        if 500 <= status_code < 600:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            return "uncertain", f"http_{status_code}"
-
-        if status_code != 200:
-            # 4xx 非 401/403/429:body 含 quota 关键词视为 auth_invalid;否则 uncertain
-            try:
-                body_preview = (resp.text or "").lower()[:1500]
-            except Exception:
-                body_preview = ""
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if any(hint in body_preview for hint in _CODEX_SMOKE_QUOTA_HINTS):
-                return "auth_invalid", f"http_{status_code}_quota_hint"
-            return "uncertain", f"http_{status_code}"
-
-        # HTTP 200 — 读 SSE 第一帧
-        try:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                if "response.created" in line:
-                    return "alive", None
-                # 安全兜底:读取多于 8 行仍未见 response.created 视为 uncertain
-        except Exception as exc:
-            logger.debug("[Codex smoke] iter_lines 异常(uncertain): %s", exc)
-            return "uncertain", f"stream:{type(exc).__name__}"
-        finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
-
-        return "uncertain", "no_response_created_frame"
-    finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
-
-
 def check_codex_quota(access_token, account_id=None):
     """
     通过 /backend-api/wham/usage 查询 Codex 额度状态，不消耗额度。
-    返回:
-        ("ok", quota_info)         — HTTP 200 + 成功解析,额度未触发上限
-        ("exhausted", info)        — HTTP 200 + quota 用尽(get_quota_exhausted_info 命中)
-        ("auth_error", None)       — **仅** HTTP 401/403,token/seat 真失效
-        ("network_error", None)    — DNS/timeout/SSL/连接异常 / 5xx / 429 / json 解析失败 / 其他临时错误
-
-    auth_error 与 network_error 必须严格区分:auth_error 会触发"标记 AUTH_INVALID/重登"等
-    破坏性流程,网络抖动绝不能落入该分支(否则一次网络故障可能批量误删账号)。
+    返回 ("ok", quota_info) | ("exhausted", exhausted_info) | ("auth_error", None)
     quota_info = {"primary_pct": int, "primary_resets_at": int, "weekly_pct": int, "weekly_resets_at": int}
     """
     import requests
@@ -1832,98 +1585,35 @@ def check_codex_quota(access_token, account_id=None):
             headers=headers,
             timeout=30,
         )
-    except (
-        requests.exceptions.ConnectionError,
-        requests.exceptions.Timeout,
-        requests.exceptions.SSLError,
-    ) as e:
-        logger.warning("[Codex] 网络异常(归类 network_error): %s", e)
-        return "network_error", None
-    except requests.exceptions.RequestException as e:
-        # 其他 requests 异常(ChunkedEncodingError 等)同样归为 network_error,而不是 auth_error
-        logger.warning("[Codex] requests 异常(归类 network_error): %s", e)
-        return "network_error", None
     except Exception as e:
-        # 兜底:未知异常宁可归 network_error,避免因为一次网络抖动批量误标 AUTH_INVALID
-        logger.warning("[Codex] 未知异常(归类 network_error,保守处理): %s", e)
-        return "network_error", None
+        logger.error("[Codex] 请求异常: %s", e)
+        return "auth_error", None
 
     if resp.status_code in (401, 403):
         return "auth_error", None
 
-    # 429 限流 / 5xx 服务端错误 → 临时性故障,归为 network_error,不动账号 status
-    if resp.status_code == 429 or 500 <= resp.status_code < 600:
-        logger.warning("[Codex] wham/usage 临时错误 %d(归类 network_error): %s", resp.status_code, resp.text[:200])
-        return "network_error", None
-
     if resp.status_code != 200:
-        # 4xx(非 401/403/429) 也归为 network_error:可能是 OpenAI 接口在调整,
-        # 不能因为一次接口变更把全部账号误判 token 失效
-        logger.warning("[Codex] wham/usage 非预期状态 %d(归类 network_error): %s", resp.status_code, resp.text[:200])
-        return "network_error", None
+        logger.error("[Codex] wham/usage 异常: %d %s", resp.status_code, resp.text[:200])
+        return "auth_error", None
 
     try:
         data = resp.json()
-    except Exception as e:
-        logger.warning("[Codex] wham/usage 响应 JSON 解析失败(归类 network_error): %s", e)
-        return "network_error", None
+    except Exception:
+        return "auth_error", None
 
     rate_limit = data.get("rate_limit") or {}
     primary = rate_limit.get("primary_window") or {}
     secondary = rate_limit.get("secondary_window") or {}
 
-    # SPEC-2 shared/quota-classification §2.2 — 扩 primary_total / primary_remaining,
-    # 让 get_quota_exhausted_info 能区分 no_quota(workspace 未分配)与 exhausted(已用完)
-    primary_total_raw = primary.get("limit", primary.get("total"))
-    primary_remaining_raw = primary.get("remaining")
     quota_info = {
         "primary_pct": primary.get("used_percent", 0),
         "primary_resets_at": primary.get("reset_at", 0),
-        "primary_total": primary_total_raw if isinstance(primary_total_raw, (int, float)) else None,
-        "primary_remaining": primary_remaining_raw if isinstance(primary_remaining_raw, (int, float)) else None,
         "weekly_pct": secondary.get("used_percent", 0),
         "weekly_resets_at": secondary.get("reset_at", 0),
-        # Round 7 P2.5:把 wham/usage 的原始 rate_limit + primary_window 子树注入 quota_info,
-        # 让 manager 在 record_failure(no_quota_assigned) 时能附 raw_rate_limit 用于事后排查。
-        "raw_rate_limit": rate_limit,
-        "primary_window": primary,
     }
-
-    # SPEC-2 shared/quota-classification §4.2 — no_quota 单独分支:rate_limit 字段
-    # 完全缺失 / primary_window 缺失也归 no_quota(空载也是无配额信号)
-    rate_limit_missing = (not rate_limit) or (not primary)
-    if rate_limit_missing:
-        return "no_quota", {
-            "window": "no_quota",
-            "resets_at": int(time.time() + 86400),
-            "quota_info": quota_info,
-            "limit_reached": False,
-            "no_quota_signals": ["rate_limit_or_primary_missing"],
-            "raw_rate_limit": rate_limit,
-        }
 
     exhausted_info = get_quota_exhausted_info(quota_info, limit_reached=bool(rate_limit.get("limit_reached")))
     if exhausted_info:
-        # window="no_quota" 是 get_quota_exhausted_info 内部短路出的形态;独立分类返回
-        if exhausted_info.get("window") == "no_quota":
-            return "no_quota", exhausted_info
-        # window="uninitialized_seat"(I5)— Round 6 PRD-5 FR-P0:必须用 cheap_codex_smoke 二次验证
-        if exhausted_info.get("window") == "uninitialized_seat":
-            smoke_result, smoke_detail = cheap_codex_smoke(access_token, account_id=account_id)
-            exhausted_info["last_smoke_result"] = smoke_result
-            if smoke_detail is not None:
-                exhausted_info["last_smoke_detail"] = smoke_detail
-            if smoke_result == "alive":
-                # fresh seat 真活,token 有效 → 维持 ok,但带 smoke_verified 标记
-                quota_info_verified = dict(quota_info)
-                quota_info_verified["smoke_verified"] = True
-                quota_info_verified["last_smoke_result"] = "alive"
-                return "ok", quota_info_verified
-            if smoke_result == "auth_invalid":
-                # codex backend 401/403/quota → 当作真 auth_error,触发 reconcile 重登
-                return "auth_error", None
-            # uncertain (5xx/network/timeout) → 保持原状态等下轮,归 network_error
-            return "network_error", None
         return "exhausted", exhausted_info
 
     return "ok", quota_info

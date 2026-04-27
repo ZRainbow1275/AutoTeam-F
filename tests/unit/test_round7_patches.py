@@ -80,6 +80,7 @@ class TestFastApiLifespanIntegration:
 
     def test_app_lifespan_is_asynccontext(self):
         import inspect
+
         from autoteam.api import app_lifespan
         # asynccontextmanager 装饰器返回的对象有 __wrapped__,且原函数是 async generator
         wrapped = getattr(app_lifespan, "__wrapped__", None)
@@ -98,6 +99,7 @@ class TestFastApiLifespanIntegration:
 
     def test_startup_via_testclient(self):
         from fastapi.testclient import TestClient
+
         from autoteam.api import app
         client = TestClient(app)
         with client:
@@ -169,8 +171,9 @@ class TestCodexSmoke24hDedup:
 
     def test_cache_hit_skips_network(self):
         # mock _read_codex_smoke_cache 返回新鲜 cache → cheap_codex_smoke 不应调网络
-        import autoteam.codex_auth as ca
         import time as _time
+
+        import autoteam.codex_auth as ca
 
         fresh = (_time.time() - 60, "alive")
         with patch.object(ca, "_read_codex_smoke_cache", return_value=fresh) as m_read, \
@@ -194,8 +197,9 @@ class TestCodexSmoke24hDedup:
         m_write.assert_called_once_with("acc_miss", "alive")
 
     def test_cache_expiry_after_24h_calls_network(self):
-        import autoteam.codex_auth as ca
         import time as _time
+
+        import autoteam.codex_auth as ca
 
         stale = (_time.time() - 86401, "alive")  # 24h+1s 前
         with patch.object(ca, "_read_codex_smoke_cache", return_value=stale), \
@@ -205,8 +209,9 @@ class TestCodexSmoke24hDedup:
         m_net.assert_called_once()
 
     def test_force_bypasses_cache(self):
-        import autoteam.codex_auth as ca
         import time as _time
+
+        import autoteam.codex_auth as ca
 
         fresh = (_time.time() - 60, "alive")
         with patch.object(ca, "_read_codex_smoke_cache", return_value=fresh) as m_read, \

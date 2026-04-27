@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # =====================================================================
 # P0 — TestUninitializedSeatI5
 # =====================================================================
@@ -216,6 +215,7 @@ class TestUninitializedSeatI5:
     def test_cheap_codex_smoke_network_error_returns_uncertain(self):
         """smoke ConnectionError → uncertain(避免一次抖动批量误标)。"""
         import requests
+
         from autoteam import codex_auth
 
         with patch("requests.post", side_effect=requests.exceptions.ConnectionError("boom")):
@@ -351,6 +351,7 @@ class TestPostAccountLogin409:
     def test_register_blocked_phone_returns_409_phone_required(self):
         """RegisterBlocked(is_phone=True) → HTTPException 409 phone_required + record_failure 落盘。"""
         from fastapi import HTTPException
+
         from autoteam import api as api_mod
         from autoteam.invite import RegisterBlocked
 
@@ -403,6 +404,7 @@ class TestPostAccountLogin409:
     def test_register_blocked_other_returns_409_register_blocked(self):
         """非 is_phone 的 RegisterBlocked → HTTPException 409 register_blocked(不再走 500)。"""
         from fastapi import HTTPException
+
         from autoteam.invite import RegisterBlocked
 
         def fake_login(*args, **kwargs):
