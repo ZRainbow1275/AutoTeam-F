@@ -4,11 +4,11 @@
 
 | 字段 | 内容 |
 |---|---|
-| 名称 | Master ChatGPT Team 母号订阅降级探针(三层判定 + 5min 缓存 + 触发位点矩阵) |
-| 版本 | v1.0 (2026-04-27 Round 8 — Master Team Subscription Expiry 修复) |
-| 主题归属 | `is_master_subscription_healthy()` 函数契约 + 三层探针 + 缓存策略 + 5 个触发位点 + 5 个误判缓解 |
-| 引用方 | PRD-7(Round 8 master-team-degrade-oauth-rejoin) / spec-2-account-lifecycle.md v1.5 §3.6 / FR-M1~M4(待 PRD-7 落地) |
-| 共因 | Round 8 PRD §1 外部根因 — `eligible_for_auto_reactivation: true` 等价 Stripe `cancel_at_period_end=true` 后周期已过 |
+| 名称 | Master ChatGPT Team 母号订阅降级探针(三层判定 + 5min 缓存 + 触发位点矩阵 + retroactive 重分类) |
+| 版本 | **v1.1 (2026-04-28 Round 9 — 加 §11 retroactive 5 触发点矩阵 + §12 grace 期 JWT 解析 + §13 M-I1 endpoint 守恒规约)** |
+| 主题归属 | `is_master_subscription_healthy()` 函数契约 + 三层探针 + 缓存策略 + 5 个触发位点 + 5 个误判缓解 + retroactive helper 5 触发点 + grace 期 JWT 解析 + endpoint 守恒 |
+| 引用方 | PRD-7(Round 8 master-team-degrade-oauth-rejoin) / Round 9 task `04-28-account-usability-state-correction` / spec-2-account-lifecycle.md v1.6 §3.7 / `./account-state-machine.md` v2.0 §4.4 / FR-M1~M4 / **AC-B1~AC-B8** |
+| 共因 | Round 8 PRD §1 外部根因 — `eligible_for_auto_reactivation: true` 等价 Stripe `cancel_at_period_end=true` 后周期已过;Round 9 共因 — retroactive helper 仅挂 cmd_reconcile 一处导致 stale-active |
 | 不在范围 | OAuth 显式选 personal workspace(见 [`./oauth-workspace-selection.md`](./oauth-workspace-selection.md)) / wham/usage 配额分类(见 [`./quota-classification.md`](./quota-classification.md)) / 自动续费 / 多母号支持(超 PRD-7 Out of Scope) |
 
 ---
@@ -595,7 +595,251 @@ def test_evidence_no_token_leak(tmp_path, monkeypatch):
 
 ---
 
-**文档结束。** 工程师据此可直接编写 `is_master_subscription_healthy` 函数 + 5 处接入 + 单测,无需额外决策。
+## 11. Retroactive 触发位点矩阵(v1.1 Round 9 新增)
+
+### 11.1 背景
+
+Round 8 落地 `_reconcile_master_degraded_subaccounts(*, dry_run)` 时**仅挂在 `cmd_reconcile`**(独立对账命令 / `POST /api/admin/reconcile`)路径,导致 server 启动 / sync / 后台巡检 / cmd_check / cmd_rotate 都不命中,UI 状态永远 stale。Round 9 task `04-28-account-usability-state-correction` 实测 4 个 xsuuhfn 子号在母号已 cancel 状态下仍标 active 即此根因。详见 `.trellis/tasks/04-28-account-usability-state-correction/research/account-live-probe.md` §3 + §5。
+
+### 11.2 helper 抽象(实施期目标)
+
+```python
+# src/autoteam/manager.py 或 src/autoteam/master_health.py
+def _apply_master_degraded_classification(
+    workspace_id: Optional[str] = None,
+    grace_until: Optional[float] = None,
+    *,
+    chatgpt_api: "ChatGPTTeamAPI" = None,
+    dry_run: bool = False,
+) -> dict:
+    """retroactive helper:把已降级母号 workspace 内子号重分类。
+
+    - 入参:
+        workspace_id  : 已降级母号 account_id;None → 内部从 master_health 探测
+        grace_until   : 子号 grace 期截止 epoch;None → 内部从 子号 JWT 解析
+        chatgpt_api   : 复用调用方实例,None 时按需 spawn(失败 silent)
+        dry_run       : True 时不写盘,只返回候选 list
+
+    - 行为:
+        1. 调 is_master_subscription_healthy(chatgpt_api)
+        2. reason == "subscription_cancelled" → 进入"前进"路径(ACTIVE/EXHAUSTED → GRACE / GRACE → STANDBY)
+        3. reason == "active"                  → 进入"撤回"路径(GRACE → ACTIVE,母号续费场景)
+        4. 其他 reason                          → return skipped
+        5. JWT 解析失败 / save_accounts 失败    → logger.warning + return partial,不抛(M-I1 守恒延伸)
+
+    - 返回:
+        {
+          "skipped_reason": Optional[str],
+          "marked_grace":   List[email],   # ACTIVE/EXHAUSTED → GRACE
+          "marked_standby": List[email],   # GRACE → STANDBY (grace 到期)
+          "reverted_active": List[email],  # GRACE → ACTIVE  (母号续费撤回)
+          "errors":         List[dict],    # 单 email 失败的明细,不传播异常
+        }
+    """
+```
+
+**与 Round 8 `_reconcile_master_degraded_subaccounts` 关系**:Round 9 实施期把后者改为 `_apply_master_degraded_classification` 的薄 wrapper(`cmd_reconcile` 的 RT-6 入口仍用旧名透传),不破坏 round-8 既有调用契约。
+
+### 11.3 5 触发点矩阵(完整)
+
+| # | 入口 | 文件:函数 | 调用时机 | 失败行为 | 对应 AC |
+|---|---|---|---|---|---|
+| **RT-1** | `app_lifespan` | `api.py:app_lifespan` | `ensure_auth_file_permissions()` 之后 / `_auto_check_loop` 启动之前 / 后台线程,失败不阻塞 yield | logger.warning,继续启动;不抛 | AC-B1 |
+| **RT-2** | `_auto_check_loop` 末尾 | `api.py:_auto_check_loop` | 每个 interval 循环末尾(在 cmd_rotate / 巡检计算后)| 同上 | AC-B1 / AC-B2 |
+| **RT-3** | `cmd_check` / `_reconcile_team_members` 末尾 | `manager.py:_reconcile_team_members` | return result 之前,复用同一 chatgpt_api | logger.warning + result["master_degraded_retroactive_error"]=str(exc),不让对账主流程失败 | AC-B1 / AC-B2 |
+| **RT-4** | `sync_account_states` 末尾 | `manager.py:sync_account_states` | save_accounts 之后(无论 changed 与否),复用 chatgpt_api | 同上 | AC-B1 / AC-B2 |
+| **RT-5** | `cmd_rotate` 末尾 | `manager.py:cmd_rotate` 5/5 步之后 | 主巡检 sync→check→fill→quota_recovery→rotate 完成后 | 同上 | AC-B2 |
+| RT-6(已有) | `cmd_reconcile` 末尾 | `manager.py:cmd_reconcile` | round-8 既有,改为复用 helper | (现行不变) | (Round-8 已覆盖) |
+
+### 11.4 retroactive helper 与 master_health cache 联动
+
+- helper **必须**走 `is_master_subscription_healthy(...)` cache(默认 5min TTL)以避免每个触发点都打一次 `/backend-api/accounts`;
+- `cache_ttl=300` 默认即可,**不需要** `force_refresh=True` 除非:
+  - `/api/admin/master-health?force_refresh=1` 显式传入(Round 9 不变);
+  - 母号续费 webhook 落地后(Round 9 暂不实施)。
+- helper 内部对 `chatgpt_api` 实例的态度:
+  - 调用方传入 → 直接复用,**不**主动 stop;
+  - 调用方未传入 → spawn 一次 ChatGPTTeamAPI,probe 完调 `stop()`(失败吞掉)。
+
+### 11.5 串行/并发约束
+
+| 约束 | 说明 |
+|---|---|
+| RT-1 启动时机 | lifespan **不**与 `_auto_check_loop` 抢 `_playwright_lock`;RT-1 后台线程内部 `try/except` 包死 |
+| RT-2~RT-5 复用 chatgpt_api | 调用方拿到的 chatgpt_api 已 start();helper 不再 start/stop;失败仅 warning |
+| RT-1 与 RT-3/RT-4 重叠场景 | server 重启后 30s 内同时落 RT-1 与首次 sync RT-4 — 第二次会命中 master_health cache,不发 HTTP,无重复 KICK 风险(I12 也保 GRACE 不被 KICK) |
+| 多线程写 accounts.json | `_apply_master_degraded_classification` 内每个 `update_account` 都走 `save_accounts` 同款 file-lock,不会 race condition |
+
+### 11.6 单元测试覆盖期望
+
+| 测试 | 说明 |
+|---|---|
+| `test_retroactive_helper_lifespan_hook` | mock master_health 为 subscription_cancelled,启动 lifespan,等后台线程跑完,断言 4 个 xsuuhfn 状态从 ACTIVE → DEGRADED_GRACE |
+| `test_retroactive_helper_grace_expiry` | 设 acc.grace_until = past_epoch,调 helper,断言 GRACE → STANDBY |
+| `test_retroactive_helper_master_recovered_revert` | mock master_health 从 cancelled 转 active,且 acc 是 GRACE,断言 GRACE → ACTIVE |
+| `test_retroactive_helper_no_kick_on_grace` | reconcile 路径下断言 GRACE 子号不会被 KICK / state flip(I12) |
+| `test_retroactive_helper_jwt_decode_failure_silent` | mock JWT decode 抛异常,断言 helper 返回 partial 不传播异常 |
+| `test_retroactive_helper_save_accounts_failure_silent` | mock save_accounts 抛 IOError,断言不影响调用方主流程 |
+
+---
+
+## 12. Grace 期处理(v1.1 Round 9 新增)
+
+### 12.1 grace_until 的来源 — 子号 JWT id_token
+
+子号 OAuth bundle 的 `id_token`(JWT)payload 内含 `https://api.openai.com/auth.chatgpt_subscription_active_until` 字段(实测 Round 9 §1.2),格式 ISO-8601 UTC 字符串(如 `"2026-05-25T12:06:23+00:00"`)。该字段**仅 plan_type=team 子号有**;personal/free 子号该字段为 null/缺失 — 与 grace 概念无关。
+
+### 12.2 grace_until 解析契约
+
+```python
+# src/autoteam/master_health.py 或 utils
+import base64, json, datetime as dt
+from typing import Optional
+
+def parse_grace_until_from_auth_file(auth_file_path: str) -> Optional[float]:
+    """从子号 auth_file 的 id_token JWT 解析 chatgpt_subscription_active_until。
+
+    返回:
+      - epoch seconds(float) 当字段存在且解析成功
+      - None 当 auth_file 不存在 / id_token 缺失 / 字段缺失 / 解析失败
+    永不抛异常。
+    """
+    try:
+        data = json.loads(Path(auth_file_path).read_text())
+        id_token = data.get("id_token") or data.get("tokens", {}).get("id_token")
+        if not id_token:
+            return None
+        # JWT payload 是中段(base64url-encoded JSON,无填充)
+        parts = id_token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        active_until_str = (
+            payload.get("https://api.openai.com/auth", {})
+                   .get("chatgpt_subscription_active_until")
+        )
+        if not active_until_str:
+            return None
+        return dt.datetime.fromisoformat(
+            active_until_str.replace("Z", "+00:00")
+        ).timestamp()
+    except Exception:
+        return None
+```
+
+### 12.3 grace 判定决策表
+
+helper 拿到 `(workspace_id, master_health=cancelled)` 后,对每个候选子号:
+
+| 输入条件 | 决策 |
+|---|---|
+| acc.workspace_account_id != workspace_id | 跳过(不属于此降级母号) |
+| acc.status not in {ACTIVE, EXHAUSTED, DEGRADED_GRACE} | 跳过(状态机不允许进 GRACE) |
+| acc.auth_file 缺失 | 跳过(无 JWT 可解,记 warning) |
+| `parse_grace_until_from_auth_file()` 返回 None | 跳过(JWT 解析失败,保守不动) |
+| acc.status ∈ {ACTIVE, EXHAUSTED} **且** now < grace_until | → DEGRADED_GRACE,落 grace_until / grace_marked_at / master_account_id_at_grace |
+| acc.status == DEGRADED_GRACE **且** now >= acc.grace_until | → STANDBY,清空 grace_*(到期降级) |
+| acc.status == DEGRADED_GRACE **且** master_health 转 healthy 且 acc.master_account_id_at_grace == 当前 account_id | → ACTIVE,清空 grace_*(撤回) |
+| acc.status ∈ {ACTIVE, EXHAUSTED} **且** now >= grace_until | → STANDBY(grace 已过,直接降级,跳过 GRACE 中间态) |
+
+### 12.4 grace_until 守恒规约
+
+- 一旦写入 `acc.grace_until`,**禁止**被业务路径(invite / OAuth / reinvite / sync / quota_check)清空;
+- 仅在退出 GRACE 状态(转 STANDBY / ACTIVE / PERSONAL / deleted)时由 helper 显式清空;
+- 字段值与 `acc.master_account_id_at_grace` 是**对儿**关系,撤回路径若 `master_account_id_at_grace` 与当前 account_id 不一致,优先按 STANDBY 处理(可能母号已被切换)。
+
+---
+
+## 13. M-I1 endpoint 守恒规约(v1.1 Round 9 新增)
+
+### 13.1 现状(Round 9 实测 bug)
+
+研究 §2.2 实测 `/api/admin/master-health` 直接调返回 **HTTP 500**。源头:`api.py:1024-1054 get_admin_master_health._do` 仅 wrap 了 `is_master_subscription_healthy(api, force_refresh=...)` 但**未 wrap `api.start()` / `api.stop()` 阶段**的异常。该路径下函数自身 M-I1 不变量(永不抛)虽保,但在 endpoint 外层被破坏。
+
+### 13.2 endpoint 守恒契约
+
+`/api/admin/master-health` 任何场景都**永不返回 5xx**,失败统一映射到 `(False, "auth_invalid" | "network_error", evidence)` 业务返回值。
+
+实施期改造点(`api.py:get_admin_master_health`):
+
+```python
+@app.get("/api/admin/master-health")
+def get_admin_master_health(force_refresh: bool = False):
+    """M-I1 endpoint 守恒 — 任何场景永不抛 5xx。"""
+    def _do():
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        from autoteam.master_health import is_master_subscription_healthy
+        api = None
+        try:
+            api = ChatGPTTeamAPI()
+            api.start()
+        except Exception as exc:
+            # ★ Round 9 必修:start() 失败映射 auth_invalid + 200 OK
+            return {
+                "healthy": False,
+                "reason": "auth_invalid",
+                "evidence": {
+                    "http_status": None,
+                    "detail": f"chatgpt_api_start_failed: {exc!s}",
+                    "cache_hit": False,
+                    "probed_at": time.time(),
+                },
+            }
+        try:
+            healthy, reason, evidence = is_master_subscription_healthy(
+                api, force_refresh=bool(force_refresh)
+            )
+            return {"healthy": healthy, "reason": reason, "evidence": evidence}
+        except Exception as exc:
+            # ★ Round 9 必修:probe 失败映射 network_error + 200 OK(双保险)
+            return {
+                "healthy": False,
+                "reason": "network_error",
+                "evidence": {
+                    "http_status": None,
+                    "detail": f"probe_unexpected_exception: {exc!s}",
+                    "cache_hit": False,
+                    "probed_at": time.time(),
+                },
+            }
+        finally:
+            try:
+                if api is not None:
+                    api.stop()
+            except Exception:
+                pass
+
+    return _pw_executor.run(_do)  # _pw_executor 保留,避免 event loop 阻塞
+```
+
+### 13.3 守恒边界
+
+| 边界 | 是否可返回 5xx |
+|---|---|
+| `_pw_executor.run` 调度异常 | 不可控 — 可保留;但需要 logger.error 留痕便于诊断 |
+| 函数内任何 `Exception` | **不可** — 必须映射 200 OK + 业务字段 |
+| FastAPI 自身校验失败(query param 类型错) | 422 是 FastAPI 原生行为,不算违反守恒 |
+
+### 13.4 single source of truth
+
+- `is_master_subscription_healthy()` 函数**自身**永不抛(M-I1 不变量);
+- `/api/admin/master-health` endpoint 自身**永不返回 5xx**(本节 §13 守恒);
+- `/api/admin/diagnose` 已有的 try/except wrap(Round 8 实施)继续保留;
+- M-T1~T5 触发位点的 record_failure 路径不变。
+
+### 13.5 单测覆盖期望
+
+| 测试 | 说明 |
+|---|---|
+| `test_master_health_endpoint_chatgpt_api_start_failure` | mock `ChatGPTTeamAPI.start()` 抛 RuntimeError,断言 endpoint 200 OK + body.reason == "auth_invalid" |
+| `test_master_health_endpoint_probe_exception` | mock `is_master_subscription_healthy` 抛 ValueError,断言 endpoint 200 OK + body.reason == "network_error" |
+| `test_master_health_endpoint_force_refresh_query_param` | 用 `?force_refresh=1`,断言函数收到 `force_refresh=True` |
+| `test_master_health_endpoint_pw_executor_failure_observable` | mock `_pw_executor.run` 抛异常,断言 logger.error 至少 1 次记录(可保留 5xx,但必须留痕) |
+
+---
+
+**文档结束。** 工程师据此可直接编写 `is_master_subscription_healthy` 函数 + 5 处接入 + retroactive helper(5 触发点)+ M-I1 endpoint 守恒 + 单测,无需额外决策。
 
 ---
 
@@ -604,3 +848,4 @@ def test_evidence_no_token_leak(tmp_path, monkeypatch):
 | 版本 | 时间 | 变更 |
 |---|---|---|
 | v1.0 | 2026-04-27 Round 8 | 初版 — 三层探针(L1 主 / L2 反推 / L3 副)+ 5 触发位点(M-T1~T5)+ 5min cache + 5 误判缓解(FN-A~E + FP-A~E)+ 10 不变量(M-I1~I10)。源自 `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/research/master-subscription-probe.md` §1-§7。配套 PRD-7 Approach A R1 母号订阅探针落地。 |
+| **v1.1** | **2026-04-28 Round 9** — 加 retroactive 5 触发点 + grace 期 + endpoint 守恒。(1) §0 元数据 bump,引用方加 Round 9 task / spec-2 v1.6 / state-machine v2.0 / AC-B1~AC-B8;(2) **新增 §11 Retroactive 触发位点矩阵** — 抽 helper `_apply_master_degraded_classification(workspace_id, grace_until)` 5 触发点 RT-1~RT-5(lifespan / `_auto_check_loop` / `cmd_check` / `sync_account_states` / `cmd_rotate`)+ RT-6 既有(cmd_reconcile),全部走 5min cache,失败 logger.warning 不阻塞调用方;(3) **新增 §12 Grace 期处理** — `parse_grace_until_from_auth_file()` 从子号 JWT id_token `chatgpt_subscription_active_until` 解析 grace_until + 决策表 7 行(进入 GRACE / 转 STANDBY / 撤回 ACTIVE / 跳过路径)+ grace_until 守恒规约(仅 helper 退出态时清空);(4) **新增 §13 M-I1 endpoint 守恒** — `/api/admin/master-health` 永不返回 5xx,`ChatGPTTeamAPI.start()` 失败映射 auth_invalid 200 OK,probe 异常映射 network_error 200 OK,双保险 try/except,4 个单测覆盖。Round 8 既有 §1~§10 内容(M-T1~T5 / M-I1~I10 / 三层探针 / 5min cache)不变。配套 Round 9 task `04-28-account-usability-state-correction` Approach B 决策(ADR-lite)落地。 |

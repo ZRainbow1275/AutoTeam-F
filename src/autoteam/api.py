@@ -39,6 +39,32 @@ async def app_lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("[启动] 修复 auths 认证文件权限失败: %s", exc)
 
+    # Round 9 RT-1 — 启动时跑 1 次 retroactive 重分类,解 "重启后 stale active" 根因。
+    # spec/shared/master-subscription-health.md v1.1 §11.3。
+    # 默认 ON,设 STARTUP_RETROACTIVE_DISABLE=1 关闭。后台线程跑,失败仅 warning。
+    if os.getenv("STARTUP_RETROACTIVE_DISABLE", "").strip().lower() not in ("1", "true", "yes"):
+        def _startup_retroactive():
+            try:
+                from autoteam.master_health import _apply_master_degraded_classification
+
+                retro = _apply_master_degraded_classification()
+                if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+                    logger.info(
+                        "[启动-retroactive] GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                        len(retro.get("marked_grace") or []),
+                        len(retro.get("marked_standby") or []),
+                        len(retro.get("reverted_active") or []),
+                    )
+                elif retro and retro.get("skipped_reason"):
+                    logger.info("[启动-retroactive] skipped: %s", retro["skipped_reason"])
+            except Exception as exc:
+                logger.warning("[启动-retroactive] 异常(不阻塞启动): %s", exc)
+
+        try:
+            threading.Thread(target=_startup_retroactive, daemon=True).start()
+        except Exception as exc:
+            logger.warning("[启动-retroactive] 后台线程启动失败: %s", exc)
+
     thread = threading.Thread(target=_auto_check_loop, daemon=True)
     thread.start()
     try:
@@ -1016,41 +1042,94 @@ def get_admin_diagnose():
 def get_admin_master_health(request: Request):
     """Round 8 — 母号订阅健康度独立端点。
 
+    Round 9 SPEC v1.1 §13 endpoint 守恒:任何场景**永不返回 5xx**,
+    全部异常映射到 200 OK + business field(reason='auth_invalid' / 'network_error')。
+
     查询参数:
         force_refresh=1 → 跳过 5min cache 直接重测
     返回 is_master_subscription_healthy() 的完整 (healthy, reason, evidence) 三元组。
     UI 用于"立即重测"按钮。
     """
-    from autoteam.chatgpt_api import ChatGPTTeamAPI
-    from autoteam.master_health import is_master_subscription_healthy
-
     force_refresh = str(request.query_params.get("force_refresh", "")).strip().lower() in (
         "1", "true", "yes",
     )
 
     def _do():
-        api = ChatGPTTeamAPI()
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        from autoteam.master_health import is_master_subscription_healthy
+
+        api = None
         try:
-            api.start()
-            healthy, reason, evidence = is_master_subscription_healthy(
-                api, force_refresh=force_refresh,
-            )
-            return {
-                "healthy": healthy,
-                "reason": reason,
-                "evidence": evidence,
-                "force_refresh": force_refresh,
-            }
+            try:
+                api = ChatGPTTeamAPI()
+                api.start()
+            except Exception as exc:
+                # spec §13.2 — start() 失败映射 auth_invalid 200 OK
+                logger.warning("[master-health] ChatGPTTeamAPI start failed: %s", exc)
+                return {
+                    "healthy": False,
+                    "reason": "auth_invalid",
+                    "evidence": {
+                        "http_status": None,
+                        "detail": f"chatgpt_api_start_failed:{type(exc).__name__}",
+                        "cache_hit": False,
+                        "probed_at": time.time(),
+                    },
+                    "force_refresh": force_refresh,
+                }
+            try:
+                healthy, reason, evidence = is_master_subscription_healthy(
+                    api, force_refresh=force_refresh,
+                )
+                return {
+                    "healthy": healthy,
+                    "reason": reason,
+                    "evidence": evidence,
+                    "force_refresh": force_refresh,
+                }
+            except Exception as exc:
+                # spec §13.2 — probe 双保险,is_master_subscription_healthy 自身永不抛,
+                # 这里兜底把任何意外异常映射 network_error 200 OK
+                logger.warning(
+                    "[master-health] probe unexpected exception: %s", exc,
+                )
+                return {
+                    "healthy": False,
+                    "reason": "network_error",
+                    "evidence": {
+                        "http_status": None,
+                        "detail": f"probe_unexpected_exception:{type(exc).__name__}",
+                        "cache_hit": False,
+                        "probed_at": time.time(),
+                    },
+                    "force_refresh": force_refresh,
+                }
         finally:
             try:
-                api.stop()
+                if api is not None:
+                    api.stop()
             except Exception:
                 pass
 
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行"))
     try:
-        return _pw_executor.run(_do)
+        try:
+            return _pw_executor.run(_do)
+        except Exception as exc:
+            # spec §13.3 — _pw_executor 调度异常兜底,仍按 endpoint 守恒返回 200
+            logger.error("[master-health] _pw_executor.run failed: %s", exc)
+            return {
+                "healthy": False,
+                "reason": "network_error",
+                "evidence": {
+                    "http_status": None,
+                    "detail": f"executor_failed:{type(exc).__name__}",
+                    "cache_hit": False,
+                    "probed_at": time.time(),
+                },
+                "force_refresh": force_refresh,
+            }
     finally:
         _playwright_lock.release()
 
@@ -2387,49 +2466,51 @@ def post_fill(params: TaskParams = TaskParams()):
                 ),
             )
 
-        # Round 8 — SPEC-2 v1.5 M-T3:fill-personal 入口先验母号订阅(5min cache,read-only)。
-        # cancel 状态下整批 fill 必拿 plan_type=team,直接 503 fail-fast 不启动 task。
-        try:
-            from autoteam.chatgpt_api import ChatGPTTeamAPI
-            from autoteam.master_health import is_master_subscription_healthy
+    # Round 8 M-T3 + Round 9 AC-B4 — fill 任务起点统一 master probe,Team / Personal 都 fail-fast。
+    # cancel 状态下整批 fill 必拿 plan_type=team,直接 503 fail-fast 不启动 task。
+    try:
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        from autoteam.master_health import is_master_subscription_healthy
 
-            def _probe_master():
-                api = ChatGPTTeamAPI()
+        def _probe_master():
+            api = ChatGPTTeamAPI()
+            try:
+                api.start()
+                return is_master_subscription_healthy(api)
+            finally:
                 try:
-                    api.start()
-                    return is_master_subscription_healthy(api)
-                finally:
-                    try:
-                        api.stop()
-                    except Exception:
-                        pass
+                    api.stop()
+                except Exception:
+                    pass
 
-            if _playwright_lock.acquire(blocking=False):
-                try:
-                    healthy, reason, evidence = _pw_executor.run(_probe_master)
-                finally:
-                    _playwright_lock.release()
-                if not healthy and reason == "subscription_cancelled":
-                    raise HTTPException(
-                        status_code=503,
-                        detail={
-                            "error": "master_subscription_degraded",
-                            "reason": reason,
-                            "evidence": evidence,
-                            "message": (
-                                "母号 ChatGPT Team 订阅已 cancel(eligible_for_auto_reactivation=true),"
-                                "fill-personal 必拿 plan_type=team。请先续订或更换母号"
-                            ),
-                        },
-                    )
-            else:
-                # playwright 锁拿不到 → 别阻塞 fill-personal,放行让任务自身的 M-T1 兜底
-                pass
-        except HTTPException:
-            raise
-        except Exception:
-            # probe 异常按 spec §6.1 不阻塞 — M-T1 在 _run_post_register_oauth 兜底
+        if _playwright_lock.acquire(blocking=False):
+            try:
+                healthy, reason, evidence = _pw_executor.run(_probe_master)
+            finally:
+                _playwright_lock.release()
+            if not healthy and reason == "subscription_cancelled":
+                msg = (
+                    "母号 ChatGPT Team 订阅已 cancel(eligible_for_auto_reactivation=true),"
+                    "fill 必拿 plan_type=team / free。请先续订或更换母号"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "master_subscription_degraded",
+                        "reason": reason,
+                        "evidence": evidence,
+                        "message": msg,
+                        "leave_workspace": params.leave_workspace,
+                    },
+                )
+        else:
+            # playwright 锁拿不到 → 别阻塞 fill,放行让任务自身的 M-T1 / M-T2 兜底
             pass
+    except HTTPException:
+        raise
+    except Exception:
+        # probe 异常按 spec §6.1 不阻塞 — M-T1 / M-T2 在 _run_post_register_oauth 兜底
+        pass
 
     command = "fill-personal" if params.leave_workspace else "fill"
     task = _start_task(
@@ -2671,6 +2752,22 @@ def _auto_check_loop():
 
         except Exception as e:
             logger.error("[巡检] 巡检异常: %s", e)
+
+        # Round 9 RT-2 — 后台巡检每 interval 跑一次 retroactive(走 5min cache,失败 warning)。
+        # spec/shared/master-subscription-health.md v1.1 §11.3。
+        try:
+            from autoteam.master_health import _apply_master_degraded_classification
+
+            retro = _apply_master_degraded_classification()
+            if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+                logger.info(
+                    "[巡检] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                    len(retro.get("marked_grace") or []),
+                    len(retro.get("marked_standby") or []),
+                    len(retro.get("reverted_active") or []),
+                )
+        except Exception as exc:
+            logger.warning("[巡检] retroactive helper 异常: %s", exc)
 
 
 class AutoCheckConfig(BaseModel):

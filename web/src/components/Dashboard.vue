@@ -1,145 +1,169 @@
 <template>
-  <div v-if="status">
-    <!-- 统计卡片 -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+  <div v-if="status" class="space-y-6">
+    <!-- F3 Master health banner -->
+    <MasterHealthBanner
+      :master-health="masterHealth"
+      :min-grace-until="minGraceUntil"
+      :loading="masterHealthBusy"
+      @refresh="onRefreshMasterHealth" />
+
+    <!-- F6 Pool health card -->
+    <PoolHealthCard
+      :accounts="status.accounts || []"
+      :master-health="masterHealth"
+      :min-grace-until="minGraceUntil" />
+
+    <!-- 状态分布卡片(色彩区分明显) -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-3">
       <div v-for="card in cards" :key="card.label"
-        class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-        <div class="text-sm text-gray-400">{{ card.label }}</div>
-        <div class="text-3xl font-bold mt-1" :class="card.color">{{ card.value }}</div>
+        class="glass-soft rounded-xl p-3.5 lift-hover relative overflow-hidden">
+        <div class="absolute top-0 right-0 w-16 h-16 rounded-full opacity-20 blur-xl pointer-events-none"
+          :style="{ background: card.glow }"></div>
+        <div class="text-[10px] uppercase tracking-widest text-gray-500 font-semibold flex items-center gap-1.5">
+          <span class="w-1 h-1 rounded-full" :style="{ background: card.dot }"></span>
+          {{ card.label }}
+        </div>
+        <div class="text-3xl font-extrabold mt-1.5 tabular leading-none" :class="card.color">{{ card.value }}</div>
       </div>
     </div>
 
     <!-- 账号表格 -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-      <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between gap-3 flex-wrap">
-        <h2 class="text-lg font-semibold text-white">账号列表</h2>
+    <div class="glass rounded-2xl overflow-hidden">
+      <div class="px-5 py-4 border-b border-white/[0.04] flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h2 class="text-base font-bold text-white tracking-tight">账号列表</h2>
+          <p class="text-[11px] text-gray-500 mt-0.5">{{ status.accounts?.length || 0 }} 个账号 · 实时配额来自 quota_cache</p>
+        </div>
         <div class="flex items-center gap-2">
-          <button
-            v-if="selectedEmails.length"
-            @click="batchDelete"
-            :disabled="actionDisabled || batchDeleting"
-            class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-            :class="actionDisabled || batchDeleting
-              ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-              : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
-            {{ batchDeleting ? `批量删除中 ${batchProgress}` : `批量删除 (${selectedEmails.length})` }}
-          </button>
-          <button
-            v-if="selectedEmails.length"
-            @click="clearSelection"
-            class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs rounded-lg border border-gray-700 text-gray-400 hover:text-white transition">
+          <AtButton v-if="selectedEmails.length"
+            variant="danger" size="sm" :loading="batchDeleting" :disabled="actionDisabled"
+            confirm @click="batchDelete">
+            <template #icon>
+              <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="currentColor" d="M5 6v6h1V6H5zm2 0v6h1V6H7zm2 0v6h1V6H9zm2 0v6h1V6h-1zM4 4l1-2h6l1 2h2v1H2V4h2zm1 1v9a2 2 0 002 2h2a2 2 0 002-2V5H5z"/></svg>
+            </template>
+            {{ batchDeleting ? `批量删除 ${batchProgress}` : `批量删除 (${selectedEmails.length})` }}
+          </AtButton>
+          <AtButton v-if="selectedEmails.length" variant="ghost" size="sm" @click="clearSelection">
             取消选择
-          </button>
-          <button @click="syncAccounts" :disabled="syncing"
-            class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs rounded-lg border border-gray-700 transition disabled:opacity-50 text-gray-400 hover:text-white">
-            {{ syncing ? '同步中...' : '同步账号' }}
-          </button>
+          </AtButton>
+          <AtButton variant="secondary" size="sm" :loading="syncing" @click="syncAccounts">
+            <template #icon>
+              <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="none" stroke="currentColor" stroke-width="1.6" d="M3 8a5 5 0 018.5-3.5L13 3M13 8a5 5 0 01-8.5 3.5L3 13M13 3v3h-3M3 13v-3h3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </template>
+            {{ syncing ? '同步中…' : '同步账号' }}
+          </AtButton>
         </div>
       </div>
-      <div v-if="message" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border" :class="messageClass">
+
+      <div v-if="message" class="mx-5 mt-4 px-4 py-2.5 rounded-xl text-sm border animate-rise" :class="messageClass">
         {{ message }}
       </div>
-      <div v-if="!adminReady" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border bg-amber-500/10 text-amber-300 border-amber-500/20">
-        请先在「设置」页完成管理员登录后，才能操作账号。
+      <div v-if="!adminReady"
+        class="mx-5 mt-4 px-4 py-2.5 rounded-xl text-sm border bg-amber-500/10 text-amber-300 border-amber-500/30">
+        请先在「设置」页完成管理员登录后,才能操作账号。
       </div>
+
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
-            <tr class="text-gray-400 text-left border-b border-gray-800">
-              <th class="px-3 py-3 font-medium w-8">
+            <tr class="text-gray-500 text-left border-b border-white/[0.04] text-[10px] uppercase tracking-widest">
+              <th class="px-3 py-3 font-semibold w-8">
                 <input
                   type="checkbox"
                   :checked="allSelectableChecked"
                   :indeterminate.prop="someSelectableChecked"
                   @change="toggleSelectAll"
                   :disabled="!selectableEmails.length"
-                  class="accent-rose-500 cursor-pointer"
+                  class="accent-indigo-500 cursor-pointer w-3.5 h-3.5"
                   title="全选/取消全选(主号除外)" />
               </th>
-              <th class="px-4 py-3 font-medium">#</th>
-              <th class="px-4 py-3 font-medium">邮箱</th>
-              <th class="px-4 py-3 font-medium">状态</th>
-              <th class="px-4 py-3 font-medium text-right">5h 剩余</th>
-              <th class="px-4 py-3 font-medium text-right">周 剩余</th>
-              <th class="px-4 py-3 font-medium">5h 重置</th>
-              <th class="px-4 py-3 font-medium">周 重置</th>
-              <th class="px-4 py-3 font-medium text-right">操作</th>
+              <th class="px-3 py-3 font-semibold">#</th>
+              <th class="px-4 py-3 font-semibold">邮箱</th>
+              <th class="px-4 py-3 font-semibold">状态</th>
+              <th class="px-4 py-3 font-semibold">实际可用</th>
+              <th class="px-4 py-3 font-semibold text-right">5h 剩余</th>
+              <th class="px-4 py-3 font-semibold text-right">周 剩余</th>
+              <th class="px-4 py-3 font-semibold">5h 重置</th>
+              <th class="px-4 py-3 font-semibold">周 重置</th>
+              <th class="px-4 py-3 font-semibold text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="(acc, i) in status.accounts" :key="acc.email"
-              class="border-b border-gray-800/50 hover:bg-gray-800/30 transition"
-              :class="isSelected(acc.email) ? 'bg-rose-500/5' : ''">
-              <td class="px-3 py-3">
+              class="row-hoverable border-b border-white/[0.03] hover:bg-white/[0.02] group"
+              :class="isSelected(acc.email) ? 'bg-indigo-500/[0.05]' : ''">
+              <td class="px-3 py-3.5">
                 <input
                   v-if="!acc.is_main_account"
                   type="checkbox"
                   :checked="isSelected(acc.email)"
                   @change="toggleSelect(acc.email)"
-                  class="accent-rose-500 cursor-pointer" />
+                  class="accent-indigo-500 cursor-pointer w-3.5 h-3.5" />
               </td>
-              <td class="px-4 py-3 text-gray-500">{{ i + 1 }}</td>
-              <td class="px-4 py-3 font-mono text-xs">{{ acc.email }}</td>
-              <td class="px-4 py-3">
-                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium"
-                  :class="statusClass(acc.status)">
-                  <span class="w-1.5 h-1.5 rounded-full" :class="dotClass(acc.status)"></span>
-                  {{ statusLabel(acc.status) }}
-                </span>
+              <td class="px-3 py-3.5 text-gray-600 font-mono text-xs">{{ String(i + 1).padStart(2, '0') }}</td>
+              <td class="px-4 py-3.5">
+                <div class="flex items-center gap-2">
+                  <span v-if="acc.is_main_account"
+                    class="text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5 rounded
+                           bg-gradient-to-br from-indigo-500/30 to-violet-500/30 text-indigo-100 border border-indigo-400/30">
+                    Master
+                  </span>
+                  <span class="font-mono text-[12px] text-gray-100">{{ acc.email }}</span>
+                </div>
               </td>
-              <td class="px-4 py-3 text-right font-mono" :class="pctColor(quota(acc, 'primary'))">
+              <td class="px-4 py-3.5">
+                <StatusBadge :status="acc.status" :grace-until="acc.grace_until" />
+              </td>
+              <td class="px-4 py-3.5">
+                <UsabilityCell :account="acc" />
+              </td>
+              <td class="px-4 py-3.5 text-right font-mono tabular text-[12px]" :class="pctColor(quota(acc, 'primary'))">
                 {{ quotaPct(acc, 'primary') }}
               </td>
-              <td class="px-4 py-3 text-right font-mono" :class="pctColor(quota(acc, 'weekly'))">
+              <td class="px-4 py-3.5 text-right font-mono tabular text-[12px]" :class="pctColor(quota(acc, 'weekly'))">
                 {{ quotaPct(acc, 'weekly') }}
               </td>
-              <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'primary') }}</td>
-              <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'weekly') }}</td>
-              <td class="px-4 py-3 text-right space-x-2">
-                <!-- 缺认证标识：personal 账号没有 auth_file → 在补登录按钮旁提示 -->
-                <span
-                  v-if="acc.status === 'personal' && !acc.auth_file"
-                  class="inline-block px-2 py-0.5 mr-1 rounded text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30"
-                  title="未拿到 Codex auth_file，请点击补登录">
-                  缺认证
-                </span>
-                <button
-                  v-if="canLogin(acc)"
-                  @click="loginAccount(acc.email)"
-                  :disabled="actionDisabled || actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="actionDisabled || actionEmail === acc.email
-                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-                    : 'bg-blue-600/10 text-blue-400 border-blue-500/30 hover:bg-blue-600/20'">
-                  {{ actionEmail === acc.email && actionType === 'login' ? '登录中...' : loginLabel(acc) }}
-                </button>
-                <button
-                  v-if="!acc.is_main_account && acc.status === 'active'"
-                  @click="kickAccount(acc.email)"
-                  :disabled="actionDisabled || actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="actionDisabled || actionEmail === acc.email
-                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-                    : 'bg-amber-600/10 text-amber-400 border-amber-500/30 hover:bg-amber-600/20'">
-                  {{ actionEmail === acc.email && actionType === 'kick' ? '移出中...' : '移出' }}
-                </button>
-                <button
-                  v-if="acc.status === 'active' || acc.status === 'personal' || acc.is_main_account"
-                  @click="exportCodexAuth(acc.email)"
-                  :disabled="actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition bg-cyan-600/10 text-cyan-400 border-cyan-500/30 hover:bg-cyan-600/20">
-                  导出
-                </button>
-                <button
-                  v-if="!acc.is_main_account"
-                  @click="removeAccount(acc.email)"
-                  :disabled="actionDisabled || actionEmail === acc.email"
-                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
-                  :class="actionDisabled || actionEmail === acc.email
-                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-                    : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
-                  {{ actionEmail === acc.email && actionType === 'delete' ? '删除中...' : '删除' }}
-                </button>
+              <td class="px-4 py-3.5 text-gray-500 font-mono text-[11px]">{{ quotaReset(acc, 'primary') }}</td>
+              <td class="px-4 py-3.5 text-gray-500 font-mono text-[11px]">{{ quotaReset(acc, 'weekly') }}</td>
+              <td class="px-4 py-3.5 text-right">
+                <div class="flex items-center justify-end gap-1.5 flex-wrap">
+                  <span v-if="acc.status === 'personal' && !acc.auth_file"
+                    class="inline-block px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide
+                           bg-amber-500/10 text-amber-300 border border-amber-500/30"
+                    title="未拿到 Codex auth_file,请点击补登录">
+                    缺认证
+                  </span>
+                  <AtButton v-if="canLogin(acc)"
+                    variant="primary" size="sm"
+                    :loading="actionEmail === acc.email && actionType === 'login'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'login')"
+                    @click="loginAccount(acc.email)">
+                    {{ loginLabel(acc) }}
+                  </AtButton>
+                  <AtButton v-if="!acc.is_main_account && acc.status === 'active'"
+                    variant="secondary" size="sm"
+                    :loading="actionEmail === acc.email && actionType === 'kick'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'kick')"
+                    @click="kickAccount(acc.email)">
+                    移出
+                  </AtButton>
+                  <AtButton v-if="acc.status === 'active' || acc.status === 'personal' || acc.is_main_account"
+                    variant="ghost" size="sm"
+                    :disabled="actionEmail === acc.email"
+                    @click="exportCodexAuth(acc.email)">
+                    <template #icon>
+                      <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="currentColor" d="M8 1l3 3h-2v5H7V4H5l3-3zM3 12v-2h1v2h8v-2h1v2a1 1 0 01-1 1H4a1 1 0 01-1-1z"/></svg>
+                    </template>
+                    导出
+                  </AtButton>
+                  <AtButton v-if="!acc.is_main_account"
+                    variant="danger" size="sm" confirm
+                    :loading="actionEmail === acc.email && actionType === 'delete'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'delete')"
+                    @click="removeAccount(acc.email)">
+                    删除
+                  </AtButton>
+                </div>
               </td>
             </tr>
           </tbody>
@@ -147,47 +171,46 @@
       </div>
 
       <!-- 注册失败明细 -->
-      <div class="mt-6 bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div class="border-t border-white/[0.04] p-5 bg-black/10">
         <div class="flex items-center justify-between mb-3">
           <div>
-            <h2 class="text-lg font-semibold text-white">注册失败明细</h2>
-            <div class="text-xs text-gray-500 mt-0.5">未能入池的注册尝试会写在这里（add-phone / duplicate / OAuth 失败等）</div>
+            <h2 class="text-sm font-bold text-white tracking-tight">注册失败明细</h2>
+            <div class="text-[11px] text-gray-500 mt-0.5">未能入池的注册尝试 (add-phone / duplicate / OAuth 失败 等)</div>
           </div>
-          <button @click="loadFailures" :disabled="failuresLoading"
-            class="px-3 py-1.5 rounded-lg text-xs border bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700 transition">
-            {{ failuresLoading ? '加载中...' : '刷新' }}
-          </button>
+          <AtButton variant="ghost" size="sm" :loading="failuresLoading" @click="loadFailures">
+            刷新
+          </AtButton>
         </div>
-        <div v-if="failuresCounts && Object.keys(failuresCounts).length" class="flex flex-wrap gap-2 mb-3 text-xs">
+        <div v-if="failuresCounts && Object.keys(failuresCounts).length" class="flex flex-wrap gap-1.5 mb-3 text-[11px]">
           <span v-for="(cnt, cat) in failuresCounts" :key="cat"
-            class="px-2 py-1 rounded border bg-gray-800 border-gray-700 text-gray-300">
-            {{ cat }}: <span class="text-rose-400 font-mono">{{ cnt }}</span>
+            class="px-2 py-0.5 rounded-md border bg-white/[0.02] border-white/[0.06] text-gray-300">
+            {{ cat }}: <span class="text-rose-300 font-mono ml-0.5 tabular">{{ cnt }}</span>
           </span>
         </div>
-        <div class="overflow-x-auto">
+        <div class="overflow-x-auto rounded-xl border border-white/[0.04]">
           <table class="w-full text-sm">
-            <thead class="text-xs text-gray-500 border-b border-gray-800">
+            <thead class="text-[10px] uppercase tracking-widest text-gray-500 border-b border-white/[0.04] bg-white/[0.01]">
               <tr>
-                <th class="text-left px-3 py-2">时间</th>
-                <th class="text-left px-3 py-2">邮箱</th>
-                <th class="text-left px-3 py-2">类别</th>
-                <th class="text-left px-3 py-2">原因</th>
-                <th class="text-left px-3 py-2">附加</th>
+                <th class="text-left px-3 py-2 font-semibold">时间</th>
+                <th class="text-left px-3 py-2 font-semibold">邮箱</th>
+                <th class="text-left px-3 py-2 font-semibold">类别</th>
+                <th class="text-left px-3 py-2 font-semibold">原因</th>
+                <th class="text-left px-3 py-2 font-semibold">附加</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-gray-800/60 text-xs">
+            <tbody class="divide-y divide-white/[0.03] text-xs">
               <tr v-if="!failuresItems.length">
-                <td class="px-3 py-4 text-gray-500" colspan="5">暂无失败记录</td>
+                <td class="px-3 py-4 text-gray-600 italic" colspan="5">暂无失败记录</td>
               </tr>
-              <tr v-for="(f, idx) in failuresItems" :key="idx">
-                <td class="px-3 py-2 text-gray-400 font-mono">{{ fmtTs(f.timestamp) }}</td>
+              <tr v-for="(f, idx) in failuresItems" :key="idx" class="hover:bg-white/[0.02]">
+                <td class="px-3 py-2 text-gray-500 font-mono">{{ fmtTs(f.timestamp) }}</td>
                 <td class="px-3 py-2 text-gray-300 font-mono">{{ f.email || '-' }}</td>
                 <td class="px-3 py-2">
-                  <span class="px-2 py-0.5 rounded border text-[11px]"
+                  <span class="px-1.5 py-0.5 rounded-md border text-[10px] font-semibold uppercase tracking-wide"
                     :class="failureCategoryClass(f.category)">{{ f.category }}</span>
                 </td>
                 <td class="px-3 py-2 text-gray-400">{{ f.reason }}</td>
-                <td class="px-3 py-2 text-gray-500 font-mono text-[11px]">{{ fmtFailureExtra(f) }}</td>
+                <td class="px-3 py-2 text-gray-600 font-mono text-[10px]">{{ fmtFailureExtra(f) }}</td>
               </tr>
             </tbody>
           </table>
@@ -195,43 +218,41 @@
       </div>
 
       <!-- Codex 认证导出弹窗 -->
-      <div v-if="exportData" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" @click.self="exportData = null">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
-          <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-            <h3 class="text-white font-semibold">Codex CLI 认证文件</h3>
-            <button @click="exportData = null" class="text-gray-400 hover:text-white text-lg">&times;</button>
+      <div v-if="exportData"
+        class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-rise"
+        @click.self="exportData = null">
+        <div class="glass rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+          <div class="px-5 py-4 border-b border-white/[0.04] flex items-center justify-between">
+            <h3 class="text-white font-bold tracking-tight">Codex CLI 认证文件</h3>
+            <button @click="exportData = null" class="text-gray-400 hover:text-white text-2xl leading-none transition">&times;</button>
           </div>
-          <div class="p-4 space-y-3 overflow-y-auto flex-1">
-            <div class="px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-sm text-amber-300 space-y-2">
-              <div class="font-medium">使用步骤：</div>
-              <ol class="list-decimal list-inside space-y-1 text-xs text-amber-400/90">
+          <div class="p-5 space-y-3 overflow-y-auto flex-1">
+            <div class="px-3 py-2.5 bg-amber-500/10 border border-amber-500/30 rounded-xl text-sm text-amber-200 space-y-2">
+              <div class="font-semibold">使用步骤:</div>
+              <ol class="list-decimal list-inside space-y-1 text-xs text-amber-300/90">
                 <li>退出当前 Codex CLI 会话</li>
-                <li>删除旧文件：<code class="bg-gray-800 px-1 rounded">rm ~/.codex/auth.json</code></li>
-                <li>将下方内容保存到 <code class="bg-gray-800 px-1 rounded">~/.codex/auth.json</code>（Windows: <code class="bg-gray-800 px-1 rounded">%APPDATA%\codex\auth.json</code>）</li>
+                <li>删除旧文件:<code class="bg-black/40 px-1 rounded">rm ~/.codex/auth.json</code></li>
+                <li>将下方内容保存到 <code class="bg-black/40 px-1 rounded">~/.codex/auth.json</code>(Windows: <code class="bg-black/40 px-1 rounded">%APPDATA%\codex\auth.json</code>)</li>
                 <li>重新启动 Codex CLI</li>
               </ol>
-              <div class="text-xs text-amber-400/60">导出后 Codex CLI 直连 OpenAI，不走 CPA 代理，响应更快。</div>
+              <div class="text-xs text-amber-300/60">导出后 Codex CLI 直连 OpenAI,不走 CPA 代理,响应更快。</div>
             </div>
             <div class="relative">
-              <pre class="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre">{{ exportJson }}</pre>
-              <button @click="copyExport"
-                class="absolute top-2 right-2 px-2 py-1 rounded border text-xs transition"
-                :class="copied
-                  ? 'bg-green-600/20 text-green-400 border-green-500/30'
-                  : 'bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white border-gray-700'">
-                {{ copied ? '复制成功' : '复制' }}
-              </button>
+              <pre class="bg-black/60 border border-white/[0.06] rounded-xl p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre">{{ exportJson }}</pre>
+              <AtButton :variant="copied ? 'primary' : 'secondary'" size="sm"
+                class="absolute top-2 right-2" @click="copyExport">
+                {{ copied ? '已复制' : '复制' }}
+              </AtButton>
             </div>
           </div>
-          <div class="px-4 py-3 border-t border-gray-800 flex justify-end gap-3">
-            <button @click="downloadExport"
-              class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
+          <div class="px-5 py-4 border-t border-white/[0.04] flex justify-end gap-2">
+            <AtButton variant="primary" @click="downloadExport">
+              <template #icon>
+                <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="currentColor" d="M8 11l-4-4h2.5V2h3v5H12L8 11zM3 13h10v1H3z"/></svg>
+              </template>
               下载 auth.json
-            </button>
-            <button @click="exportData = null"
-              class="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm text-gray-300 rounded-lg border border-gray-700 transition">
-              关闭
-            </button>
+            </AtButton>
+            <AtButton variant="secondary" @click="exportData = null">关闭</AtButton>
           </div>
         </div>
       </div>
@@ -241,26 +262,38 @@
   <!-- Loading skeleton -->
   <div v-else-if="loading" class="space-y-4">
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-      <div v-for="i in 4" :key="i" class="bg-gray-900 border border-gray-800 rounded-xl p-4 h-20 animate-pulse"></div>
+      <div v-for="i in 4" :key="i" class="glass-soft rounded-xl p-4 h-20 shimmer-bg"></div>
     </div>
-    <div class="bg-gray-900 border border-gray-800 rounded-xl h-64 animate-pulse"></div>
+    <div class="glass-soft rounded-2xl h-64 shimmer-bg"></div>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../api.js'
+import StatusBadge from './StatusBadge.vue'
+import UsabilityCell from './UsabilityCell.vue'
+import MasterHealthBanner from './MasterHealthBanner.vue'
+import PoolHealthCard from './PoolHealthCard.vue'
+import AtButton from './AtButton.vue'
+import {
+  quotaRemainingPct as _qr,
+  quotaPctText,
+  formatQuotaReset,
+  quotaPctColor,
+} from '../composables/useStatus.js'
+import { useToast } from '../composables/useToast.js'
+
+const toast = useToast()
 
 const props = defineProps({
   status: Object,
   loading: Boolean,
   runningTask: Object,
-  adminStatus: {
-    type: Object,
-    default: null,
-  },
+  adminStatus: { type: Object, default: null },
+  masterHealth: { type: Object, default: null },
 })
-const emit = defineEmits(['refresh'])
+const emit = defineEmits(['refresh', 'reload-master-health'])
 
 const actionEmail = ref('')
 const actionType = ref('')
@@ -269,6 +302,7 @@ const message = ref('')
 const exportData = ref(null)
 const copied = ref(false)
 const messageClass = ref('')
+const masterHealthBusy = ref(false)
 
 // 批量删除选中态:按邮箱(小写)保存,便于跨刷新复用
 const selectedSet = ref(new Set())
@@ -302,12 +336,13 @@ function fmtTs(ts) {
 
 function failureCategoryClass(cat) {
   const map = {
-    phone_blocked: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-    duplicate_exhausted: 'bg-orange-500/10 text-orange-400 border-orange-500/30',
-    register_failed: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
-    oauth_failed: 'bg-purple-500/10 text-purple-400 border-purple-500/30',
-    kick_failed: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30',
-    exception: 'bg-red-500/10 text-red-400 border-red-500/30',
+    phone_blocked: 'bg-rose-500/10 text-rose-300 border-rose-500/30',
+    duplicate_exhausted: 'bg-orange-500/10 text-orange-300 border-orange-500/30',
+    register_failed: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
+    oauth_failed: 'bg-purple-500/10 text-purple-300 border-purple-500/30',
+    kick_failed: 'bg-yellow-500/10 text-yellow-300 border-yellow-500/30',
+    exception: 'bg-red-500/10 text-red-300 border-red-500/30',
+    master_subscription_degraded: 'bg-orange-500/10 text-orange-300 border-orange-500/30',
   }
   return map[cat] || 'bg-gray-500/10 text-gray-400 border-gray-500/30'
 }
@@ -323,9 +358,9 @@ function fmtFailureExtra(f) {
 
 onMounted(loadFailures)
 watch(() => props.runningTask, (cur, prev) => {
-  // 有任务完成（从有到无）时自动刷新一次失败日志
   if (prev && !cur) loadFailures()
 })
+
 const adminReady = computed(() => !!props.adminStatus?.configured)
 const actionDisabled = computed(() => !!props.runningTask || !adminReady.value)
 
@@ -345,7 +380,6 @@ const someSelectableChecked = computed(() =>
 function isSelected(email) {
   return selectedSet.value.has((email || '').toLowerCase())
 }
-
 function toggleSelect(email) {
   const key = (email || '').toLowerCase()
   const next = new Set(selectedSet.value)
@@ -353,103 +387,50 @@ function toggleSelect(email) {
   else next.add(key)
   selectedSet.value = next
 }
-
 function toggleSelectAll() {
-  if (allSelectableChecked.value) {
-    selectedSet.value = new Set()
-  } else {
-    selectedSet.value = new Set(selectableEmails.value.map(e => e.toLowerCase()))
-  }
+  if (allSelectableChecked.value) selectedSet.value = new Set()
+  else selectedSet.value = new Set(selectableEmails.value.map(e => e.toLowerCase()))
 }
+function clearSelection() { selectedSet.value = new Set() }
 
-function clearSelection() {
-  selectedSet.value = new Set()
-}
+// Round 9 — 派生 minGraceUntil:从所有 GRACE 子号取最早到期者,banner/PoolHealthCard 共用
+const minGraceUntil = computed(() => {
+  let min = null
+  for (const acc of props.status?.accounts || []) {
+    if (acc.status === 'degraded_grace' && typeof acc.grace_until === 'number') {
+      if (min === null || acc.grace_until < min) min = acc.grace_until
+    }
+  }
+  return min
+})
 
 const cards = computed(() => {
   if (!props.status) return []
-  const s = props.status.summary
+  const s = props.status.summary || {}
+  const dg = s.degraded_grace ?? (props.status.accounts || []).filter(a => a.status === 'degraded_grace').length
   return [
-    { label: '活跃', value: s.active, color: 'text-green-400' },
-    { label: '待命', value: s.standby, color: 'text-yellow-400' },
-    { label: '额度用完', value: s.exhausted, color: 'text-red-400' },
-    { label: '免费号', value: s.personal || 0, color: 'text-fuchsia-400' },
-    { label: '总计', value: s.total, color: 'text-white' },
+    { label: 'Active', value: s.active || 0, color: 'text-emerald-300', dot: 'rgb(52, 211, 153)', glow: 'radial-gradient(circle, rgba(52, 211, 153, 0.45), transparent 60%)' },
+    { label: 'Standby', value: s.standby || 0, color: 'text-amber-300', dot: 'rgb(251, 191, 36)', glow: 'radial-gradient(circle, rgba(251, 191, 36, 0.40), transparent 60%)' },
+    { label: 'Grace', value: dg, color: 'text-orange-300', dot: 'rgb(251, 146, 60)', glow: 'radial-gradient(circle, rgba(251, 146, 60, 0.40), transparent 60%)' },
+    { label: 'Personal', value: s.personal || 0, color: 'text-violet-300', dot: 'rgb(167, 139, 250)', glow: 'radial-gradient(circle, rgba(167, 139, 250, 0.40), transparent 60%)' },
+    { label: 'Total', value: s.total || 0, color: 'text-white', dot: 'rgb(99, 102, 241)', glow: 'radial-gradient(circle, rgba(99, 102, 241, 0.45), transparent 60%)' },
   ]
 })
-
-function statusClass(s) {
-  return {
-    active: 'bg-green-500/10 text-green-400',
-    exhausted: 'bg-red-500/10 text-red-400',
-    standby: 'bg-yellow-500/10 text-yellow-400',
-    pending: 'bg-gray-500/10 text-gray-400',
-    personal: 'bg-fuchsia-500/10 text-fuchsia-400',
-    auth_invalid: 'bg-orange-500/10 text-orange-400',
-    orphan: 'bg-amber-500/10 text-amber-300',
-  }[s] || 'bg-gray-500/10 text-gray-400'
-}
-
-function dotClass(s) {
-  return {
-    active: 'bg-green-400',
-    exhausted: 'bg-red-400',
-    standby: 'bg-yellow-400',
-    pending: 'bg-gray-400',
-    personal: 'bg-fuchsia-400',
-    auth_invalid: 'bg-orange-400',
-    orphan: 'bg-amber-300',
-  }[s] || 'bg-gray-400'
-}
-
-function statusLabel(s) {
-  return {
-    active: 'Active',
-    exhausted: 'Used up',
-    standby: 'Standby',
-    pending: 'Pending',
-    personal: 'Personal',
-    auth_invalid: '认证失效',
-    orphan: '孤立',
-  }[s] || s
-}
 
 function quota(acc, type) {
   const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
   if (!qi) return null
-  const pct = type === 'primary' ? qi.primary_pct : qi.weekly_pct
-  return 100 - (pct || 0)
+  return _qr(qi, type)
 }
-
-function isNoQuota(acc) {
-  // SPEC-2 — primary_total=0 表示后端没分配配额(不是耗尽)。UI 上显示"无配额"
-  // 避免误读"100% 剩余"
-  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
-  if (!qi) return false
-  return qi.primary_total === 0 || qi.no_quota === true
-}
-
 function quotaPct(acc, type) {
-  if (type === 'primary' && isNoQuota(acc)) return '无配额'
-  const val = quota(acc, type)
-  return val !== null ? `${val}%` : '-'
+  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
+  return quotaPctText(qi, type)
 }
-
 function quotaReset(acc, type) {
   const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
-  if (!qi) return '-'
-  const ts = type === 'primary' ? qi.primary_resets_at : qi.weekly_resets_at
-  if (!ts) return '-'
-  const d = new Date(ts * 1000)
-  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return formatQuotaReset(qi, type)
 }
-
-function pctColor(val) {
-  if (val === null) return 'text-gray-500'
-  if (val > 30) return 'text-green-400'
-  if (val > 0) return 'text-yellow-400'
-  return 'text-red-400'
-}
+function pctColor(remain) { return quotaPctColor(remain) }
 
 const exportJson = computed(() => {
   if (!exportData.value) return ''
@@ -461,9 +442,7 @@ async function exportCodexAuth(email) {
     exportData.value = await api.getCodexAuth(email)
     copied.value = false
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
-    setTimeout(() => { message.value = '' }, 8000)
+    toast.error('导出失败', e.message)
   }
 }
 
@@ -471,127 +450,92 @@ async function copyExport() {
   try {
     await navigator.clipboard.writeText(exportJson.value)
   } catch {
-    // HTTP 下 clipboard API 不可用，用 textarea fallback
     const ta = document.createElement('textarea')
     ta.value = exportJson.value
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    document.body.removeChild(ta)
+    ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta)
   }
   copied.value = true
-  setTimeout(() => { copied.value = false }, 3000)
+  setTimeout(() => { copied.value = false }, 2400)
 }
 
 function downloadExport() {
   const blob = new Blob([exportJson.value], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  a.href = url
-  a.download = 'auth.json'
-  a.click()
+  a.href = url; a.download = 'auth.json'; a.click()
   URL.revokeObjectURL(url)
 }
 
 async function syncAccounts() {
   syncing.value = true
-  message.value = ''
   try {
     const result = await api.postSyncAccounts()
-    message.value = result.message || '同步完成'
-    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    toast.success('同步完成', result.message || '')
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('同步失败', e.message)
   } finally {
     syncing.value = false
-    setTimeout(() => { message.value = '' }, 8000)
   }
 }
 
 function canLogin(acc) {
-  // active 账号已经在 Team 里不需要再登录；personal + 已有 auth_file 也不需要
   if (acc.is_main_account) return false
   if (acc.status === 'active') return false
   if (acc.status === 'personal' && acc.auth_file) return false
+  if (acc.status === 'degraded_grace') return false // grace 期内仍可用,无需补登录
   return true
 }
-
 function loginLabel(acc) {
-  // personal 缺认证 / auth_invalid / orphan 都属于"需要补登录"语境
   if (acc.status === 'personal' || acc.status === 'auth_invalid' || acc.status === 'orphan') return '补登录'
   return '登录'
 }
 
 async function loginAccount(email) {
   if (actionDisabled.value) return
-
-  actionEmail.value = email
-  actionType.value = 'login'
-  message.value = ''
+  actionEmail.value = email; actionType.value = 'login'
   try {
     const result = await api.loginAccount(email)
-    message.value = `已提交 ${email} 的登录任务: ${result.task_id}`
-    messageClass.value = 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+    toast.success('登录任务已提交', `${email} · ${result.task_id}`)
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('提交登录任务失败', e.message)
   } finally {
-    actionEmail.value = ''
-    actionType.value = ''
-    setTimeout(() => { message.value = '' }, 8000)
+    actionEmail.value = ''; actionType.value = ''
   }
 }
 
 async function kickAccount(email) {
   if (actionDisabled.value) return
-
-  const ok = window.confirm(`确认将 ${email} 移出 Team？\n账号会变为 standby 状态，额度恢复后可重新复用。`)
+  const ok = window.confirm(`确认将 ${email} 移出 Team?\n账号会变为 standby 状态,额度恢复后可重新复用。`)
   if (!ok) return
-
-  actionEmail.value = email
-  actionType.value = 'kick'
-  message.value = ''
+  actionEmail.value = email; actionType.value = 'kick'
   try {
     const result = await api.kickAccount(email)
-    message.value = result.message || `已将 ${email} 移出 Team`
-    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    toast.success('已移出 Team', result.message || email)
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('移出失败', e.message)
   } finally {
-    actionEmail.value = ''
-    actionType.value = ''
-    setTimeout(() => { message.value = '' }, 8000)
+    actionEmail.value = ''; actionType.value = ''
   }
 }
 
 async function removeAccount(email) {
   if (actionDisabled.value) return
-
-  const ok = window.confirm(`确认删除账号 ${email}？\n这会同时清理本地记录、CPA、Team/Invite 和 CloudMail。`)
+  // 二次确认已在 AtButton(confirm) 内做了第一次,这里再用 native confirm 提示破坏性操作细节
+  const ok = window.confirm(`确认删除账号 ${email}?\n这会清理本地记录、CPA、Team/Invite 和 CloudMail。`)
   if (!ok) return
-
-  actionEmail.value = email
-  actionType.value = 'delete'
-  message.value = ''
+  actionEmail.value = email; actionType.value = 'delete'
   try {
     const result = await api.deleteAccount(email)
-    message.value = result.message || `已删除 ${email}`
-    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    toast.success('账号已删除', result.message || email)
     emit('refresh')
   } catch (e) {
-    message.value = e.message
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('删除失败', e.message)
   } finally {
-    actionEmail.value = ''
-    actionType.value = ''
-    setTimeout(() => { message.value = '' }, 8000)
+    actionEmail.value = ''; actionType.value = ''
   }
 }
 
@@ -599,38 +543,39 @@ async function batchDelete() {
   if (actionDisabled.value || batchDeleting.value) return
   const emails = selectedEmails.value
   if (!emails.length) return
-
   const preview = emails.slice(0, 8).join('\n')
-  const more = emails.length > 8 ? `\n...还有 ${emails.length - 8} 个` : ''
+  const more = emails.length > 8 ? `\n…还有 ${emails.length - 8} 个` : ''
   const ok = window.confirm(
-    `确认批量删除以下 ${emails.length} 个账号？这会清理本地记录、CPA、Team/Invite 和 CloudMail。\n\n${preview}${more}`
+    `确认批量删除以下 ${emails.length} 个账号?这会清理本地记录、CPA、Team/Invite 和 CloudMail。\n\n${preview}${more}`
   )
   if (!ok) return
-
-  batchDeleting.value = true
-  batchProgress.value = `0/${emails.length}`
-  message.value = ''
+  batchDeleting.value = true; batchProgress.value = `0/${emails.length}`
   try {
     const r = await api.deleteAccountsBatch(emails, true)
     const s = r?.summary || {}
     const failed = (r?.results || []).filter(x => !x.ok)
     if (failed.length === 0) {
-      message.value = `批量删除完成:成功 ${s.ok}/${s.total}`
-      messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+      toast.success('批量删除完成', `成功 ${s.ok}/${s.total}`)
     } else {
       const head = failed.slice(0, 3).map(x => `${x.email}: ${x.error}`).join('; ')
-      message.value = `批量删除部分失败(成功 ${s.ok}/${s.total}):${head}${failed.length > 3 ? ' …' : ''}`
-      messageClass.value = 'bg-amber-500/10 text-amber-300 border-amber-500/20'
+      toast.warn('批量删除部分失败', `成功 ${s.ok}/${s.total}; ${head}${failed.length > 3 ? ' …' : ''}`)
     }
     clearSelection()
     emit('refresh')
   } catch (e) {
-    message.value = `批量删除失败: ${e.message}`
-    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+    toast.error('批量删除失败', e.message)
   } finally {
-    batchDeleting.value = false
-    batchProgress.value = ''
-    setTimeout(() => { message.value = '' }, 12000)
+    batchDeleting.value = false; batchProgress.value = ''
+  }
+}
+
+async function onRefreshMasterHealth() {
+  masterHealthBusy.value = true
+  try {
+    emit('reload-master-health', true)
+    toast.info('已请求重测', '走 force_refresh,绕过 5min cache')
+  } finally {
+    setTimeout(() => { masterHealthBusy.value = false }, 1200)
   }
 }
 </script>

@@ -8,10 +8,10 @@
 | 名称 | 账号生命周期与配额加固 实施规范 |
 | 主笔 | prd-lifecycle |
 | 时间 | 2026-04-26 |
-| 版本 | v1.5 (2026-04-27 Round 8 — master subscription probe + oauth workspace/select 显式选 personal + sleep(8) 删除) |
-| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) · `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/prd.md` (Round 8 PRD-7 候选) |
-| 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) · [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) (Round 8 新增) · [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) (Round 8 新增) |
-| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** / **M1~M4 / W1~W5(Round 8)** |
+| 版本 | **v1.6 (2026-04-28 Round 9 — Account Usability + Retroactive State Correction;引用 state-machine v2.0(8 状态 + GRACE)+ master-subscription-health v1.1(retroactive 5 触发点 + grace 期 + endpoint 守恒);Approach B 决策落地)** |
+| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) · `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/prd.md` (Round 8 PRD-7) · **`.trellis/tasks/04-28-account-usability-state-correction/prd.md` (Round 9 task,Approach B + 前端美化)** |
+| 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) **v2.0(Round 9 BREAKING — STATUS_DEGRADED_GRACE)** · [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) **v1.1(Round 9 — §11 retroactive 5 触发点 + §12 grace 期 + §13 endpoint 守恒)** · [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) (Round 8) |
+| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** / **M1~M4 / W1~W5(Round 8)** / **AC-B1~AC-B8(Round 9 Approach B)** |
 
 ---
 
@@ -685,6 +685,119 @@ if use_personal:
 
 **与 §3.4.5 add-phone 探针的关系**:本流程**不**复用 `assert_not_blocked`(语义不同),且失败需要外层重试,因此**不抛**异常到 login_codex_via_browser 顶层,只返回 `(success, fail_category, evidence)` 三元组。
 
+### 3.4.8 Grace 期处理路径(Round 9 Approach B,AC-B1~B8)
+
+**位置**:`src/autoteam/manager.py:_apply_master_degraded_classification(workspace_id, grace_until)` 新 helper + 5 触发点接入。
+
+**契约**:retroactive 重分类母号已降级 workspace 内的子号 — ACTIVE/EXHAUSTED → DEGRADED_GRACE(grace 期内)/ DEGRADED_GRACE → STANDBY(grace 到期)/ DEGRADED_GRACE → ACTIVE(母号续费撤回)。state-machine v2.0 §4.4 / master-subscription-health v1.1 §11/§12 集中描述。
+
+#### 3.4.8.1 helper 抽象与签名
+
+详见 `./shared/master-subscription-health.md` v1.1 §11.2(完整 docstring + 返回 dict 结构);本节只列接入责任。
+
+#### 3.4.8.2 5 触发点接入(AC-B1)
+
+| # | 文件:函数 | 改动概要 | 行数 |
+|---|---|---|---|
+| **RT-1** | `api.py:app_lifespan` | 在 `ensure_auth_file_permissions()` 之后启动后台线程跑 1 次 helper(默认 ON,可由 `STARTUP_RETROACTIVE_DISABLE=1` 关闭);失败 logger.warning 不阻塞 yield | +15 |
+| **RT-2** | `api.py:_auto_check_loop` | 每个 interval 循环末尾调 1 次 helper,**不**自己 spawn ChatGPTTeamAPI(走 cache);失败 logger.warning | +10 |
+| **RT-3** | `manager.py:_reconcile_team_members` | return result 之前,复用同一 chatgpt_api 调 helper;result 字典加 `master_degraded_retroactive` 子键 | +20 |
+| **RT-4** | `manager.py:sync_account_states` | save_accounts 之后,复用 chatgpt_api 调 helper;失败仅 warning | +12 |
+| **RT-5** | `manager.py:cmd_rotate` | 5/5 步之后调 helper;走 cache 不发 HTTP | +8 |
+| RT-6(已有) | `manager.py:cmd_reconcile` | 改为 `_apply_master_degraded_classification` 薄 wrapper(原 `_reconcile_master_degraded_subaccounts` 透传) | -10 / +15 |
+
+#### 3.4.8.3 grace_until 解析接入(AC-B5)
+
+实现 `parse_grace_until_from_auth_file(auth_file_path)`(`master_health.py` 或 `manager.py` 末尾) — 详见 master-subscription-health v1.1 §12.2 完整代码。
+
+helper 内部循环每个候选子号时调一次,失败返回 None,helper 跳过该子号但不 abort 其他子号。
+
+#### 3.4.8.4 GRACE 状态机接入(AC-B1, AC-B2)
+
+引用 state-machine v2.0(`./shared/account-state-machine.md` v2.0):
+- §2.1 `STATUS_DEGRADED_GRACE = "degraded_grace"` 枚举(实施期 backend-implementer 在 `accounts.py:13-20` 区块加)
+- §2.2 AccountStatus Literal 增 `degraded_grace`
+- §2.2 AccountRecord 加 3 字段:`grace_until` / `grace_marked_at` / `master_account_id_at_grace`
+- §3.1 GRACE 子图 — 4 个进入 / 退出 transition
+- §4.3b 删除链短路扩 GRACE(account_ops.delete_managed_account / api.delete_accounts_batch 同步加 STATUS_DEGRADED_GRACE)
+- §4.4 转移规则三段(进入 / 退出 / 5 触发点矩阵)
+- §7 不变量 I10/I11/I12
+
+#### 3.4.8.5 fill-team M-T3 补全(AC-B4 + Round 8 backlog)
+
+研究 §4 / §6 P1 指出 fill-team 路径(`/api/tasks/fill {leave_workspace:false}`)无 master probe — Round 8 仅 fill-personal 有。Round 9 Approach B 补 fill-team:
+
+```python
+# api.py:fill_team_task 入口(对称 fill_personal_task,Round 8 落地)
+@app.post("/api/tasks/fill")
+def post_task_fill(req: FillTaskRequest):
+    if not req.leave_workspace:  # Team 分支
+        # ★ AC-B4 — Round 9 必修:fill-team 入口加 master probe
+        from autoteam.master_health import is_master_subscription_healthy
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        api_inst = ChatGPTTeamAPI()
+        try:
+            api_inst.start()
+            healthy, reason, evidence = is_master_subscription_healthy(api_inst)
+        finally:
+            try: api_inst.stop()
+            except Exception: pass
+        if not healthy and reason == "subscription_cancelled":
+            raise HTTPException(503, detail={
+                "error": "master_subscription_degraded",
+                "reason": reason,
+                "evidence": evidence,
+            })
+    # 现有 _start_task 逻辑保留
+```
+
+#### 3.4.8.6 master-health endpoint 守恒(AC-B3)
+
+详见 master-subscription-health v1.1 §13.2 完整代码。`api.py:get_admin_master_health` `_do()` 必须 wrap `ChatGPTTeamAPI.start()` 与 `is_master_subscription_healthy` 两段 try/except,失败映射 200 OK + reason='auth_invalid'/'network_error'。
+
+#### 3.4.8.7 数据契约影响
+
+- `accounts.json` 字段:`grace_until` / `grace_marked_at` / `master_account_id_at_grace`(参考 state-machine v2.0 §2.2)
+- `accounts/.master_health_cache.json` schema 不变(Round 8 v1.0 已定义)
+- `register_failures.json` 不新增 category(Round 8 已有 `master_subscription_degraded`)
+
+#### 3.4.8.8 调用方与 §3.7 / §3.4.7 的串联
+
+```
+fill-team / fill-personal 入口 (M-T3 / AC-B4)
+    │
+    ├── master degraded → 503,前端横幅
+    │
+    └── master healthy   → 进 OAuth (M-T1 / M-T2)
+                            │
+                            ├── personal 分支 → §3.4.7 workspace/select
+                            └── team     分支 → 既有路径
+
+后台 / 同步 / 巡检 (RT-1~RT-5)
+    │
+    └── 调 _apply_master_degraded_classification helper
+              │
+              ├── master cancelled + grace 期内 → ACTIVE/EXHAUSTED → GRACE
+              ├── GRACE + grace 已到期            → STANDBY
+              ├── GRACE + master 续费回 healthy   → ACTIVE (撤回)
+              └── helper 永不抛 (M-I1 / I11)
+```
+
+#### 3.4.8.9 单元测试期望(AC-B8)
+
+- `test_lifespan_retroactive_marks_grace`(RT-1 接入)
+- `test_sync_account_states_appends_retroactive`(RT-4 接入)
+- `test_cmd_check_appends_retroactive`(RT-3 接入)
+- `test_cmd_rotate_appends_retroactive`(RT-5 接入)
+- `test_grace_to_standby_on_expiry`(grace_until past)
+- `test_grace_revert_to_active_on_master_recovery`(撤回路径)
+- `test_grace_short_circuit_in_delete`(§4.3b state-machine v2.0)
+- `test_master_health_endpoint_never_5xx_on_start_failure`(§13)
+- `test_master_health_endpoint_never_5xx_on_probe_exception`(§13)
+- `test_fill_team_master_probe_503`(AC-B4)
+
+合计 ≥10 单测,与 PRD AC-B8(基线 260 + 新增 ≥10)对齐。
+
 ### 3.5 personal 删除链短路 fetch_team_state
 
 **文件**:`src/autoteam/account_ops.py:40-162` + `src/autoteam/api.py:1306-1404`
@@ -1352,3 +1465,4 @@ Phase 6 (灰度上线)
 | v1.3 | 2026-04-26 Round 6 quality-reviewer 终审 follow-up | §3.4.5 C-P4 探针位置描述对齐实施(`codex_auth.py:939`):由"`if use_personal:` 这行**之前**"修订为"callback for-loop 之后,`browser.close()` 之前,`_exchange_auth_code` 之前"。理由:`if use_personal:` 在 `browser.close()` 之后,page 已 close,assert_not_blocked 异常会被吞为 False。表格"插入位置"列 + 实施代码段全部对齐;落地状态由 ❌ 改为 ✅;同步规范 try/except 关 browser 后 raise 的资源释放要求。详见 `prompts/0426/verify/round6-review-report.md` §3.1 决策 1 审查 |
 | v1.4 | 2026-04-26 Round 7 P2 follow-up | (1) §3.4.1 PREFERRED_SEAT_TYPE 命名归一化:主名 `default`(默认) / `codex`,加 `chatgpt` 转移期别名(setter 接受并 normalize 为 default,getter 永不返 chatgpt);(2) §3.4.6 加 quota check 24h 去重接入说明(Round 7 FR-D6,详见 quota-classification §4.4 + I9);(3) §3.5.3 加 task["error"] 关键字契约(phone_required / register_blocked 字符串子串匹配,前端 api.js 模板);(4) 引用方加 PRD-6;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.1 / §5.6 / §5.7 |
 | v1.5 | 2026-04-27 Round 8 master-team-degrade-oauth-rejoin | (1) 元数据引用 shared spec 加 `master-subscription-health.md` + `oauth-workspace-selection.md` 两份新 shared,关联 PRD 加 Round 8 PRD-7,覆盖 FR 加 M1~M4 / W1~W5;(2) §1 文件清单追加 Round 8 14 个文件(含 4 个新 shared/test fixture);(3) §3.4.5 末尾加注 — `manager.py:1554-1556 time.sleep(8)` 同 round 8 删除,完整理由见 `oauth-workspace-selection.md §4.3` + W-I7 不变量;(4) 新增 §3.4.7 OAuth Personal Workspace 显式选择 — `ensure_personal_workspace_selected` 编排 / 3 失败分类(`oauth_workspace_select_no_personal` / `oauth_workspace_select_endpoint_error` / `oauth_plan_drift_persistent`)/ Team 路径不调 / 5 次重试外层在 manager;(5) 新增 §3.7 Master 母号订阅健康度探针 — 5 触发位点 M-T1~T5(personal/Team OAuth 入口、`/api/tasks/fill` 503、`/api/admin/diagnose` 扩、cmd_reconcile 入口),5min cache 文件 `accounts/.master_health_cache.json`,与 §3.4.7 串联(master health 是 personal 流程前置门控);(6) §4.1 新增 `accounts/.master_health_cache.json` schema 描述;(7) §4.3 RegisterFailureRecord enum 加 4 个 Round 8 category;(8) 关联 `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/research/{master-subscription-probe,oauth-personal-selection,sticky-rejoin-mechanism}.md` 三份研究;Approach A 决策原文见 PRD §"Decision (ADR-lite)" |
+| **v1.6** | **2026-04-28 Round 9 account-usability-state-correction(Approach B)** | (1) 元数据引用 shared spec bump:`account-state-machine.md` v2.0(BREAKING — STATUS_DEGRADED_GRACE 8 状态)+ `master-subscription-health.md` v1.1(§11 retroactive 5 触发点 + §12 grace 期 + §13 endpoint 守恒);关联 PRD 加 Round 9 task `04-28-account-usability-state-correction`;覆盖 FR 加 AC-B1~AC-B8。(2) 新增 §3.4.8 Grace 期处理路径 — 8 子节(helper 抽象 / 5 触发点接入 RT-1~RT-5 + RT-6 既有 / grace_until JWT 解析接入 / GRACE 状态机接入 / fill-team M-T3 补全 / master-health endpoint 守恒 / 数据契约影响 / 与 §3.7 / §3.4.7 串联 / 单元测试期望 ≥10 case);(3) Approach B 决策原文与 ADR-lite 见 Round 9 task PRD `Decision (ADR-lite)`;(4) **回归影响**:state-machine v2.0 是 BREAKING,round-1~8 测试 mock / 前端 status 字符串集合需扫 8 处(详见 state-machine v2.0 changelog 列表)— backend-implementer Stage 2a 实施期需在 PR 内一并修复,不允许遗留 round-1~8 测试因状态机扩展失败;(5) **未改动**:Round 8 既有 §3.4.7 / §3.7 / §3.5 / §3.6 / §4 / §5 / §6 / §7 全部保持,仅 §3.4.8 增量;§5/§6/§7 实施期通过引用 v2.0 / v1.1 联动覆盖,无需在本 spec 重复展开 |

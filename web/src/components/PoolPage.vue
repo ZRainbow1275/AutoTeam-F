@@ -1,47 +1,52 @@
 <template>
-  <div>
-    <h2 class="text-xl font-bold text-white mb-2">账号池操作</h2>
-    <p class="text-sm text-gray-400 mb-6">
-      这里集中放轮转、检查、补满、添加、清理等会直接影响账号池状态的操作。
-    </p>
-    <!-- Round 8 — master degraded 提示横幅(spec §6.4) -->
-    <div
-      v-if="masterHealth && masterHealth.healthy === false && masterHealth.reason === 'subscription_cancelled'"
-      class="mb-4 px-4 py-3 rounded-lg text-sm bg-red-500/10 text-red-300 border border-red-500/30"
-    >
-      母号 ChatGPT Team 订阅已 cancel,「生成免费号」按钮已禁用。请到「设置」页处理后再试。
+  <div class="space-y-5">
+    <!-- 标题 -->
+    <div>
+      <div class="text-[10px] uppercase tracking-[0.3em] text-indigo-300/70 mb-1">Pool Operations</div>
+      <h2 class="text-2xl font-extrabold text-white tracking-tight">账号池操作</h2>
+      <p class="text-sm text-gray-400 mt-1 max-w-2xl">
+        集中执行轮转、检查、补满、添加、清理等会直接影响账号池状态的动作。
+      </p>
     </div>
+
+    <!-- F3 Master health banner(共享 App 级数据) -->
+    <MasterHealthBanner
+      :master-health="masterHealth"
+      :min-grace-until="minGraceUntil"
+      :loading="false"
+      @refresh="$emit('reload-master-health', true)" />
+
     <TaskPanel
       mode="pool"
       :running-task="runningTask"
       :admin-status="adminStatus"
       :master-health="masterHealth"
       @task-started="$emit('task-started')"
-      @refresh="$emit('refresh')"
-    />
+      @refresh="$emit('refresh')" />
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
-import { api } from '../api.js'
+import { computed } from 'vue'
 import TaskPanel from './TaskPanel.vue'
+import MasterHealthBanner from './MasterHealthBanner.vue'
 
 const props = defineProps({
   runningTask: Object,
   adminStatus: Object,
+  masterHealth: { type: Object, default: null },
+  status: { type: Object, default: null },
 })
 
-defineEmits(['task-started', 'refresh'])
+defineEmits(['task-started', 'refresh', 'reload-master-health'])
 
-// Round 8 — 母号订阅健康度(走 5min cache 不强刷)
-const masterHealth = ref(null)
-onMounted(async () => {
-  if (!props.adminStatus?.configured) return
-  try {
-    masterHealth.value = await api.getMasterHealth(false)
-  } catch (e) {
-    console.error('加载母号健康度失败:', e)
+const minGraceUntil = computed(() => {
+  let min = null
+  for (const acc of props.status?.accounts || []) {
+    if (acc.status === 'degraded_grace' && typeof acc.grace_until === 'number') {
+      if (min === null || acc.grace_until < min) min = acc.grace_until
+    }
   }
+  return min
 })
 </script>

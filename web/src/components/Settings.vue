@@ -1,34 +1,19 @@
 <template>
-  <div class="mt-6 space-y-6">
-    <!-- Round 8 — 母号订阅健康度 banner(spec §6.4) -->
-    <div
-      v-if="masterHealth && masterHealth.healthy === false && masterHealth.reason === 'subscription_cancelled'"
-      class="bg-red-500/10 border border-red-500/30 rounded-xl p-4"
-    >
-      <div class="flex items-start justify-between gap-4">
-        <div class="flex-1">
-          <h2 class="text-base font-semibold text-red-300">母号 ChatGPT Team 订阅已 cancel</h2>
-          <p class="text-sm text-red-200/80 mt-1">
-            eligible_for_auto_reactivation=true, fill-personal 必拿 plan_type=team。请先续订或更换母号,
-            否则 fill-personal 入口会被 503 拒绝。
-          </p>
-          <div v-if="masterHealth.evidence" class="text-xs text-red-200/60 mt-2 font-mono break-all">
-            account_id={{ masterHealth.evidence.account_id || '-' }} |
-            current_user_role={{ masterHealth.evidence.current_user_role || '-' }} |
-            cached={{ masterHealth.evidence.cached ? 'yes' : 'no' }}
-          </div>
-        </div>
-        <button
-          class="px-3 py-1.5 text-xs rounded-md bg-red-500/20 text-red-200 hover:bg-red-500/30 disabled:opacity-50"
-          :disabled="masterHealthLoading"
-          @click="reloadMasterHealth(true)"
-        >
-          {{ masterHealthLoading ? '检测中...' : '立即重测' }}
-        </button>
-      </div>
+  <div class="space-y-5">
+    <div>
+      <div class="text-[10px] uppercase tracking-[0.3em] text-indigo-300/70 mb-1">Configuration</div>
+      <h2 class="text-2xl font-extrabold text-white tracking-tight">设置</h2>
+      <p class="text-sm text-gray-400 mt-1">管理员登录、巡检策略、邮箱后端、生命周期参数,皆可在此调整。</p>
     </div>
 
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <!-- F3 — 共享父级 master-health banner -->
+    <MasterHealthBanner
+      :master-health="masterHealth"
+      :min-grace-until="minGraceUntil"
+      :loading="masterHealthLoading"
+      @refresh="onReloadMasterHealth" />
+
+    <div class="glass rounded-2xl p-5">
       <div class="flex items-center justify-between gap-4 mb-4">
         <div>
           <h2 class="text-lg font-semibold text-white">管理员登录</h2>
@@ -345,7 +330,7 @@
       </div>
     </div>
 
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="glass rounded-2xl p-5">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-lg font-semibold text-white">巡检设置</h2>
         <span v-if="saved" class="text-xs text-green-400 transition">已保存</span>
@@ -390,7 +375,7 @@
     </div>
 
     <!-- SPEC-1 §FR-008 / AC-017 — 邮箱后端切换 (Settings 复用 SetupPage 4 步状态机) -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="glass rounded-2xl p-5">
       <div class="flex items-center justify-between gap-4 mb-4">
         <div>
           <h2 class="text-lg font-semibold text-white">邮箱后端</h2>
@@ -438,7 +423,7 @@
     </div>
 
     <!-- SPEC-2 §席位策略 + 探测节流 -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div class="glass rounded-2xl p-5">
       <div class="mb-4">
         <h2 class="text-lg font-semibold text-white">账号生命周期</h2>
         <p class="text-sm text-gray-400 mt-1">
@@ -510,19 +495,34 @@
 import { computed, ref, watch, onMounted } from 'vue'
 import { api } from '../api.js'
 import MailProviderCard from './MailProviderCard.vue'
+import MasterHealthBanner from './MasterHealthBanner.vue'
 
 const props = defineProps({
-  adminStatus: {
-    type: Object,
-    default: null,
-  },
-  codexStatus: {
-    type: Object,
-    default: null,
-  },
+  adminStatus: { type: Object, default: null },
+  codexStatus: { type: Object, default: null },
+  masterHealth: { type: Object, default: null },
+  status: { type: Object, default: null },
 })
 
-const emit = defineEmits(['refresh', 'admin-progress'])
+const emit = defineEmits(['refresh', 'admin-progress', 'reload-master-health'])
+
+// F3 — minGraceUntil 派生(父级传 status,这里取最早 grace_until)
+const minGraceUntil = computed(() => {
+  let min = null
+  for (const acc of props.status?.accounts || []) {
+    if (acc.status === 'degraded_grace' && typeof acc.grace_until === 'number') {
+      if (min === null || acc.grace_until < min) min = acc.grace_until
+    }
+  }
+  return min
+})
+
+const masterHealthLoading = ref(false)
+async function onReloadMasterHealth() {
+  masterHealthLoading.value = true
+  try { emit('reload-master-health', true) }
+  finally { setTimeout(() => { masterHealthLoading.value = false }, 1200) }
+}
 
 const form = ref({ interval: 5, threshold: 10, min_low: 2 })
 const saving = ref(false)
@@ -581,22 +581,6 @@ watch(
   },
   { immediate: true },
 )
-
-// Round 8 — 母号订阅健康度
-const masterHealth = ref(null)
-const masterHealthLoading = ref(false)
-
-async function reloadMasterHealth(forceRefresh = false) {
-  masterHealthLoading.value = true
-  try {
-    masterHealth.value = await api.getMasterHealth(forceRefresh)
-  } catch (e) {
-    console.error('加载母号健康度失败:', e)
-    masterHealth.value = null
-  } finally {
-    masterHealthLoading.value = false
-  }
-}
 
 // SPEC-2 — 席位偏好 + sync 探测节流(本块独立于上面的 mailForm)
 const preferredSeatType = ref('default')
@@ -670,10 +654,7 @@ onMounted(async () => {
   } catch (e) {
     console.error('加载 sync 探测节流失败:', e)
   }
-  // Round 8 — 母号订阅健康度(走 5min cache,首屏不加 force_refresh)
-  if (props.adminStatus?.configured) {
-    reloadMasterHealth(false)
-  }
+  // F3 — 母号订阅健康度由 App 级共享 props.masterHealth,不再本组件自管
 })
 
 function setMessage(text, type = 'success') {

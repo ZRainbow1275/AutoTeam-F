@@ -4,12 +4,12 @@
 
 | 字段 | 内容 |
 |---|---|
-| 名称 | 账号 7 状态完整状态机与转移规则 |
-| 版本 | v1.1 (2026-04-26 Round 7 P2 follow-up — Round 6 落地的 cheap_codex_smoke / uninitialized_seat / AUTH_INVALID 短路语义同步) |
-| 主题归属 | `accounts.py` STATUS_* 常量 + 各转移点的触发函数 + 不变量 + uninitialized_seat 中间态(Round 6 引入) |
-| 引用方 | PRD-2 / PRD-5 / PRD-6 / spec-2-account-lifecycle.md / FR-D1~D4、FR-E1~E4、FR-H1~H3、FR-P0、FR-P1.2 / FR-P1.4 / FR-D6 / FR-D8 |
-| 共因 | synthesis §1 共因 D、E + Issue#6 |
-| 不在范围 | seat_type 字段(见 PRD-2 FR-F1~F6)、cpa_sync 同步细节(参考 `cpa_sync.py`) |
+| 名称 | 账号 8 状态完整状态机与转移规则 |
+| 版本 | **v2.0 (2026-04-28 Round 9 — BREAKING:新增 STATUS_DEGRADED_GRACE 状态;母号 cancel_at_period_end 期内子号 grace 期保留可用配额)** |
+| 主题归属 | `accounts.py` STATUS_* 常量 + 各转移点的触发函数 + 不变量 + uninitialized_seat 中间态(Round 6 引入) + grace 期 retroactive 重分类(Round 9 引入) |
+| 引用方 | PRD-2 / PRD-5 / PRD-6 / Round 9 task `04-28-account-usability-state-correction` / spec-2-account-lifecycle.md v1.6 / master-subscription-health.md v1.1 §11~§13 / FR-D1~D4、FR-E1~E4、FR-H1~H3、FR-P0、FR-P1.2 / FR-P1.4 / FR-D6 / FR-D8 / **AC-B1~AC-B8** |
+| 共因 | synthesis §1 共因 D、E + Issue#6 + Round 9 根因(retroactive helper 触发位点 gap) |
+| 不在范围 | seat_type 字段(见 PRD-2 FR-F1~F6)、cpa_sync 同步细节(参考 `cpa_sync.py`)、母号订阅探针实现细节(见 `./master-subscription-health.md` v1.1) |
 
 ---
 
@@ -27,10 +27,10 @@
 
 ## 2. 完整数据契约
 
-### 2.1 状态枚举(已存在,在 `accounts.py:13-20`)
+### 2.1 状态枚举(`accounts.py:13-20` + Round 9 v2.0 新增)
 
 ```python
-# src/autoteam/accounts.py 已有:
+# src/autoteam/accounts.py 已有(v1.x 7 状态):
 STATUS_ACTIVE = "active"            # 在 team 中,额度可用
 STATUS_EXHAUSTED = "exhausted"      # 在 team 中,额度用完
 STATUS_STANDBY = "standby"          # 已移出 team,等待额度恢复
@@ -38,7 +38,21 @@ STATUS_PENDING = "pending"          # 已邀请,等待注册完成
 STATUS_PERSONAL = "personal"        # 已主动退出 team,走个人号 Codex OAuth
 STATUS_AUTH_INVALID = "auth_invalid" # auth_file token 已不可用,待 reconcile 清理或重登
 STATUS_ORPHAN = "orphan"            # 在 workspace 占席位但本地无 auth_file
+
+# v2.0 Round 9 新增(BREAKING):
+STATUS_DEGRADED_GRACE = "degraded_grace"  # 母号已 cancel_at_period_end,但 grace 期内
+                                          # 子号 wham 仍 200 plan=team — 仍可消耗配额,
+                                          # 不参与 fill 轮转,grace 到期自动转 STANDBY
 ```
+
+**STATUS_DEGRADED_GRACE 语义**:
+
+- **触发条件**:子号 `workspace_account_id` 命中已降级(`subscription_cancelled`)的母号 workspace,**且**子号 JWT id_token 的 `chatgpt_subscription_active_until` 仍未过期(`now < grace_until`)
+- **可消耗性**:仍持有有效 auth_file 与 access_token,wham/usage 200 plan=team allowed=true,**用户/外部消费方可继续用 codex 跑活**
+- **轮转排除**:不参与 `cmd_rotate / cmd_check / fill-team / fill-personal` 工作池筛选(避免被当成 active 名额误算)
+- **不被 KICK**:reconcile 看到 GRACE 不执行 KICK / state flip(M-I10 在母号降级期间禁止改写)
+- **自动转 STANDBY**:retroactive helper 在 grace 到期后自动转 STANDBY(而非 AUTH_INVALID — 因为 token 仍可能在新 invite 后做 plan_drift 验证)
+- **手动转 PERSONAL**:用户在 UI 显式 `leave_workspace` 后由 manual_account 走 personal OAuth → STATUS_PERSONAL
 
 ### 2.2 Pydantic AccountRecord(完整契约,本 spec 引入)
 
@@ -48,6 +62,7 @@ from pydantic import BaseModel, Field
 
 AccountStatus = Literal[
     "active", "exhausted", "standby", "pending", "personal", "auth_invalid", "orphan",
+    "degraded_grace",   # v2.0 Round 9 BREAKING — 母号 cancel grace 期内子号
 ]
 SeatType = Literal["chatgpt", "codex", "unknown"]
 
@@ -79,6 +94,12 @@ class AccountRecord(BaseModel):
     plan_supported: Optional[bool] = None        # 新增,见 ./plan-type-whitelist.md
     plan_type_raw: Optional[str] = None          # 新增,记录原始 OAuth 字面量
     last_kicked_at: Optional[float] = None       # 新增,被踢识别时间戳;reconcile 用
+    # v2.0 Round 9 新增 — grace 期相关字段
+    grace_until: Optional[float] = None          # 子号 JWT id_token chatgpt_subscription_active_until,
+                                                 # epoch seconds;degraded_grace → standby 的转换判定阈值
+    grace_marked_at: Optional[float] = None      # 进入 GRACE 状态的时间戳(retroactive helper 写入)
+    master_account_id_at_grace: Optional[str] = None  # 进入 GRACE 时的母号 workspace_account_id 快照
+                                                      # (用于母号续费回 healthy 时反向恢复 ACTIVE)
 ```
 
 ### 2.3 状态-字段不变量
@@ -92,6 +113,7 @@ class AccountRecord(BaseModel):
 | `personal` | `email`, `auth_file`(非 None,personal 专属 plan_type=free) | — |
 | `auth_invalid` | `email` | — |
 | `orphan` | `email`(在 workspace 占席位) | `auth_file` 必须为 None |
+| **`degraded_grace`(v2.0)** | `email`, `auth_file`(非 None,token 仍有效), `workspace_account_id`(必须等于一个降级母号 id), `grace_until`(>0), `grace_marked_at`(>0), `master_account_id_at_grace` | `quota_exhausted_at` 必须为 None(grace 是配额仍可用前提下的轮转排除态,不是耗尽) |
 
 ---
 
@@ -137,14 +159,35 @@ class AccountRecord(BaseModel):
    _reconcile 发现 ghost  ┌──────────┐    人工 KICK
    ──────────────────────► │  ORPHAN  │ ──────────────────► 删
                           └──────────┘
+
+   ── v2.0 GRACE 子图 ──(Round 9 新增,5 触发点 retroactive helper 驱动)
+   
+   ACTIVE / EXHAUSTED            ┌─────────────────────┐
+   workspace 命中已降级母号  ──► │ DEGRADED_GRACE      │
+   且 now < grace_until          │ 仍可消耗 / 不入轮转  │
+                                  │ wham 200 plan=team  │
+                                  └──┬──┬───────────────┘
+                                     │  │
+       grace 到期(now >= grace_until) │  │ 母号续费回 healthy
+       (lifespan/auto_check/sync     │  │ retroactive 撤回
+        /cmd_check/cmd_rotate 任一)   │  │
+                  ▼                  │  │
+              STANDBY  ◄─────────────┘  └──────► ACTIVE
+              (5h 后 reinvite 自动恢复)
+                                     
+       用户主动 leave_workspace ─────────────────► PERSONAL
+                                                  (终态)
 ```
 
-### 3.2 状态分类
+### 3.2 状态分类(v2.0 重排)
 
-| 类别 | 状态 |
-|---|---|
-| 工作池(轮转参与) | `active`、`exhausted`、`standby`、`pending` |
-| 终态(不参与轮转) | `personal`、`auth_invalid`、`orphan` |
+| 类别 | 状态 | 备注 |
+|---|---|---|
+| 工作池(轮转参与) | `active`、`exhausted`、`standby`、`pending` | 参与 fill / cmd_rotate / cmd_check 名额计数 |
+| **过渡态(可消耗 / 不入轮转,v2.0)** | `degraded_grace` | 母号 cancel 但子号 grace 期内仍 200;**用户可手动用,系统 fill 不计** |
+| 终态(不参与轮转) | `personal`、`auth_invalid`、`orphan` | 不在 fill 名额池;personal 是用户决定的最终态 |
+
+**为何 GRACE 不归入"工作池"**:fill 系列动作需要"母号能继续生产新席位"作为前提,母号已 cancel 时新 invite 必拿 free,把 GRACE 计入工作池会让 fill 误判名额还充足并继续浪费 OAuth 周期。GRACE 子号已存的 quota 仍可被用户手动消费,但**系统轮转不再依赖它**。
 
 ### 3.3 uninitialized_seat 中间态(Round 6 引入,Round 7 文档同步)
 
@@ -252,6 +295,20 @@ sync_account_states 看到 acc.status == ACTIVE 且 email 不在当前 workspace
 - `test_auth_invalid_short_circuit_does_not_start_chatgpt_api`(FR-P1.2)
 - `test_all_personal_short_circuit_skips_chatgpt_api_start`(FR-P1.4)
 
+### 4.3b GRACE 删除链短路(v2.0 Round 9)
+
+**语义**:`STATUS_DEGRADED_GRACE` 在删除链中**等价**于 `STATUS_PERSONAL` / `STATUS_AUTH_INVALID` — 都跳过 ChatGPTTeamAPI 远端同步,直接走本地清理。
+
+**理由**:
+- GRACE 子号的母号已 cancel,即使 fetch_team_state 拿到席位,KICK 操作也大概率因母号 admin session 401 / 503 卡住;
+- 删除 GRACE 不需要远端 KICK(grace 到期后 standby retroactive helper 会自然清理 workspace,无 ghost 风险);
+- 与 §4.3a 处置矩阵 / spec-2 §3.5.1 short_circuit 实施一致 — `account_ops.delete_managed_account` short_circuit 条件需追加 `STATUS_DEGRADED_GRACE`,`api.delete_accounts_batch` `all_local_only` 条件同步追加。
+
+**单测覆盖**(实施期 backend-implementer 加):
+- `test_grace_short_circuit_skips_fetch_team_state`
+- `test_all_grace_short_circuit_does_not_start_chatgpt_api`
+- `test_mixed_grace_active_starts_chatgpt_api`(GRACE + ACTIVE 混批不能短路)
+
 ### 4.3 reinvite_account fail_reason 分支(扩 FR-H1)
 
 ```
@@ -267,11 +324,48 @@ reinvite_account 拿到 bundle 后:
       └─ quota fail_reason in (auth_error, network_error, exception) → STATUS_STANDBY 不锁 5h(旧)
 ```
 
-### 4.4 反向不变量
+### 4.4 STATUS_DEGRADED_GRACE 转移规则(v2.0 Round 9 新增)
+
+GRACE 状态由"母号订阅 retroactive 重分类 helper"集中驱动,不会被 invite / OAuth / reinvite 路径直接写入。
+
+#### 4.4.1 进入 GRACE 的转移
+
+| 触发函数 | 触发条件 | from → to | 必须落字段 |
+|---|---|---|---|
+| `_apply_master_degraded_classification(workspace_id, grace_until)` 内部循环 | acc.status ∈ {ACTIVE, EXHAUSTED} **且** acc.workspace_account_id == 已降级母号 workspace_id **且** now < grace_until | ACTIVE/EXHAUSTED → DEGRADED_GRACE | grace_until=<JWT id_token chatgpt_subscription_active_until>, grace_marked_at=time.time(), master_account_id_at_grace=<workspace_id> |
+| 同上 | acc.status == AUTH_INVALID(token 已 401)且 workspace 命中已降级母号 | **不转 GRACE**,保持 AUTH_INVALID(grace 前提是 token 仍可用) | (跳过) |
+
+#### 4.4.2 退出 GRACE 的转移
+
+| 触发函数 | 触发条件 | from → to | 字段处理 |
+|---|---|---|---|
+| `_apply_master_degraded_classification` retroactive 扫描 | acc.status == GRACE **且** now >= acc.grace_until | DEGRADED_GRACE → STANDBY | 清空 grace_*,保留 last_quota / last_kicked_at;不动 auth_file(等用户决定 reinvite 或 delete) |
+| `_apply_master_degraded_classification` retroactive 撤回(母号续费) | acc.status == GRACE **且** master_health 此时 reason == "active" **且** acc.workspace_account_id == 当前活跃母号 | DEGRADED_GRACE → ACTIVE | 清空 grace_*,保留 master_account_id_at_grace 字段最近值用于审计日志,可置 None |
+| `manual_account.leave_workspace` 用户主动退出 | 用户 UI 点 "leave_workspace" | DEGRADED_GRACE → PERSONAL | grace_* 清空;经 personal OAuth 走 STATUS_PERSONAL 路径(plan_type=free 验证通过) |
+| `delete_managed_account` | 用户删除 | DEGRADED_GRACE → deleted | 走 §4.3a short_circuit 等价路径(GRACE 与 PERSONAL/AUTH_INVALID 视为可短路 — 见 §4.3b) |
+
+#### 4.4.3 5 触发点 retroactive 矩阵(与 master-subscription-health.md §11 联动)
+
+| # | 触发位点 | 文件:函数 | 调 helper 时机 | 备注 |
+|---|---|---|---|---|
+| RT-1 | server 启动 lifespan | `api.py:app_lifespan` 内 ensure_auth_file_permissions 之后 | yield 前 / 后台线程,失败不阻塞启动 | 解 "重启后 stale active" 问题(Round 9 根因) |
+| RT-2 | `_auto_check_loop` 后台巡检 | `api.py:_auto_check_loop` 内 cmd_rotate 末尾或巡检循环末尾 | 每个 interval 周期 1 次 | 持续保护:即便用户从不点 reconcile 也能自愈 |
+| RT-3 | `cmd_check` / `_reconcile_team_members` 末尾 | `manager.py:_reconcile_team_members` return 之前 | 复用同一 chatgpt_api 实例,无额外 Playwright 启动 | spec-2 §3.7 + research §6 方案 A |
+| RT-4 | `sync_account_states` 末尾 | `manager.py:sync_account_states` Team 成员同步完成后 | save_accounts 之前 | UI 用户点"同步"按钮也能命中 |
+| RT-5 | `cmd_rotate` 末尾 | `manager.py:cmd_rotate` 5/5 步之后 | 主巡检链路收尾 | 与 RT-3 在 cmd_rotate 内嵌的 cmd_check 互补,防遗漏 |
+| RT-6(已有) | `cmd_reconcile` 末尾 | `manager.py:cmd_reconcile` 末尾 `_reconcile_master_degraded_subaccounts` | 现 round-8 唯一接入 | v2.0 后改为复用 helper(避免重复 spawn ChatGPTTeamAPI) |
+
+**helper 必须做的事**:
+1. 调 `is_master_subscription_healthy(chatgpt_api)`(可走 5min cache);
+2. 若 `reason != "subscription_cancelled"`,处理"撤回"路径 — 把所有 `status==GRACE` **且** `master_account_id_at_grace == account_id` 的子号转回 ACTIVE;
+3. 若 `reason == "subscription_cancelled"`,从 evidence 取 master account_id,从 子号 auth_file JWT 解析 `chatgpt_subscription_active_until`(见 master-subscription-health.md §12 grace 期处理),按 §4.4.1 / §4.4.2 矩阵重分类;
+4. 全程不抛异常 — 任何失败 logger.warning,不影响调用方主流程。
+
+### 4.5 反向不变量
 
 | 不变量 | 说明 |
 |---|---|
-| `auth_file 存在 ⇒ status ∈ {active, exhausted, standby_with_token, personal, auth_invalid}` | orphan / pending 必无 auth_file |
+| `auth_file 存在 ⇒ status ∈ {active, exhausted, standby_with_token, personal, auth_invalid, degraded_grace}` | orphan / pending 必无 auth_file;v2.0 增加 GRACE — token 可用但 workspace 已 cancel |
 | `status == personal ⇒ plan_type_raw == "free"` | personal 路径强校验(`codex_auth.py:920-930`) |
 | `status == active ⇒ workspace_account_id 与当前一致 OR workspace_account_id is None` | sync 守卫(`manager.py:531-538`) |
 | `last_kicked_at != None ⇒ status in {auth_invalid, deleted}` | 被踢标记的语义边界 |
@@ -324,6 +418,7 @@ def get_terminal_accounts():
 | `personal` | 个人 free 号 | 删除(短路 fetch_team_state,见 PRD-2 FR-G1) |
 | `auth_invalid` | **token 失效,已退出 Team** | 删除(短路 fetch_team_state) |
 | `orphan` | **席位异常,等待清理** | KICK + 删除 |
+| **`degraded_grace`(v2.0)** | **过渡期(母号已取消,grace 到期 YYYY-MM-DD HH:MM)** + grace 倒计时 | 删除(短路 fetch_team_state)/ 切个人号(走 leave_workspace + manual_account)/ 立即重新对账(`/api/admin/reconcile?force=1`)|
 
 ---
 
@@ -556,6 +651,9 @@ def test_pydantic_account_record_round_trip():
 - **I6**:`last_kicked_at` 字段一旦写入,后续状态转移不能清掉(用于 reconcile 历史回放;只在 delete_account 时随记录一起删)
 - **I7**:reconcile_anomalies(`manager.py:161-471`)对 `auth_invalid` 的 KICK 行为必须保持幂等(重复 KICK 不抛异常,`kick_status="already_absent"` 视为成功)
 - **I8**:状态白名单变更(新增枚举)需要全局检查 4 处:`Dashboard.vue` statusClass / `cpa_sync.py` 同步规则 / `sync_account_states` 处置 / 本 spec §4.2
+- **I10**(v2.0 Round 9):**STATUS_DEGRADED_GRACE 仅由 `_apply_master_degraded_classification` helper 写入与撤回**;invite / OAuth / reinvite / `_run_post_register_oauth` / `manual_account._finalize_account` 等业务路径**禁止**直接把 status 写为 `degraded_grace`。原因:GRACE 是"母号订阅状态 × 子号工作状态"的组合派生,只有同时持有 master_health 探测结果与子号 JWT grace_until 的 helper 才有完整决策上下文。
+- **I11**(v2.0 Round 9):**helper 调用必须永不抛**(与 master-subscription-health.md M-I1 永不抛对齐)— 任何 master_health probe 异常 / JWT 解析异常 / save_accounts 异常都必须 logger.warning 兜住,不影响调用方主流程(lifespan 启动 / sync 完成 / cmd_check / cmd_rotate 都不能因 retroactive 异常而失败)。
+- **I12**(v2.0 Round 9):**GRACE 子号绝不被 KICK** — `_reconcile_team_members` 处理 ghost / orphan 时若发现 acc.status == GRACE,跳过 KICK 与 state flip;只允许 read-only 扫描和日志输出。理由与 master-subscription-health.md M-I10 同源:母号降级期间任何 KICK 都可能踢掉用户仍在用的实活号。
 - **I9**(Round 6 落地,Round 7 文档同步):**add-phone 探针必须接入 7 处**(invite 4 + OAuth 3,Round 6 P1.1 后 OAuth 扩为 4 处,合计 8 处)。具体清单:
   - **invite 阶段 4 处**(`invite.py:247/282/364/446`):`invite_filling`、`invite_confirm`、`invite_pre_submit`、`invite_post_submit`
   - **OAuth 阶段 4 处**(`codex_auth.py:586/638/910/939`,Round 6 加 C-P4):`oauth_about_you`(C-P1)、`oauth_consent_{step}`(C-P2)、`oauth_callback_wait`(C-P3)、`oauth_personal_check`(C-P4,Round 6 PRD-5 FR-P1.1 引入)
@@ -573,6 +671,7 @@ def test_pydantic_account_record_round_trip():
 | v0.3 | round-3 | 加 auth_invalid + orphan(commit cf2f7d3) |
 | v1.0 | 2026-04-26 PRD-2 | 加 last_kicked_at / plan_supported / plan_type_raw 字段;补全转移规则;不新增 STATUS_PHONE_REQUIRED(复用 auth_invalid + register_failures) |
 | v1.1 | 2026-04-26 Round 7 P2 follow-up | (1) §3.3 加 uninitialized_seat 中间态(Round 6 引入,STATUS_ACTIVE/PENDING 的"待验证"子态,经 cheap_codex_smoke 二次验证后转 5 分类);(2) §4.1 转移矩阵加 cheap_codex_smoke 触发条件(uninitialized_seat + smoke=auth_invalid → AUTH_INVALID;smoke=uncertain → 保留原状态);(3) §4.3a 加删除链短路语义(STATUS_AUTH_INVALID 与 STATUS_PERSONAL 等价处置;Round 6 FR-P1.2 / FR-P1.4 落地);(4) §6 加 I9 不变量 — add-phone 探针 7 处接入(invite 4 + OAuth C-P1~C-P4 共 4 处,Round 6 加 C-P4);(5) 引用方加 PRD-5/PRD-6 + FR-P0/P1.2/P1.4/D6/D8;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.8 |
+| **v2.0** | **2026-04-28 Round 9** — **BREAKING: 引入 STATUS_DEGRADED_GRACE 8 状态机**。(1) §2.1 加枚举 `STATUS_DEGRADED_GRACE = "degraded_grace"`;(2) §2.2 AccountStatus Literal 增 `degraded_grace`;AccountRecord 加 3 字段(`grace_until` / `grace_marked_at` / `master_account_id_at_grace`);(3) §2.3 不变量表追加 grace 行(必备 grace_until>0 + master_account_id_at_grace,禁用 quota_exhausted_at);(4) §3.1 ASCII 加 GRACE 子图(进入 / grace 到期 → standby / 母号续费 → active / 用户 leave_workspace → personal);(5) §3.2 分类表加"过渡态"分类;(6) §4.3b 删除链短路扩 GRACE 等价 PERSONAL/AUTH_INVALID;(7) §4.4 加 GRACE 转移规则三段(进入 / 退出 / 5 触发点矩阵 RT-1~RT-6),其中 retroactive helper 集中由 `_apply_master_degraded_classification(workspace_id, grace_until)` 承担;(8) §4.5 反向不变量加 grace;(9) §5.3 UI 显示规范加 grace 文案 + grace 倒计时 + 三档操作;(10) §7 不变量加 I10(GRACE 仅由 helper 写)/ I11(helper 永不抛)/ I12(GRACE 不被 KICK)。<br><br>**round-1~8 测试 mock 更新点**(本版本 BREAKING 必须扫):<br>① `tests/fixtures/state_transitions.yaml` 不影响(yaml 里没有 grace 行,新增即可);<br>② 任何 `mock` AccountRecord / accounts.json fixture 显式枚举状态字符串的位置(ripgrep `STATUS_(ACTIVE\|EXHAUSTED\|STANDBY\|PERSONAL\|AUTH_INVALID\|ORPHAN\|PENDING)` 单测里命中);<br>③ Round 5/6 `_reconcile_team_members` mock 现假设的"7 状态分类"枚举遍历(若有 `for status in [...]:` 写死 7 个,需补 grace);<br>④ Round 7 `test_state_field_invariants` 5 个 case 增 `(STATUS_DEGRADED_GRACE, [...], [...])`;<br>⑤ Round 8 `_reconcile_master_degraded_subaccounts` 测试 mock 期望"ACTIVE → STANDBY",v2.0 要改 "ACTIVE → DEGRADED_GRACE"(grace 期内)+ "DEGRADED_GRACE → STANDBY"(grace 到期);<br>⑥ Round 8 master-subscription probe 测试 fixture `master_accounts_responses.json` 不变,但调用方在 retroactive helper 内的处置 mock 需要改;<br>⑦ Round 7 / 8 删除链 short_circuit 测试加 `test_grace_short_circuit_*`(参见 §4.3b);<br>⑧ 前端 Vue / TS 任何写死 7 状态字符串集合的位置(`web/src/components/Dashboard.vue statusClass` / `web/src/utils/statusLabel.ts` 等)需要补 GRACE。<br><br>**引用方变更**:加 Round 9 task `04-28-account-usability-state-correction` / spec-2 v1.6 / master-subscription-health v1.1 §11~§13 / AC-B1~AC-B8 |
 
 ---
 

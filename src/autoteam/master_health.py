@@ -387,3 +387,321 @@ def is_master_subscription_healthy(
             logger.warning("[master_health] 写 cache 失败: %s", exc)
 
     return healthy, reason, evidence
+
+
+# ---------------------------------------------------------------------------
+# Round 9 SPEC v1.1 §11~§12 — Retroactive helper + grace 期 JWT 解析
+# ---------------------------------------------------------------------------
+
+
+def extract_grace_until_from_jwt(token):
+    """从 access/id_token JWT payload 解析 chatgpt_subscription_active_until → epoch seconds。
+
+    spec/shared/master-subscription-health.md v1.1 §12.2。token 既可以是 access_token
+    也可以是 id_token,只要 payload 中含 https://api.openai.com/auth.chatgpt_subscription_active_until。
+    返回:
+        epoch seconds(float) — 字段存在且解析成功
+        None — token 缺失 / 字段缺失 / 格式错误 / 解析异常(永不抛)
+    """
+    if not token or not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload_b64 = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+    try:
+        import base64
+
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
+    auth_claims = payload.get("https://api.openai.com/auth") or {}
+    raw = auth_claims.get("chatgpt_subscription_active_until")
+    if raw is None:
+        return None
+    # raw 可能是 epoch(int / float)或 ISO-8601 字符串
+    try:
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str):
+            from datetime import datetime
+
+            normalized = raw.strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).timestamp()
+    except Exception:
+        return None
+    return None
+
+
+def _read_access_token_from_auth_file(auth_file_path):
+    """从 auth_file 读 access_token / id_token,优先返回 id_token(grace_until 在 id_token 里)。
+
+    返回 (access_token, id_token);任一不可用返回 None。
+    """
+    if not auth_file_path:
+        return None, None
+    try:
+        from pathlib import Path as _Path
+
+        path_obj = _Path(auth_file_path)
+        if not path_obj.exists():
+            return None, None
+        data = json.loads(path_obj.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    access_token = data.get("access_token") or (data.get("tokens") or {}).get("access_token")
+    id_token = data.get("id_token") or (data.get("tokens") or {}).get("id_token")
+    return access_token, id_token
+
+
+def _apply_master_degraded_classification(
+    workspace_id=None,
+    grace_until=None,
+    *,
+    chatgpt_api=None,
+    dry_run=False,
+):
+    """Round 9 SPEC v1.1 §11.2 — 母号订阅 retroactive 重分类 helper。
+
+    抽 Round 8 _reconcile_master_degraded_subaccounts 子句为通用 helper,5 触发点共用:
+    lifespan / _auto_check_loop / _reconcile_team_members / sync_account_states / cmd_rotate。
+
+    行为:
+      1. 调 is_master_subscription_healthy(走 5min cache,不主动 force_refresh)
+      2. reason == "subscription_cancelled" → 进入"前进"路径
+         - ACTIVE/EXHAUSTED + workspace 命中 + JWT grace_until 未过期 → DEGRADED_GRACE
+         - DEGRADED_GRACE + grace 已到期                                → STANDBY
+      3. reason == "active" → 进入"撤回"路径
+         - DEGRADED_GRACE + master_account_id_at_grace == 当前 account_id → ACTIVE
+      4. 其他 reason → skipped
+
+    M-I1 / I11:永不抛异常,所有 Exception 捕获 + logger.warning。
+    M-I12:GRACE 子号绝不被 KICK(本函数只改 status,不调远端)。
+
+    返回 dict:
+        {
+          "skipped_reason": Optional[str],
+          "marked_grace":   List[email],
+          "marked_standby": List[email],
+          "reverted_active": List[email],
+          "errors":         List[dict],
+        }
+    """
+    from autoteam.accounts import (
+        STATUS_ACTIVE,
+        STATUS_DEGRADED_GRACE,
+        STATUS_EXHAUSTED,
+        STATUS_STANDBY,
+        load_accounts,
+        update_account,
+    )
+    from autoteam.register_failures import MASTER_SUBSCRIPTION_DEGRADED, record_failure
+
+    out = {
+        "skipped_reason": None,
+        "marked_grace": [],
+        "marked_standby": [],
+        "reverted_active": [],
+        "errors": [],
+        "dry_run": bool(dry_run),
+    }
+
+    # 1. master health probe(走 cache)
+    api_owns = False
+    api = chatgpt_api
+    try:
+        if api is None or not getattr(api, "browser", None):
+            try:
+                from autoteam.chatgpt_api import ChatGPTTeamAPI
+
+                api = ChatGPTTeamAPI()
+                api.start()
+                api_owns = True
+            except Exception as exc:
+                out["skipped_reason"] = f"chatgpt_api_start_failed:{type(exc).__name__}"
+                return out
+        try:
+            healthy, reason, evidence = is_master_subscription_healthy(api)
+        except Exception as exc:
+            out["skipped_reason"] = f"probe_exception:{type(exc).__name__}"
+            return out
+    finally:
+        if api_owns and api is not None:
+            try:
+                api.stop()
+            except Exception:
+                pass
+
+    # 2. 解析 master account_id
+    if workspace_id:
+        master_aid = workspace_id
+    else:
+        try:
+            from autoteam.admin_state import get_chatgpt_account_id
+
+            master_aid = (evidence or {}).get("account_id") or get_chatgpt_account_id() or ""
+        except Exception:
+            master_aid = (evidence or {}).get("account_id") or ""
+
+    if not master_aid:
+        out["skipped_reason"] = "no_master_account_id"
+        return out
+
+    now_ts = time.time()
+
+    # 3. 路径分流
+    if healthy and reason == "active":
+        # 撤回路径:GRACE → ACTIVE(母号续费)
+        try:
+            for acc in load_accounts():
+                if acc.get("status") != STATUS_DEGRADED_GRACE:
+                    continue
+                if (acc.get("master_account_id_at_grace") or "") != master_aid:
+                    continue
+                email = acc.get("email")
+                if dry_run:
+                    out["reverted_active"].append(email)
+                    continue
+                try:
+                    update_account(
+                        email,
+                        status=STATUS_ACTIVE,
+                        grace_until=None,
+                        grace_marked_at=None,
+                        master_account_id_at_grace=None,
+                    )
+                    out["reverted_active"].append(email)
+                except Exception as exc:
+                    out["errors"].append({"email": email, "stage": "revert", "error": str(exc)})
+        except Exception as exc:
+            out["errors"].append({"stage": "load_for_revert", "error": str(exc)})
+        if out["reverted_active"]:
+            logger.info(
+                "[retroactive] master 已恢复 active,GRACE → ACTIVE 撤回 %d 个",
+                len(out["reverted_active"]),
+            )
+        else:
+            out["skipped_reason"] = "master_active_no_grace_candidates"
+        return out
+
+    if reason != "subscription_cancelled":
+        out["skipped_reason"] = f"master reason={reason} 非 cancelled,无需重分类"
+        return out
+
+    # subscription_cancelled — 前进路径
+    try:
+        accounts_now = load_accounts()
+    except Exception as exc:
+        out["skipped_reason"] = f"load_accounts_failed:{type(exc).__name__}"
+        return out
+
+    for acc in accounts_now:
+        try:
+            email = acc.get("email")
+            cur_status = acc.get("status")
+            cur_ws = acc.get("workspace_account_id") or ""
+
+            # GRACE 到期检查:无论 workspace 是否一致,先处理已经标 GRACE 的
+            if cur_status == STATUS_DEGRADED_GRACE:
+                acc_grace_until = acc.get("grace_until")
+                if acc_grace_until and now_ts >= float(acc_grace_until):
+                    if dry_run:
+                        out["marked_standby"].append(email)
+                    else:
+                        update_account(
+                            email,
+                            status=STATUS_STANDBY,
+                            grace_until=None,
+                            grace_marked_at=None,
+                            # master_account_id_at_grace 保留供审计
+                        )
+                        out["marked_standby"].append(email)
+                continue
+
+            # 前进路径:仅 ACTIVE / EXHAUSTED 且属于此降级 workspace
+            if cur_status not in (STATUS_ACTIVE, STATUS_EXHAUSTED):
+                continue
+            if cur_ws != master_aid:
+                continue
+
+            # 解析 grace_until — 优先用入参,否则从 auth_file id_token 解
+            acc_grace_until = grace_until
+            if acc_grace_until is None:
+                _, id_token = _read_access_token_from_auth_file(acc.get("auth_file"))
+                acc_grace_until = extract_grace_until_from_jwt(id_token)
+
+            # 决策:
+            #  - grace_until 解析成功 + 仍未过期 → 进 GRACE
+            #  - grace_until 解析失败  → 没法判断,进保守 STANDBY
+            #  - grace_until 已过期    → 直接 STANDBY,跳 GRACE
+            target_status = None
+            if acc_grace_until and now_ts < float(acc_grace_until):
+                target_status = STATUS_DEGRADED_GRACE
+            else:
+                target_status = STATUS_STANDBY
+
+            if dry_run:
+                if target_status == STATUS_DEGRADED_GRACE:
+                    out["marked_grace"].append(email)
+                else:
+                    out["marked_standby"].append(email)
+                continue
+
+            if target_status == STATUS_DEGRADED_GRACE:
+                update_account(
+                    email,
+                    status=STATUS_DEGRADED_GRACE,
+                    grace_until=float(acc_grace_until),
+                    grace_marked_at=now_ts,
+                    master_account_id_at_grace=master_aid,
+                )
+                try:
+                    record_failure(
+                        email,
+                        MASTER_SUBSCRIPTION_DEGRADED,
+                        "retroactive: master cancelled, in grace period",
+                        stage="apply_master_degraded_classification",
+                        master_account_id=master_aid,
+                        grace_until=float(acc_grace_until),
+                    )
+                except Exception:
+                    pass
+                out["marked_grace"].append(email)
+            else:
+                update_account(
+                    email,
+                    status=STATUS_STANDBY,
+                    grace_until=None,
+                    grace_marked_at=None,
+                )
+                try:
+                    record_failure(
+                        email,
+                        MASTER_SUBSCRIPTION_DEGRADED,
+                        "retroactive: master cancelled, no grace period (jwt missing/expired)",
+                        stage="apply_master_degraded_classification",
+                        master_account_id=master_aid,
+                    )
+                except Exception:
+                    pass
+                out["marked_standby"].append(email)
+        except Exception as exc:
+            out["errors"].append({
+                "email": acc.get("email"),
+                "stage": "classify",
+                "error": f"{type(exc).__name__}:{exc}",
+            })
+
+    if not (out["marked_grace"] or out["marked_standby"]):
+        out["skipped_reason"] = "no_candidates"
+
+    if out["marked_grace"] or out["marked_standby"]:
+        logger.info(
+            "[retroactive] master cancelled — 标 GRACE %d 个 / STANDBY %d 个 (dry_run=%s)",
+            len(out["marked_grace"]),
+            len(out["marked_standby"]),
+            dry_run,
+        )
+    return out

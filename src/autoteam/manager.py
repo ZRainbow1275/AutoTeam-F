@@ -496,6 +496,17 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                             logger.error("[对账] 超员 kick %s 失败: status=%s", email, remove_status)
                     except Exception as exc:
                         logger.error("[对账] 超员 kick %s 抛异常: %s", email, exc)
+        # Round 9 RT-3 — 复用 chatgpt_api 调 retroactive helper(走 5min cache,失败仅 warning)。
+        # spec/shared/master-subscription-health.md v1.1 §11.3。
+        try:
+            from autoteam.master_health import _apply_master_degraded_classification
+
+            retro = _apply_master_degraded_classification(chatgpt_api=chatgpt_api, dry_run=dry_run)
+            result["master_degraded_retroactive"] = retro
+        except Exception as exc:
+            logger.warning("[对账] retroactive helper 异常: %s", exc)
+            result["master_degraded_retroactive"] = {"errors": [{"stage": "rt3", "error": str(exc)}]}
+
     finally:
         if need_stop:
             try:
@@ -725,6 +736,22 @@ def sync_account_states(chatgpt_api=None):
 
     if changed:
         save_accounts(accounts)
+
+    # Round 9 RT-4 — sync 收尾跑一次 retroactive helper(走 5min cache,不发 HTTP)。
+    # spec/shared/master-subscription-health.md v1.1 §11.3。失败仅 warning 不影响 sync。
+    try:
+        from autoteam.master_health import _apply_master_degraded_classification
+
+        retro = _apply_master_degraded_classification()
+        if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+            logger.info(
+                "[同步] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                len(retro.get("marked_grace") or []),
+                len(retro.get("marked_standby") or []),
+                len(retro.get("reverted_active") or []),
+            )
+    except Exception as exc:
+        logger.warning("[同步] retroactive helper 异常(不影响 sync 主流程): %s", exc)
 
 
 def _print_status_table(accounts, quota_cache=None):
@@ -1296,6 +1323,22 @@ def cmd_check(include_standby: bool = False):
             _probe_standby_quota()
         except Exception as exc:
             logger.warning("[检查] standby 探测分支异常(不影响 active/personal 结果): %s", exc)
+
+    # Round 9 RT-3 兜底 — 即便 _reconcile_team_members 因 chatgpt_api 启动失败提前 return,
+    # 这里仍能跑一次 retroactive(走 5min cache,自起 chatgpt_api)。
+    try:
+        from autoteam.master_health import _apply_master_degraded_classification
+
+        retro = _apply_master_degraded_classification()
+        if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+            logger.info(
+                "[检查] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                len(retro.get("marked_grace") or []),
+                len(retro.get("marked_standby") or []),
+                len(retro.get("reverted_active") or []),
+            )
+    except Exception as exc:
+        logger.warning("[检查] retroactive helper 异常(不影响 cmd_check): %s", exc)
 
     return exhausted_list
 
@@ -3592,6 +3635,21 @@ def cmd_rotate(target_seats=5):
         # 所有操作完成后统一同步 CPA，避免中途同步导致 CPA 不可用
         logger.info("[轮转] 轮转完成，同步 CPA...")
         sync_to_cpa()
+        # Round 9 RT-5 — cmd_rotate 收尾跑一次 retroactive(走 5min cache,失败仅 warning)。
+        # spec/shared/master-subscription-health.md v1.1 §11.3。
+        try:
+            from autoteam.master_health import _apply_master_degraded_classification
+
+            retro = _apply_master_degraded_classification()
+            if retro and (retro.get("marked_grace") or retro.get("marked_standby") or retro.get("reverted_active")):
+                logger.info(
+                    "[轮转] retroactive: GRACE %d / STANDBY %d / 撤回 ACTIVE %d",
+                    len(retro.get("marked_grace") or []),
+                    len(retro.get("marked_standby") or []),
+                    len(retro.get("reverted_active") or []),
+                )
+        except Exception as exc:
+            logger.warning("[轮转] retroactive helper 异常: %s", exc)
         logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
@@ -4505,78 +4563,35 @@ def cmd_pull_cpa():
     return result
 
 
-def _reconcile_master_degraded_subaccounts(*, dry_run: bool = False):
+def _reconcile_master_degraded_subaccounts(*, dry_run: bool = False, chatgpt_api=None):
     """Round 8 — SPEC-2 v1.5 §3.5.3:reconcile retroactive 清理。
 
-    若母号订阅已降级(subscription_cancelled),将本地 ACTIVE/EXHAUSTED 账号中
-    workspace_account_id 等于当前(已降级)母号 account_id 的子号统一标 STANDBY,
-    避免 health-check 把 plan=team 的"已脱身"账号误派出去。
+    Round 9 SPEC v2.0 — 改为 _apply_master_degraded_classification helper 的薄 wrapper,
+    保留旧返回结构(degraded_marked / skipped_reason)以兼容既有 cmd_reconcile 调用方。
+    新加 marked_grace / reverted_active / errors 字段透传,便于 audit。
 
-    条件:
-        master_health: subscription_cancelled
-        account.status in (ACTIVE, EXHAUSTED, AUTH_INVALID) and
-        account.workspace_account_id == current_master_account_id
-
-    Returns: dict { "degraded_marked": [emails], "skipped_reason": str|None }
+    若母号订阅 cancelled 且子号 JWT grace_until 仍未过期 → DEGRADED_GRACE
+    若 grace 已过期 / JWT 解析失败                          → STANDBY
+    若母号已恢复 active                                       → DEGRADED_GRACE 撤回为 ACTIVE
     """
-    from autoteam.master_health import is_master_subscription_healthy
+    from autoteam.master_health import _apply_master_degraded_classification
 
-    out = {"degraded_marked": [], "skipped_reason": None}
-    try:
-        temp_api = ChatGPTTeamAPI()
-        try:
-            temp_api.start()
-            healthy, reason, evidence = is_master_subscription_healthy(temp_api)
-        finally:
-            try:
-                temp_api.stop()
-            except Exception:
-                pass
-    except Exception as exc:
-        out["skipped_reason"] = f"probe_exception:{exc}"
-        return out
-
-    if healthy or reason != "subscription_cancelled":
-        out["skipped_reason"] = f"master healthy(reason={reason}),无需 retroactive cleanup"
-        return out
-
-    master_aid = (evidence or {}).get("account_id") or get_chatgpt_account_id()
-    if not master_aid:
-        out["skipped_reason"] = "无法解析当前母号 account_id"
-        return out
-
-    candidates = []
-    for acc in load_accounts():
-        if acc.get("status") not in (STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID):
-            continue
-        if (acc.get("workspace_account_id") or "") != master_aid:
-            continue
-        candidates.append(acc.get("email"))
-
-    logger.info(
-        "[对账-retroactive] master degraded(reason=%s),候选 standby 子号 %d 个: %s",
-        reason, len(candidates), candidates,
+    raw = _apply_master_degraded_classification(
+        chatgpt_api=chatgpt_api, dry_run=dry_run,
     )
 
-    if dry_run:
-        out["degraded_marked"] = candidates
-        out["skipped_reason"] = "dry_run"
-        return out
+    # 旧返回字段映射:degraded_marked = grace + standby (统一视为"被重分类")
+    degraded_marked = list(raw.get("marked_grace") or []) + list(raw.get("marked_standby") or [])
 
-    for em in candidates:
-        try:
-            update_account(em, status=STATUS_STANDBY)
-            record_failure(
-                em, MASTER_SUBSCRIPTION_DEGRADED,
-                "reconcile retroactive cleanup:母号 cancelled,子号统一 standby",
-                stage="reconcile_retroactive",
-                master_account_id=master_aid,
-            )
-            out["degraded_marked"].append(em)
-        except Exception as exc:
-            logger.warning("[对账-retroactive] 标 standby 失败 email=%s err=%s", em, exc)
-
-    return out
+    return {
+        "degraded_marked": degraded_marked,
+        "marked_grace": raw.get("marked_grace") or [],
+        "marked_standby": raw.get("marked_standby") or [],
+        "reverted_active": raw.get("reverted_active") or [],
+        "skipped_reason": raw.get("skipped_reason"),
+        "errors": raw.get("errors") or [],
+        "dry_run": raw.get("dry_run", bool(dry_run)),
+    }
 
 
 def cmd_reconcile(dry_run: bool = False):

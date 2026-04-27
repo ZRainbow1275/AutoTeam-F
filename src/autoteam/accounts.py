@@ -18,6 +18,11 @@ STATUS_PENDING = "pending"  # 已邀请，等待注册完成
 STATUS_PERSONAL = "personal"  # 已主动退出 team，走个人号 Codex OAuth，不再参与 Team 轮转
 STATUS_AUTH_INVALID = "auth_invalid"  # auth_file token 已不可用(401/403),待 reconcile 清理或重登
 STATUS_ORPHAN = "orphan"  # 在 workspace 里占着席位,但本地没 auth_file(残废,待人工介入或兜底 kick)
+# Round 9 SPEC v2.0 — 母号 cancel_at_period_end 期内子号过渡态:
+# 仍持有有效 auth_file + token,wham 200 plan=team 可继续消耗配额;
+# 不参与 fill / cmd_rotate / cmd_check 工作池,grace_until 到期才转 STANDBY。
+# 仅由 _apply_master_degraded_classification helper 写入与撤回(I10 不变量)。
+STATUS_DEGRADED_GRACE = "degraded_grace"
 
 # 席位类型:标记该账号在 ChatGPT Team 里被授予的席位种类,用于下游 fill / check 区分对待
 SEAT_CHATGPT = "chatgpt"  # 完整 ChatGPT 席位(PATCH invite seat_type=default 成功)
