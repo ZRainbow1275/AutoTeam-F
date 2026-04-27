@@ -1,5 +1,33 @@
 <template>
   <div class="mt-6 space-y-6">
+    <!-- Round 8 — 母号订阅健康度 banner(spec §6.4) -->
+    <div
+      v-if="masterHealth && masterHealth.healthy === false && masterHealth.reason === 'subscription_cancelled'"
+      class="bg-red-500/10 border border-red-500/30 rounded-xl p-4"
+    >
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex-1">
+          <h2 class="text-base font-semibold text-red-300">母号 ChatGPT Team 订阅已 cancel</h2>
+          <p class="text-sm text-red-200/80 mt-1">
+            eligible_for_auto_reactivation=true, fill-personal 必拿 plan_type=team。请先续订或更换母号,
+            否则 fill-personal 入口会被 503 拒绝。
+          </p>
+          <div v-if="masterHealth.evidence" class="text-xs text-red-200/60 mt-2 font-mono break-all">
+            account_id={{ masterHealth.evidence.account_id || '-' }} |
+            current_user_role={{ masterHealth.evidence.current_user_role || '-' }} |
+            cached={{ masterHealth.evidence.cached ? 'yes' : 'no' }}
+          </div>
+        </div>
+        <button
+          class="px-3 py-1.5 text-xs rounded-md bg-red-500/20 text-red-200 hover:bg-red-500/30 disabled:opacity-50"
+          :disabled="masterHealthLoading"
+          @click="reloadMasterHealth(true)"
+        >
+          {{ masterHealthLoading ? '检测中...' : '立即重测' }}
+        </button>
+      </div>
+    </div>
+
     <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
       <div class="flex items-center justify-between gap-4 mb-4">
         <div>
@@ -554,6 +582,22 @@ watch(
   { immediate: true },
 )
 
+// Round 8 — 母号订阅健康度
+const masterHealth = ref(null)
+const masterHealthLoading = ref(false)
+
+async function reloadMasterHealth(forceRefresh = false) {
+  masterHealthLoading.value = true
+  try {
+    masterHealth.value = await api.getMasterHealth(forceRefresh)
+  } catch (e) {
+    console.error('加载母号健康度失败:', e)
+    masterHealth.value = null
+  } finally {
+    masterHealthLoading.value = false
+  }
+}
+
 // SPEC-2 — 席位偏好 + sync 探测节流(本块独立于上面的 mailForm)
 const preferredSeatType = ref('default')
 const syncProbeConcurrency = ref(5)
@@ -625,6 +669,10 @@ onMounted(async () => {
     syncProbeCooldown.value = sp?.cooldown_minutes ?? 30
   } catch (e) {
     console.error('加载 sync 探测节流失败:', e)
+  }
+  // Round 8 — 母号订阅健康度(走 5min cache,首屏不加 force_refresh)
+  if (props.adminStatus?.configured) {
+    reloadMasterHealth(false)
   }
 })
 

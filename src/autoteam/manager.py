@@ -67,7 +67,7 @@ from autoteam.config import get_playwright_launch_options
 from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
 from autoteam.identity import random_age, random_birthday, random_full_name, random_password
 from autoteam.invite import RegisterBlocked  # SPEC-2 shared/add-phone-detection §5 — 5 处 OAuth 调用方 catch
-from autoteam.register_failures import record_failure
+from autoteam.register_failures import MASTER_SUBSCRIPTION_DEGRADED, record_failure
 from autoteam.textio import read_text, write_text
 
 logger = logging.getLogger(__name__)
@@ -1526,6 +1526,50 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             out_outcome.update(status=status, email=email, **extra)
 
     if leave_workspace:
+        # Round 8 — SPEC-2 v1.5 §3.7 + shared/master-subscription-health.md M-T1:
+        # personal OAuth 入口先验证母号订阅健康度。母号 cancel 时 personal 子号必拿 plan_type=team,
+        # 跑完 OAuth 也只是积累一条 plan_drift,所以 fail-fast 不进 OAuth。
+        try:
+            from autoteam.master_health import is_master_subscription_healthy
+            temp_probe_api = ChatGPTTeamAPI()
+            try:
+                temp_probe_api.start()
+                healthy, master_reason, master_evidence = is_master_subscription_healthy(temp_probe_api)
+            finally:
+                try:
+                    temp_probe_api.stop()
+                except Exception:
+                    pass
+        except Exception as probe_exc:
+            logger.warning("[注册] master health probe 异常 %s,按既有逻辑放行", probe_exc)
+            healthy, master_reason, master_evidence = True, "active", {"detail": str(probe_exc)[:200]}
+
+        if not healthy and master_reason == "subscription_cancelled":
+            logger.error(
+                "[注册] master 母号订阅已取消(eligible_for_auto_reactivation=true),fail-fast 不进 personal OAuth: %s",
+                email,
+            )
+            record_failure(
+                email, MASTER_SUBSCRIPTION_DEGRADED,
+                "master subscription cancelled,personal OAuth 必拿 plan_type=team",
+                stage="run_post_register_oauth_personal_precheck",
+                master_account_id=master_evidence.get("account_id"),
+                master_role=master_evidence.get("current_user_role"),
+            )
+            update_account(email, status=STATUS_STANDBY)
+            _record_outcome("master_degraded", reason="master subscription cancelled")
+            return None
+        if not healthy and master_reason in ("network_error", "auth_invalid"):
+            logger.warning(
+                "[注册] master health probe 不确定 (%s),按既有逻辑放行,失败由 plan_drift 兜底",
+                master_reason,
+            )
+        elif not healthy and master_reason in ("workspace_missing", "role_not_owner"):
+            logger.warning(
+                "[注册] master 异常 (%s, role=%s),仍尝试 personal OAuth,reconcile 后续接管",
+                master_reason, master_evidence.get("current_user_role"),
+            )
+
         # 退出 Team 必须用主号权限，临时起一个 ChatGPTTeamAPI 实例完成 DELETE
         logger.info("[注册] leave_workspace=True，先将 %s 从 Team 中移出...", email)
         temp_api = ChatGPTTeamAPI()
@@ -1546,112 +1590,225 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             _record_outcome("kick_failed", reason=f"主号踢出失败 status={remove_status}")
             return None
 
-        # kick 成功后必须等 OpenAI 后端同步:DELETE /users 返回 2xx 不代表 auth.openai.com
-        # 立刻把 default workspace 从 Team 切回 Personal。如果此时立刻开 OAuth,auth 会
-        # 继续把 Team 当 default 颁发 team plan 的 token,拿到的 bundle 会被 plan_type 校
-        # 验拒收(codex_auth.py login_codex_via_browser 末尾)→ 整个账号 oauth_failed,白跑
-        # 2 分钟。等 8s 足够让 workspace default 切换生效,同时也不会让用户觉得慢
-        if remove_status == "removed":
-            logger.info("[注册] kick 成功,等 8s 让 OpenAI workspace default 同步后再 OAuth...")
-            time.sleep(8)
+        # Round 8 — SPEC-2 v1.5 §3.4.5 + shared/oauth-workspace-selection.md §4.3:
+        # 删除原 time.sleep(8)。kick 成功不等同于 auth.openai.com 把 default_workspace_id 从
+        # Team 切回 Personal — research/sticky-rejoin §1.2-1.3 实测 default 不会自动 unset。
+        # sticky 根因是 default 没切,等多久都没用。改用 oauth_workspace.ensure_personal_workspace_selected
+        # 在 OAuth 内主动 POST /api/accounts/workspace/select 切到 personal,5 次外层重试触发后端最终一致性。
 
-        # SPEC-2 §3.1.3 — personal 分支 catch RegisterBlocked + plan_supported 检查
-        try:
-            bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
-        except RegisterBlocked as blocked:
-            if blocked.is_phone:
-                logger.error(
-                    "[注册] %s personal OAuth 触发 add-phone (step=%s),从账号池删除",
-                    email, blocked.step,
+        # Round 8 — 5 次 personal OAuth 重试外层(spec §3.4 退避表 ±20% jitter)
+        # 触发条件:bundle.plan_type != "free" 但 workspace/select 主路径成功 →
+        #   后端最终一致性短暂滞后,重试可触发刷新(openai/codex#1977 ejntaylor 实证)
+        import random as _random
+
+        from autoteam.register_failures import (
+            OAUTH_PLAN_DRIFT_PERSISTENT as _OAUTH_PLAN_DRIFT_PERSISTENT,
+        )
+        bundle = None
+        max_retries = 5
+        retry_backoff = (0, 5, 10, 20, 30)
+        plan_drift_history = []  # 收集每次拿到的非-free plan_type,fail-fast 时一起 record_failure
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                base_delay = retry_backoff[attempt] if attempt < len(retry_backoff) else 30
+                jitter = base_delay * _random.uniform(-0.2, 0.2)
+                sleep_secs = max(0, base_delay + jitter)
+                logger.info(
+                    "[注册] personal OAuth 第 %d/%d 次重试,先退避 %.1fs",
+                    attempt + 1, max_retries, sleep_secs,
                 )
+                if sleep_secs > 0:
+                    time.sleep(sleep_secs)
+
+            # SPEC-2 §3.1.3 — personal 分支 catch RegisterBlocked + plan_supported 检查
+            try:
+                bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
+            except RegisterBlocked as blocked:
+                # add-phone / duplicate 等异常是 terminal,不重试
+                if blocked.is_phone:
+                    logger.error(
+                        "[注册] %s personal OAuth 触发 add-phone (step=%s),从账号池删除",
+                        email, blocked.step,
+                    )
+                    record_failure(
+                        email,
+                        "oauth_phone_blocked",
+                        f"personal OAuth 阶段触发 add-phone (step={blocked.step})",
+                        step=blocked.step,
+                        stage="run_post_register_oauth_personal",
+                        attempt=attempt + 1,
+                    )
+                    delete_account(email)
+                    _record_outcome("oauth_phone_blocked", reason="personal OAuth 触发 add-phone")
+                    return None
+                logger.error("[注册] %s personal OAuth RegisterBlocked: %s", email, blocked.reason)
                 record_failure(
-                    email,
-                    "oauth_phone_blocked",
-                    f"personal OAuth 阶段触发 add-phone (step={blocked.step})",
-                    step=blocked.step,
+                    email, "exception",
+                    f"personal OAuth RegisterBlocked: {blocked.reason}",
                     stage="run_post_register_oauth_personal",
+                    attempt=attempt + 1,
                 )
                 delete_account(email)
-                _record_outcome("oauth_phone_blocked", reason="personal OAuth 触发 add-phone")
+                _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
                 return None
-            # is_duplicate 或其他异常子类:OAuth 阶段不应出现 duplicate,记 exception 兜底
-            logger.error("[注册] %s personal OAuth RegisterBlocked: %s", email, blocked.reason)
-            record_failure(email, "exception", f"personal OAuth RegisterBlocked: {blocked.reason}",
-                           stage="run_post_register_oauth_personal")
+
+            if not bundle:
+                # bundle 没拿到 — 这是 oauth 路径 abort(workspace_select 失败 / 网络错误),不重试,直接 fail
+                logger.error("[注册] %s personal OAuth 第 %d/%d 次未返回 bundle,放弃重试",
+                             email, attempt + 1, max_retries)
+                break
+
+            bundle_plan = (bundle.get("plan_type") or "").lower()
+            if bundle_plan == "free":
+                # 拿到 free,直接出循环走后续 plan_supported / quota probe / save_auth_file
+                logger.info("[注册] %s 第 %d 次 personal OAuth 拿到 plan=free,出重试循环",
+                            email, attempt + 1)
+                break
+
+            # plan_type != free → 后端最终一致性滞后,记一笔继续重试
+            plan_drift_history.append({
+                "attempt": attempt + 1,
+                "plan_type": bundle_plan,
+                "plan_type_raw": bundle.get("plan_type_raw"),
+                "account_id": bundle.get("account_id"),
+            })
+            logger.warning(
+                "[注册] %s 第 %d/%d 次 personal OAuth 拿到 plan=%s(非 free),继续重试",
+                email, attempt + 1, max_retries, bundle_plan,
+            )
+            bundle = None  # 清掉这次的 bundle,不让 fall-through 误用
+
+        # 退出循环:bundle 要么 None(所有 attempt 都 abort 或 plan_drift),要么 plan==free
+        if not bundle:
+            logger.error(
+                "[注册] %s 5 次 personal OAuth 后仍未拿到 plan=free,fail-fast 删除账号",
+                email,
+            )
+            record_failure(
+                email, _OAUTH_PLAN_DRIFT_PERSISTENT,
+                f"5 次 personal OAuth 后 plan_type 仍非 free (drift_history={len(plan_drift_history)} 条)",
+                stage="run_post_register_oauth_personal",
+                attempts=max_retries,
+                drift_history=plan_drift_history,
+            )
             delete_account(email)
-            _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
+            _record_outcome("oauth_failed", reason="5 次 personal OAuth plan_drift 持续")
             return None
 
-        if bundle:
-            # SPEC-2 shared/plan-type-whitelist §5.2 — plan_supported=False 直接拒,personal 已 leave_workspace 本地无价值
-            plan_supported = bundle.get(
-                "plan_supported", is_supported_plan(bundle.get("plan_type", ""))
+        # bundle.plan_type=="free" 已在循环内验证,此处仍走完整白名单 + quota 流程保留对称
+        # SPEC-2 shared/plan-type-whitelist §5.2 — plan_supported=False 直接拒,personal 已 leave_workspace 本地无价值
+        plan_supported = bundle.get(
+            "plan_supported", is_supported_plan(bundle.get("plan_type", ""))
+        )
+        if not plan_supported:
+            logger.error(
+                "[注册] %s personal OAuth 拿到 plan_type=%s 不在白名单,从账号池删除",
+                email, bundle.get("plan_type_raw") or bundle.get("plan_type"),
             )
-            if not plan_supported:
-                logger.error(
-                    "[注册] %s personal OAuth 拿到 plan_type=%s 不在白名单,从账号池删除",
-                    email, bundle.get("plan_type_raw") or bundle.get("plan_type"),
-                )
+            record_failure(
+                email, "plan_unsupported",
+                f"personal OAuth bundle plan_type={bundle.get('plan_type_raw')} 不在白名单",
+                plan_type=bundle.get("plan_type"),
+                plan_type_raw=bundle.get("plan_type_raw"),
+                stage="run_post_register_oauth_personal",
+            )
+            delete_account(email)
+            _record_outcome("plan_unsupported", plan=bundle.get("plan_type"))
+            return None
+
+        auth_file = save_auth_file(bundle)
+        update_fields = {
+            "status": STATUS_PERSONAL,
+            "seat_type": "codex",
+            "auth_file": auth_file,
+            "last_active_at": time.time(),
+            "plan_type_raw": bundle.get("plan_type_raw"),
+        }
+        # SPEC-2 FR-D3 — personal 分支也 quota probe(对称设计):free plan 也可能"未分配 codex 配额"
+        access_token = bundle.get("access_token")
+        if access_token:
+            try:
+                quota_status, quota_info = check_codex_quota(access_token, account_id=bundle.get("account_id"))
+                if quota_status == "ok" and isinstance(quota_info, dict):
+                    update_fields["last_quota"] = quota_info
+                elif quota_status == "no_quota":
+                    # personal free 无配额 — 记一笔但仍保留 PERSONAL,让用户决定删不删
+                    record_failure(
+                        email, "no_quota_assigned",
+                        "personal free plan 无 codex 配额",
+                        stage="run_post_register_oauth_personal",
+                        raw_rate_limit=_extract_raw_rate_limit_str(quota_info),
+                    )
+            except Exception as exc:
                 record_failure(
-                    email, "plan_unsupported",
-                    f"personal OAuth bundle plan_type={bundle.get('plan_type_raw')} 不在白名单",
-                    plan_type=bundle.get("plan_type"),
-                    plan_type_raw=bundle.get("plan_type_raw"),
+                    email, "quota_probe_network_error",
+                    f"personal quota probe exception: {exc}",
                     stage="run_post_register_oauth_personal",
                 )
-                delete_account(email)
-                _record_outcome("plan_unsupported", plan=bundle.get("plan_type"))
-                return None
+        # personal 分支:已主动退出 Team,bundle 是个人 free/plus plan,算 codex 席位
+        update_account(email, **update_fields)
+        logger.info("[注册] 免费号就绪: %s (plan=%s, attempts=%d)",
+                    email, bundle.get("plan_type"), len(plan_drift_history) + 1)
+        _record_outcome("success", plan=bundle.get("plan_type"))
+        return email
 
-            auth_file = save_auth_file(bundle)
-            update_fields = {
-                "status": STATUS_PERSONAL,
-                "seat_type": "codex",
-                "auth_file": auth_file,
-                "last_active_at": time.time(),
-                "plan_type_raw": bundle.get("plan_type_raw"),
-            }
-            # SPEC-2 FR-D3 — personal 分支也 quota probe(对称设计):free plan 也可能"未分配 codex 配额"
-            access_token = bundle.get("access_token")
-            if access_token:
-                try:
-                    quota_status, quota_info = check_codex_quota(access_token, account_id=bundle.get("account_id"))
-                    if quota_status == "ok" and isinstance(quota_info, dict):
-                        update_fields["last_quota"] = quota_info
-                    elif quota_status == "no_quota":
-                        # personal free 无配额 — 记一笔但仍保留 PERSONAL,让用户决定删不删
-                        record_failure(
-                            email, "no_quota_assigned",
-                            "personal free plan 无 codex 配额",
-                            stage="run_post_register_oauth_personal",
-                            raw_rate_limit=_extract_raw_rate_limit_str(quota_info),
-                        )
-                except Exception as exc:
-                    record_failure(
-                        email, "quota_probe_network_error",
-                        f"personal quota probe exception: {exc}",
-                        stage="run_post_register_oauth_personal",
-                    )
-            # personal 分支:已主动退出 Team,bundle 是个人 free/plus plan,算 codex 席位
-            update_account(email, **update_fields)
-            logger.info("[注册] 免费号就绪: %s (plan=%s)", email, bundle.get("plan_type"))
-            _record_outcome("success", plan=bundle.get("plan_type"))
-            return email
+    # Round 8 — SPEC-2 v1.5 §3.7 表第 2 行 + shared/master-subscription-health.md M-T2:
+    # Team 分支也需对称 master probe。母号 cancel 时 Team invite 同样必拿 plan_type=free,
+    # 跑完 OAuth 只是堆 plan_drift(实测已观测 28 条)。fail-fast 不进 OAuth 节省 2 分钟。
+    # 与 personal 分支差异:Team 已成功 invite,席位占着 → 标 AUTH_INVALID + 主动 kick 释放席位
+    # (不能 delete_account,席位还在 Team)。
+    try:
+        from autoteam.master_health import is_master_subscription_healthy
+        team_probe_api = ChatGPTTeamAPI()
+        try:
+            team_probe_api.start()
+            t_healthy, t_master_reason, t_master_evidence = is_master_subscription_healthy(team_probe_api)
+        finally:
+            try:
+                team_probe_api.stop()
+            except Exception:
+                pass
+    except Exception as probe_exc:
+        logger.warning("[注册] Team master health probe 异常 %s,按既有逻辑放行", probe_exc)
+        t_healthy, t_master_reason, t_master_evidence = True, "active", {"detail": str(probe_exc)[:200]}
 
-        # personal OAuth 失败 — 不留僵尸 PERSONAL 记录：直接从 accounts.json 删除，失败明细写 register_failures.json
-        # 用户能在失败日志里看到发生了什么（哪个 email / 是什么阶段 / 什么时候），账号列表保持干净
+    if not t_healthy and t_master_reason == "subscription_cancelled":
         logger.error(
-            "[注册] %s 已退出 Team 但 personal Codex OAuth 未返回认证 bundle，从账号池删除",
+            "[注册] master 母号订阅已取消(eligible_for_auto_reactivation=true),fail-fast 不进 Team OAuth: %s",
             email,
         )
-        delete_account(email)
         record_failure(
-            email,
-            "oauth_failed",
-            "已退出 Team 但 personal Codex OAuth 登录未返回 bundle",
-            stage="post_leave_workspace",
+            email, MASTER_SUBSCRIPTION_DEGRADED,
+            "master subscription cancelled,Team OAuth 必拿 plan_type=free",
+            stage="run_post_register_oauth_team_precheck",
+            master_account_id=t_master_evidence.get("account_id"),
+            master_role=t_master_evidence.get("current_user_role"),
         )
-        _record_outcome("oauth_failed", reason="personal Codex OAuth 未返回 bundle")
+        # Team 已 invite,不能 delete_account → 标 AUTH_INVALID + 主动 kick 释放席位
+        # (避免 28 条 plan_drift 子号长期占着 Team 名额)
+        update_account(
+            email,
+            status=STATUS_AUTH_INVALID,
+            workspace_account_id=get_chatgpt_account_id() or None,
+        )
+        try:
+            cleanup_api = ChatGPTTeamAPI()
+            try:
+                cleanup_api.start()
+                kick_status = remove_from_team(cleanup_api, email, return_status=True)
+                logger.info(
+                    "[注册] master degraded → kick Team 残留席位 %s status=%s",
+                    email, kick_status,
+                )
+            finally:
+                try:
+                    cleanup_api.stop()
+                except Exception:
+                    pass
+        except Exception as kick_exc:
+            logger.warning("[注册] master degraded 后 kick %s 抛异常(留给下次对账): %s", email, kick_exc)
+        _record_outcome("master_degraded", reason="master subscription cancelled (Team)")
         return None
 
     # 原有 Team 流程 — SPEC-2 §3.1.2 改造:catch RegisterBlocked + plan_supported 检查 + quota probe
@@ -4348,6 +4505,80 @@ def cmd_pull_cpa():
     return result
 
 
+def _reconcile_master_degraded_subaccounts(*, dry_run: bool = False):
+    """Round 8 — SPEC-2 v1.5 §3.5.3:reconcile retroactive 清理。
+
+    若母号订阅已降级(subscription_cancelled),将本地 ACTIVE/EXHAUSTED 账号中
+    workspace_account_id 等于当前(已降级)母号 account_id 的子号统一标 STANDBY,
+    避免 health-check 把 plan=team 的"已脱身"账号误派出去。
+
+    条件:
+        master_health: subscription_cancelled
+        account.status in (ACTIVE, EXHAUSTED, AUTH_INVALID) and
+        account.workspace_account_id == current_master_account_id
+
+    Returns: dict { "degraded_marked": [emails], "skipped_reason": str|None }
+    """
+    from autoteam.master_health import is_master_subscription_healthy
+
+    out = {"degraded_marked": [], "skipped_reason": None}
+    try:
+        temp_api = ChatGPTTeamAPI()
+        try:
+            temp_api.start()
+            healthy, reason, evidence = is_master_subscription_healthy(temp_api)
+        finally:
+            try:
+                temp_api.stop()
+            except Exception:
+                pass
+    except Exception as exc:
+        out["skipped_reason"] = f"probe_exception:{exc}"
+        return out
+
+    if healthy or reason != "subscription_cancelled":
+        out["skipped_reason"] = f"master healthy(reason={reason}),无需 retroactive cleanup"
+        return out
+
+    master_aid = (evidence or {}).get("account_id") or get_chatgpt_account_id()
+    if not master_aid:
+        out["skipped_reason"] = "无法解析当前母号 account_id"
+        return out
+
+    candidates = []
+    for acc in load_accounts():
+        if acc.get("status") not in (STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID):
+            continue
+        if (acc.get("workspace_account_id") or "") != master_aid:
+            continue
+        candidates.append(acc.get("email"))
+
+    logger.info(
+        "[对账-retroactive] master degraded(reason=%s),候选 standby 子号 %d 个: %s",
+        reason, len(candidates), candidates,
+    )
+
+    if dry_run:
+        out["degraded_marked"] = candidates
+        out["skipped_reason"] = "dry_run"
+        return out
+
+    for em in candidates:
+        try:
+            update_account(em, status=STATUS_STANDBY)
+            record_failure(
+                em, MASTER_SUBSCRIPTION_DEGRADED,
+                "reconcile retroactive cleanup:母号 cancelled,子号统一 standby",
+                stage="reconcile_retroactive",
+                master_account_id=master_aid,
+            )
+            out["degraded_marked"].append(em)
+        except Exception as exc:
+            logger.warning("[对账-retroactive] 标 standby 失败 email=%s err=%s", em, exc)
+
+    return out
+
+
 def cmd_reconcile(dry_run: bool = False):
     """独立运行一次对账,修正残废 / 错位 / 耗尽未抛弃 / ghost 成员。
 
@@ -4355,6 +4586,8 @@ def cmd_reconcile(dry_run: bool = False):
     - 不做额度检查、不触发 Codex 登录,纯做状态对齐
     - 入口日志更友好,返回结构化 result 便于 API / 脚本消费
     - dry_run=True 等价于 cmd_reconcile_dry_run,只输出诊断不动账户
+
+    Round 8 — 在常规 reconcile 后额外做 master-degraded retroactive cleanup。
     """
     logger.info("[对账] 开始独立对账 dry_run=%s", dry_run)
     recon = _reconcile_team_members(dry_run=dry_run)
@@ -4379,6 +4612,23 @@ def cmd_reconcile(dry_run: bool = False):
         items = recon.get(k) or []
         if items:
             logger.info("[对账] %s → %s", k, items)
+
+    # Round 8 — retroactive cleanup
+    try:
+        retro = _reconcile_master_degraded_subaccounts(dry_run=dry_run)
+        recon["master_degraded_retroactive"] = retro
+        if retro.get("degraded_marked"):
+            logger.info(
+                "[对账-retroactive] %s标 standby %d 个: %s",
+                "(dry-run) " if dry_run else "",
+                len(retro["degraded_marked"]),
+                retro["degraded_marked"],
+            )
+    except Exception as exc:
+        logger.warning("[对账-retroactive] 异常未阻塞主对账: %s", exc)
+        recon["master_degraded_retroactive"] = {
+            "degraded_marked": [], "skipped_reason": f"exception:{exc}",
+        }
 
     return recon
 

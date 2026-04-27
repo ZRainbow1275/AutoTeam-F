@@ -82,6 +82,11 @@ const props = defineProps({
     type: String,
     default: 'all',
   },
+  // Round 8 — 母号订阅健康度,degraded 时禁用 fill-personal
+  masterHealth: {
+    type: Object,
+    default: null,
+  },
 })
 const emit = defineEmits(['task-started', 'refresh'])
 
@@ -205,9 +210,19 @@ const adminHint = computed(() => {
 })
 const showAdminHint = computed(() => !adminReady.value && (props.mode === 'pool' || props.mode === 'sync'))
 
+const masterDegraded = computed(() => {
+  // Round 8 — fill-personal 在 master cancelled 时禁用,避免账号池堆 plan_drift 失败
+  return !!(
+    props.masterHealth
+    && props.masterHealth.healthy === false
+    && props.masterHealth.reason === 'subscription_cancelled'
+  )
+})
+
 function isDisabled(action) {
   if (props.runningTask) return true
   if (!adminReady.value && !action.allowWithoutAdmin) return true
+  if (action.key === 'fill-personal' && masterDegraded.value) return true
   return false
 }
 

@@ -8,10 +8,10 @@
 | 名称 | 账号生命周期与配额加固 实施规范 |
 | 主笔 | prd-lifecycle |
 | 时间 | 2026-04-26 |
-| 版本 | v1.4 (2026-04-26 Round 7 P2 follow-up — 命名归一化 + task["error"] 关键字契约 + 24h 去重接入) |
-| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) |
-| 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) |
-| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** |
+| 版本 | v1.5 (2026-04-27 Round 8 — master subscription probe + oauth workspace/select 显式选 personal + sleep(8) 删除) |
+| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) · `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/prd.md` (Round 8 PRD-7 候选) |
+| 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) · [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) (Round 8 新增) · [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) (Round 8 新增) |
+| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** / **M1~M4 / W1~W5(Round 8)** |
 
 ---
 
@@ -35,6 +35,27 @@
 
 **总计**:13 个文件,预计 +650 行 / -120 行。
 
+**Round 8(v1.5)新增/调整文件清单**:
+
+| 文件 | 预估改动行数 | 涉及 |
+|---|---|---|
+| `src/autoteam/chatgpt_api.py` 或新模块 `master_health.py` | +180 | `is_master_subscription_healthy` 三层探针 + `.master_health_cache.json` 读写 |
+| `src/autoteam/chatgpt_api.py` 或新模块 `oauth_workspace.py` | +220 | `decode_oauth_session_cookie` / `select_oauth_workspace` / `force_select_personal_via_ui` / `ensure_personal_workspace_selected` |
+| `src/autoteam/codex_auth.py` | ~30 | `login_codex_via_browser(use_personal=True)` 内 consent 后 / callback 前接入 ensure_personal_workspace_selected |
+| `src/autoteam/manager.py` | ~80 | M-T1 / M-T2 / M-T5 接入;personal 5 次 OAuth 重试外层;**删 `time.sleep(8)`(L1554-1556)** |
+| `src/autoteam/api.py` | ~40 | M-T3(/api/tasks/fill 入口 503)+ M-T4(/api/admin/diagnose 扩 master_subscription_state)+ 新增 `/api/admin/master-health` |
+| `src/autoteam/register_failures.py` | +5 | docstring 扩 4 个 Round 8 category |
+| `web/src/views/Settings.vue` | +30 | master degraded 横幅 + 立即重测按钮 |
+| `web/src/components/Dashboard.vue` | ~20 | master 不健康时禁用 fill 按钮 + 横幅链接 |
+| `prompts/0426/spec/shared/master-subscription-health.md` | (新) | 见本 spec §3.7 引用 |
+| `prompts/0426/spec/shared/oauth-workspace-selection.md` | (新) | 见本 spec §3.4.7 引用 |
+| `tests/unit/test_master_subscription_probe.py` | (新) | 见 master-subscription-health.md §8.2 |
+| `tests/unit/test_oauth_workspace_select.py` | (新) | 见 oauth-workspace-selection.md §7.2 |
+| `tests/fixtures/master_accounts_responses.json` | (新) | master probe 8 个 fixture |
+| `tests/fixtures/oauth_session_cookies.json` | (新) | oai-oauth-session 5 个 fixture |
+
+**Round 8 总计追加**:~14 个文件 / 约 +600 行 / -10 行(删 sleep(8))。
+
 ---
 
 ## 2. 引用的 shared specs
@@ -47,6 +68,8 @@
 | [`./shared/quota-classification.md`](./shared/quota-classification.md) | `check_codex_quota` 5 分类签名、QuotaSnapshot / QuotaExhaustedInfo 类型、9+2 调用点处置 |
 | [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) | RegisterBlocked / assert_not_blocked 复用契约、4 探针接入点位置、5 调用方处置模板 |
 | [`./shared/account-state-machine.md`](./shared/account-state-machine.md) | 7 状态完整状态机、AccountRecord Pydantic 模型、转移矩阵、不变量 |
+| [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) (Round 8) | `is_master_subscription_healthy()` 三层探针、5min cache、5 触发位点、5 误判缓解、10 不变量(M-I1~I10) |
+| [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) (Round 8) | `decode_oauth_session_cookie / select_oauth_workspace / force_select_personal_via_ui / ensure_personal_workspace_selected`、5 次重试、3 失败分类、sleep(8) 删除依据、10 不变量(W-I1~I10) |
 
 ---
 
@@ -615,6 +638,8 @@ if use_personal:
 
 **验收**:`grep -rn "oauth_personal_check" src/autoteam/codex_auth.py` 必须命中 1 处(Round 6 实测 `:939` 已落地 ✅)。
 
+**Round 8 关联说明 — `time.sleep(8)` 已删除**:`manager.py:1554-1556` kick 后 `time.sleep(8)` **C-P4 探针不变,但同 round 8 一并删除该 sleep**。删除依据:研究证实 `auth.openai.com.session.default_workspace_id` 不随 ChatGPT DELETE user 自动 unset,等 8s / 80s / 800s 都没用,sticky 根因不是同步延迟而是 default 不会自动切。完整理由 + 替代方案见 [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) §4.3 + W-I7 不变量。删除后 personal 流程时长降低 8s。
+
 ### 3.4.6 quota check 24h 去重(Round 7 FR-D6)
 
 **位置**:`codex_auth.py:check_codex_quota` 内 uninitialized_seat 分支
@@ -634,6 +659,31 @@ if use_personal:
 **详见**:`./shared/quota-classification.md §4.4`(完整工具函数代码 + I9 不变量)
 
 **调用方透明**:9+2 调用方对 `check_codex_quota` 的 5 分类处置不变,24h 去重由 `check_codex_quota` 内部消化。
+
+### 3.4.7 OAuth Personal Workspace 显式选择(Round 8 FR-W1~W5)
+
+**位置**:`src/autoteam/codex_auth.py:login_codex_via_browser` 的 `use_personal=True` 分支,接入位置在 consent 循环结束后、callback 等待之前。`src/autoteam/manager.py:_run_post_register_oauth(leave_workspace=True)` 外层承担 5 次 OAuth 重试。
+
+**契约**:在 personal OAuth 拿到 callback 之前**主动**选 personal workspace,绕过 sticky-default;失败时按 3 类 fail_category 落 register_failures,最多 5 次重试触发后端最终一致性。
+
+**3 个失败分类**(spec-2 v1.5 RegisterFailureRecord enum 新增):
+
+| category | 触发条件 | 处置 |
+|---|---|---|
+| `oauth_workspace_select_no_personal` | `oai-oauth-session.workspaces[]` 中确认无 personal 项(user 在后端只属于 Team) | fail-fast,delete_account + record_failure;不重试 |
+| `oauth_workspace_select_endpoint_error` | 主路径 POST + Playwright UI fallback 都失败 | record_failure + 进 5 次重试外层(若 retries 用完后仍此 category 视为 endpoint 永久不可用,通知运营) |
+| `oauth_plan_drift_persistent` | workspace/select 成功但 5 次重试后 callback 仍 `plan_type=team` | delete_account + record_failure;后端最终一致性失败的尾声分类 |
+
+**Team 路径不调** — `use_personal=False` 时本流程**完全跳过**(Team 路径希望默认 = Team workspace,无动机切)。但 Team 路径仍需 master health probe(§3.7 / M-T2)。
+
+**accounts.json / register_failures.json 影响**:
+
+- 不新增 accounts.json 字段(失败信息全部走 register_failures)
+- register_failures.json 增 3 个 category enum(spec-2 v1.5 RegisterFailureRecord)
+
+**详见**:[`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md)(完整函数契约、cookie 解码契约、5 次重试退避表、抓包验证 checklist、10 不变量 W-I1~I10)。
+
+**与 §3.4.5 add-phone 探针的关系**:本流程**不**复用 `assert_not_blocked`(语义不同),且失败需要外层重试,因此**不抛**异常到 login_codex_via_browser 顶层,只返回 `(success, fail_category, evidence)` 三元组。
 
 ### 3.5 personal 删除链短路 fetch_team_state
 
@@ -896,6 +946,30 @@ async function removeAccount(email: string) {
 </template>
 ```
 
+### 3.7 Master 母号订阅健康度探针(Round 8 FR-M1~M4)
+
+**位置**:`src/autoteam/chatgpt_api.py` 末尾或新模块 `master_health.py` — 函数 `is_master_subscription_healthy()`;接入点跨 `manager.py / api.py` 共 5 处。
+
+**契约**:在 personal / Team 注册流程入口先调主探针 + 5 min cache,母号订阅 cancel 时 fail-fast,避免浪费 OAuth 周期。
+
+**5 个触发位点**(见 [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) §4 触发位点矩阵 完整版):
+
+| # | 文件:函数 | 失败行为(`subscription_cancelled`) |
+|---|---|---|
+| M-T1 | `manager.py:_run_post_register_oauth(leave_workspace=True)` 入口(personal 分支) | record_failure(category=`master_subscription_degraded`, stage=`run_post_register_oauth_personal_precheck`) + update_account(STATUS_STANDBY) + `_record_outcome("master_degraded")` + 不进 OAuth |
+| M-T2 | `manager.py:_run_post_register_oauth(leave_workspace=False)` 入口(Team 分支) | 同 M-T1,stage=`run_post_register_oauth_team_precheck`;子号已 invite → 走 `_cleanup_team_leftover` 不直接 STANDBY |
+| M-T3 | `api.py:fill_team_task / fill_personal_task` 任务起点(`/api/tasks/fill` handler 入口) | HTTP 503 + body `{"error":"master_subscription_degraded","reason":"<reason>","evidence":<裁剪后>}` |
+| M-T4 | `api.py:get_admin_diagnose`(`/api/admin/diagnose` 现有 4-probe 旁挂) | 返回 `master_subscription_state` 字段;支持 `?force_refresh=1` |
+| M-T5 | `manager.py:cmd_reconcile` 入口 | reconcile 仅做"扫描不动作",日志告警 + 不执行 KICK / state flip(M-I10 不变量) |
+
+**register_failures.json schema 影响**:新增 category `master_subscription_degraded`(spec-2 v1.5 RegisterFailureRecord enum 扩)。
+
+**accounts.json 影响**:不新增账号字段;新增 `accounts/.master_health_cache.json` 缓存文件(schema_version + cache by master account_id),5 min TTL,与 `accounts.json` 同 file-lock。
+
+**详见**:[`./shared/master-subscription-health.md`](./shared/master-subscription-health.md)(完整三层探针 / 6 reason 枚举 / 5 误判缓解 / 10 不变量 M-I1~I10 / 单元测试 fixture)。
+
+**与 §3.4.7 的串联**:M-T1 / M-T2 healthy=False → 不进 OAuth → 不调 §3.4.7 workspace/select;M-T1 healthy=True → 进 OAuth → §3.4.7 显式选 personal → callback。两者前后串联,master health 是 personal 流程的前置门控。
+
 ---
 
 ## 4. 数据契约
@@ -909,6 +983,12 @@ async function removeAccount(email: string) {
 | `last_kicked_at` | float \| null | null | `sync_account_states` 探测到 wham 401 时写入 | reconcile 历史回放 / UI 展示"X 分钟前被踢" |
 | `last_quota.primary_total` | int \| null | null | `check_codex_quota` 解析 wham/usage 写入 | no_quota 识别;UI 显示"无配额" |
 | `last_quota.primary_remaining` | int \| null | null | 同上 | UI 精确剩余值显示 |
+
+**Round 8 关联文件**(不新增 accounts.json 字段,但新增独立缓存文件):
+
+| 文件 | 类型 | 默认/初始 | 来源 | 用途 |
+|---|---|---|---|---|
+| `accounts/.master_health_cache.json` | JSON dict | `{schema_version:1, cache:{}}` | `is_master_subscription_healthy` 实测后写入 | 5 min TTL master health 缓存,见 [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) §2.3 |
 
 **JSON Schema 片段**:
 
@@ -1052,6 +1132,11 @@ class RegisterFailureRecord(BaseModel):
         "plan_drift",               # 新增
         "auth_error_at_oauth",      # 新增
         "quota_probe_network_error",# 新增
+        # —— Round 8 (v1.5) 新增 ——
+        "master_subscription_degraded",            # M-T1~T2 § 3.7;母号订阅 cancel
+        "oauth_workspace_select_no_personal",      # § 3.4.7 W-I2;workspaces[] 无 personal
+        "oauth_workspace_select_endpoint_error",   # § 3.4.7;主路径+UI fallback 都失败
+        "oauth_plan_drift_persistent",             # § 3.4.7;5 次重试后仍 plan_type=team
     ]
     reason: str
     stage: Optional[str] = None
@@ -1266,3 +1351,4 @@ Phase 6 (灰度上线)
 | v1.2 | 2026-04-26 Round 6 finalize | user 确认 Q-3 决策:§3.5.3 验收清单加 1 条 — 409 body 不带截图相对路径,前端自己拉 `/api/screenshots/...` 或读 `register_failures.json` 字段 |
 | v1.3 | 2026-04-26 Round 6 quality-reviewer 终审 follow-up | §3.4.5 C-P4 探针位置描述对齐实施(`codex_auth.py:939`):由"`if use_personal:` 这行**之前**"修订为"callback for-loop 之后,`browser.close()` 之前,`_exchange_auth_code` 之前"。理由:`if use_personal:` 在 `browser.close()` 之后,page 已 close,assert_not_blocked 异常会被吞为 False。表格"插入位置"列 + 实施代码段全部对齐;落地状态由 ❌ 改为 ✅;同步规范 try/except 关 browser 后 raise 的资源释放要求。详见 `prompts/0426/verify/round6-review-report.md` §3.1 决策 1 审查 |
 | v1.4 | 2026-04-26 Round 7 P2 follow-up | (1) §3.4.1 PREFERRED_SEAT_TYPE 命名归一化:主名 `default`(默认) / `codex`,加 `chatgpt` 转移期别名(setter 接受并 normalize 为 default,getter 永不返 chatgpt);(2) §3.4.6 加 quota check 24h 去重接入说明(Round 7 FR-D6,详见 quota-classification §4.4 + I9);(3) §3.5.3 加 task["error"] 关键字契约(phone_required / register_blocked 字符串子串匹配,前端 api.js 模板);(4) 引用方加 PRD-6;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.1 / §5.6 / §5.7 |
+| v1.5 | 2026-04-27 Round 8 master-team-degrade-oauth-rejoin | (1) 元数据引用 shared spec 加 `master-subscription-health.md` + `oauth-workspace-selection.md` 两份新 shared,关联 PRD 加 Round 8 PRD-7,覆盖 FR 加 M1~M4 / W1~W5;(2) §1 文件清单追加 Round 8 14 个文件(含 4 个新 shared/test fixture);(3) §3.4.5 末尾加注 — `manager.py:1554-1556 time.sleep(8)` 同 round 8 删除,完整理由见 `oauth-workspace-selection.md §4.3` + W-I7 不变量;(4) 新增 §3.4.7 OAuth Personal Workspace 显式选择 — `ensure_personal_workspace_selected` 编排 / 3 失败分类(`oauth_workspace_select_no_personal` / `oauth_workspace_select_endpoint_error` / `oauth_plan_drift_persistent`)/ Team 路径不调 / 5 次重试外层在 manager;(5) 新增 §3.7 Master 母号订阅健康度探针 — 5 触发位点 M-T1~T5(personal/Team OAuth 入口、`/api/tasks/fill` 503、`/api/admin/diagnose` 扩、cmd_reconcile 入口),5min cache 文件 `accounts/.master_health_cache.json`,与 §3.4.7 串联(master health 是 personal 流程前置门控);(6) §4.1 新增 `accounts/.master_health_cache.json` schema 描述;(7) §4.3 RegisterFailureRecord enum 加 4 个 Round 8 category;(8) 关联 `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/research/{master-subscription-probe,oauth-personal-selection,sticky-rejoin-mechanism}.md` 三份研究;Approach A 决策原文见 PRD §"Decision (ADR-lite)" |

@@ -106,6 +106,11 @@ export const api = {
 
   getRegisterFailures: (limit = 50) => request('GET', `/register-failures?limit=${limit}`),
 
+  // Round 8 — SPEC-2 v1.5 §6.2:母号订阅健康度独立端点
+  getMasterHealth: (forceRefresh = false) => request(
+    'GET', `/admin/master-health${forceRefresh ? '?force_refresh=1' : ''}`,
+  ),
+
   getTeamMembers: () => request('GET', '/team/members'),
   removeTeamMember: (payload) => request('POST', '/team/members/remove', payload),
   getLogs: (limit = 100, since = 0) => request('GET', `/logs?limit=${limit}&since=${since}`),

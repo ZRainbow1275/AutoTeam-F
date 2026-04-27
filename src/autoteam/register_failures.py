@@ -28,6 +28,21 @@ RECORD_LIMIT = 500
 _LOCK = threading.Lock()
 
 
+# Round 8 — Master Team 订阅降级 + OAuth Personal Workspace 显式选择
+# 详见 prompts/0426/spec/shared/master-subscription-health.md §7 + oauth-workspace-selection.md §2.3
+MASTER_SUBSCRIPTION_DEGRADED = "master_subscription_degraded"
+"""母号 ChatGPT Team 订阅 cancel(eligible_for_auto_reactivation=true)。M-T1 / M-T2 fail-fast。"""
+
+OAUTH_WS_NO_PERSONAL = "oauth_workspace_select_no_personal"
+"""workspaces[] 中找不到 personal 项 — user 在后端事实上只属于 Team。fail-fast,不重试。"""
+
+OAUTH_WS_ENDPOINT_ERROR = "oauth_workspace_select_endpoint_error"
+"""POST /api/accounts/workspace/select 4xx/5xx 且 UI fallback 失败。端点变更 / 反爬 / DOM 漂移。"""
+
+OAUTH_PLAN_DRIFT_PERSISTENT = "oauth_plan_drift_persistent"
+"""workspace/select 成功但 5 次 OAuth retry 后 bundle.plan_type 仍非 free — 后端最终一致性失败。"""
+
+
 def _load():
     if not FAILURES_FILE.exists():
         return []
@@ -71,6 +86,11 @@ def record_failure(email, category, reason="", **extra):
         'plan_drift'                 reinvite 后 plan_type 漂移到非 team
         'auth_error_at_oauth'        post-register quota 探测返回 401/403
         'quota_probe_network_error'  post-register quota 探测网络错误(允许下次重试)
+    category(Round 8 SPEC-2 v1.5 新增 — Master 订阅降级 / OAuth Workspace 显式选择):
+        'master_subscription_degraded'         母号 Team 订阅已 cancel(M-T1 / M-T2 fail-fast)
+        'oauth_workspace_select_no_personal'   OAuth session workspaces[] 中无 personal 项
+        'oauth_workspace_select_endpoint_error' workspace/select 端点 + UI fallback 都失败
+        'oauth_plan_drift_persistent'          5 次 OAuth retry 后 bundle.plan 仍非 free
 
     reason: 面向人的简短描述,显示在日志和面板。可留空,从 extra.detail 取代。
     extra:  任意附加字段(attempts, duplicate_swaps, step, url, stage, detail ...)

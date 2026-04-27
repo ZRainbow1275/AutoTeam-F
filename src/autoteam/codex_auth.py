@@ -905,6 +905,31 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             except Exception:
                 break
 
+        # Round 8 — SPEC-2 v1.5 §3.4.7 + shared/oauth-workspace-selection.md §4.1:
+        # personal OAuth 需要在 consent 循环之后、callback 之前**主动**选 personal workspace,
+        # 否则 issuer 按 default_workspace_id(sticky 指向 Team)颁 token,拿到 plan_type=team。
+        # 三层兜底:HTTP /api/accounts/workspace/select(主路径)→ Playwright UI fallback →
+        # 失败则返回 fail_category 由外层 5 次重试承担。
+        # Team 路径(use_personal=False)完全跳过 — 默认 default_workspace_id 已指向 Team。
+        if use_personal and not auth_code:
+            try:
+                from autoteam.oauth_workspace import ensure_personal_workspace_selected
+                consent_url_for_select = page.url or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+                ws_ok, ws_fail_category, ws_evidence = ensure_personal_workspace_selected(
+                    page, consent_url=consent_url_for_select,
+                )
+                if ws_ok:
+                    logger.info("[Codex] personal workspace 选择成功,继续等 callback")
+                else:
+                    logger.warning(
+                        "[Codex] personal workspace 选择失败 fail_category=%s evidence=%s",
+                        ws_fail_category,
+                        json.dumps(ws_evidence, ensure_ascii=False)[:300],
+                    )
+                _screenshot(page, "codex_04b_after_workspace_select.png")
+            except Exception as exc:
+                logger.warning("[Codex] ensure_personal_workspace_selected 异常: %s", exc)
+
         # SPEC-2 shared/add-phone-detection §4 (位点 C-P3):等 callback 前探针。
         # add-phone 阻塞 = "callback 永远不来"的根因,30s 等待白白浪费。
         assert_not_blocked(page, "oauth_callback_wait")

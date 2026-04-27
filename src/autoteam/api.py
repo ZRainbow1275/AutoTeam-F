@@ -974,12 +974,72 @@ def get_admin_diagnose():
                 r = api._api_fetch("GET", path)
                 probes[name] = {"status": r.get("status"), "body": (r.get("body") or "")[:500]}
 
+            # Round 8 — SPEC-2 v1.5 §6.2:diagnose 内嵌 master_subscription_state(read-only,5min cache)
+            try:
+                from autoteam.master_health import is_master_subscription_healthy
+                healthy, reason, evidence = is_master_subscription_healthy(api)
+                master_state = {
+                    "healthy": healthy,
+                    "reason": reason,
+                    "evidence": evidence,
+                }
+            except Exception as exc:
+                master_state = {
+                    "healthy": None,
+                    "reason": "probe_exception",
+                    "evidence": {"detail": str(exc)[:200]},
+                }
+
             return {
                 "admin_email": get_admin_email(),
                 "account_id": account_id,
                 "access_token_present": bool(api.access_token),
                 "access_token_prefix": (api.access_token or "")[:30],
                 "probes": probes,
+                "master_subscription_state": master_state,
+            }
+        finally:
+            try:
+                api.stop()
+            except Exception:
+                pass
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行"))
+    try:
+        return _pw_executor.run(_do)
+    finally:
+        _playwright_lock.release()
+
+
+@app.get("/api/admin/master-health")
+def get_admin_master_health(request: Request):
+    """Round 8 — 母号订阅健康度独立端点。
+
+    查询参数:
+        force_refresh=1 → 跳过 5min cache 直接重测
+    返回 is_master_subscription_healthy() 的完整 (healthy, reason, evidence) 三元组。
+    UI 用于"立即重测"按钮。
+    """
+    from autoteam.chatgpt_api import ChatGPTTeamAPI
+    from autoteam.master_health import is_master_subscription_healthy
+
+    force_refresh = str(request.query_params.get("force_refresh", "")).strip().lower() in (
+        "1", "true", "yes",
+    )
+
+    def _do():
+        api = ChatGPTTeamAPI()
+        try:
+            api.start()
+            healthy, reason, evidence = is_master_subscription_healthy(
+                api, force_refresh=force_refresh,
+            )
+            return {
+                "healthy": healthy,
+                "reason": reason,
+                "evidence": evidence,
+                "force_refresh": force_refresh,
             }
         finally:
             try:
@@ -2326,6 +2386,50 @@ def post_fill(params: TaskParams = TaskParams()):
                     "fill-personal 拒绝执行。请先等子号自然 exhausted 或手动腾位置后再试"
                 ),
             )
+
+        # Round 8 — SPEC-2 v1.5 M-T3:fill-personal 入口先验母号订阅(5min cache,read-only)。
+        # cancel 状态下整批 fill 必拿 plan_type=team,直接 503 fail-fast 不启动 task。
+        try:
+            from autoteam.chatgpt_api import ChatGPTTeamAPI
+            from autoteam.master_health import is_master_subscription_healthy
+
+            def _probe_master():
+                api = ChatGPTTeamAPI()
+                try:
+                    api.start()
+                    return is_master_subscription_healthy(api)
+                finally:
+                    try:
+                        api.stop()
+                    except Exception:
+                        pass
+
+            if _playwright_lock.acquire(blocking=False):
+                try:
+                    healthy, reason, evidence = _pw_executor.run(_probe_master)
+                finally:
+                    _playwright_lock.release()
+                if not healthy and reason == "subscription_cancelled":
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "error": "master_subscription_degraded",
+                            "reason": reason,
+                            "evidence": evidence,
+                            "message": (
+                                "母号 ChatGPT Team 订阅已 cancel(eligible_for_auto_reactivation=true),"
+                                "fill-personal 必拿 plan_type=team。请先续订或更换母号"
+                            ),
+                        },
+                    )
+            else:
+                # playwright 锁拿不到 → 别阻塞 fill-personal,放行让任务自身的 M-T1 兜底
+                pass
+        except HTTPException:
+            raise
+        except Exception:
+            # probe 异常按 spec §6.1 不阻塞 — M-T1 在 _run_post_register_oauth 兜底
+            pass
 
     command = "fill-personal" if params.leave_workspace else "fill"
     task = _start_task(
