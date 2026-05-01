@@ -1,11 +1,14 @@
 """Round 11 — cheap_codex_smoke 加 model 参数 + 读完整 SSE 拿真实对话内容。
 
 覆盖:
-  - model 默认值 gpt-5(向后兼容)
+  - model 默认值 gpt-5.5 (Round 11 v2 升级 — team-only 主路径)
   - model 入参可定制(gpt-5.5 团队号 / gpt-5.4 通用号)
   - SSE 完整读出 response.completed,detail 升级为 dict 含 response_text
   - 8 行内未见 response.created → uncertain
   - 30 帧仍无 completed → alive 兜底(标 raw_event=no_completed_within_30_frames)
+
+Round 11 v2 schema 升级注:max_output_tokens 不再写入 payload(后端拒收),
+完整 v2 schema 测试见 tests/unit/test_round11_cheap_codex_smoke_v2.py。
 """
 from __future__ import annotations
 
@@ -48,8 +51,8 @@ def test_smoke_with_custom_model_param_passes_through():
     assert detail.get("model") == "gpt-5.5"
 
 
-def test_smoke_default_model_gpt5_backward_compat():
-    """不传 model → 默认 gpt-5(向后兼容)。"""
+def test_smoke_default_model_gpt55():
+    """Round 11 v2:不传 model → 默认 gpt-5.5(team-only 主路径,见 PRD Q4)。"""
     from autoteam import codex_auth
 
     captured = {}
@@ -65,7 +68,7 @@ def test_smoke_default_model_gpt5_backward_compat():
         result, _detail = codex_auth.cheap_codex_smoke("tok", account_id="acc-1", force=True)
 
     assert result == "alive"
-    assert captured["payload"]["model"] == "gpt-5"
+    assert captured["payload"]["model"] == "gpt-5.5"
 
 
 def test_smoke_returns_response_text_in_dict():
@@ -109,8 +112,8 @@ def test_smoke_no_response_created_returns_uncertain():
     assert "no_response_created_frame" in (detail or "")
 
 
-def test_smoke_max_output_tokens_passed():
-    """传 max_output_tokens=128 → payload 内有此值。"""
+def test_smoke_max_output_tokens_no_longer_in_payload():
+    """Round 11 v2:max_output_tokens 不再写入 payload(后端拒收),但函数签名保留。"""
     from autoteam import codex_auth
 
     captured = {}
@@ -123,11 +126,12 @@ def test_smoke_max_output_tokens_passed():
         ])
 
     with patch("requests.post", side_effect=fake_post):
+        # 传 max_output_tokens 不抛(签名仍接受),但 payload 不会含此 key
         codex_auth.cheap_codex_smoke(
-            "tok", account_id="acc-1", model="gpt-5", max_output_tokens=128, force=True,
+            "tok", account_id="acc-1", model="gpt-5.5", max_output_tokens=128, force=True,
         )
 
-    assert captured["payload"]["max_output_tokens"] == 128
+    assert "max_output_tokens" not in captured["payload"]
 
 
 def test_smoke_auth_invalid_path_unchanged():

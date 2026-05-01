@@ -41,6 +41,16 @@ CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 _CODEX_SMOKE_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 # quota 关键词:codex backend 返回 4xx 时若 body 含这些词同样视为 auth_invalid(可能是配额相关 API 错误)
 _CODEX_SMOKE_QUOTA_HINTS = ("quota", "no_quota", "rate_limit", "billing", "exceeded")
+# Round 11 — codex backend 拒绝 model 时的 body 关键词(4xx),用于触发 fallback model chain
+_CODEX_SMOKE_MODEL_NOT_SUPPORTED_HINTS = (
+    "not supported",
+    "model_not_supported",
+    "is not supported",
+    "invalid model",
+    "unknown model",
+)
+# Round 11 — cheap_codex_smoke 默认 instructions(短回复 + 最小 token 消耗)
+_CODEX_SMOKE_DEFAULT_INSTRUCTIONS = "You are a concise assistant. Reply with one short word."
 
 
 def _generate_pkce():
@@ -132,6 +142,387 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
         bundle["plan_supported"],
     )
     return bundle
+
+
+def _password_grant_access_token(email, password):
+    """Round 11 V8 fast-path(已弃用,保留作未来 hook)— OAuth 2.0 ROPC password grant.
+
+    现状(V11 实证 2026-04-30):OAuth 2.1 已移除 ROPC,OpenAI auth.openai.com/oauth/token
+    后端 30 次组合(5 账号 × 2 client_id × 3 scope)全员 HTTP 400
+    `unknown_parameter:'username'` — 完全没部署 password grant,本 helper 永远返回 None。
+    完整证据见 `research/v11-password-grant-probe-report.md`。
+
+    实际使用 `fetch_nextauth_backend_access_token` 替代(NextAuth /api/auth/session.accessToken
+    路径,V10 jshook trace 已实证 chatgpt.com /api/auth/session 响应含 accessToken 字段
+    可作 Bearer 调 backend-api/*)。
+
+    保留 helper 仅作未来 OpenAI 重启 ROPC 时的 hook;现有单测继续覆盖契约语义(空参 / 200 /
+    401 / 网络异常 / 非 JSON / 缺字段),实现行为保持不变。
+
+    Args:
+        email: 子号邮箱,作为 `username` 字段。
+        password: 注册时设的密码。
+
+    Returns:
+        access_token 字符串(200 OK + token_type=Bearer 时);否则 None。永不抛(M-I1 风格)。
+        当前实测永远返回 None(OpenAI 后端 unknown_parameter:'username')。
+    """
+    if not email or not password:
+        return None
+
+    import requests
+
+    try:
+        resp = requests.post(
+            CODEX_TOKEN_URL,
+            data={
+                "grant_type": "password",
+                "client_id": CODEX_CLIENT_ID,
+                "username": email,
+                "password": password,
+                "scope": "openid profile email offline_access",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] _password_grant_access_token 请求异常: %s", exc)
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(
+            "[Codex] _password_grant_access_token 返回 %d: %s",
+            resp.status_code,
+            (resp.text or "")[:200],
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] _password_grant_access_token 响应非 JSON: %s", exc)
+        return None
+
+    access_token = data.get("access_token")
+    if not access_token:
+        logger.warning(
+            "[Codex] _password_grant_access_token 响应缺 access_token: %s",
+            str(data)[:200],
+        )
+        return None
+
+    logger.info("[Codex] _password_grant_access_token 成功 (token_type=%s)", data.get("token_type"))
+    return access_token
+
+
+def fetch_nextauth_backend_access_token(page):
+    """Round 11 V12 P0.1 — 从已加载 chatgpt.com cookie 的浏览器 page 提取 NextAuth `accessToken`。
+
+    背景:V11 探活实证 OpenAI `auth.openai.com/oauth/token` 已撤 ROPC password grant
+    (30 个 client_id/scope/audience 变体全员 HTTP 400 `unknown_parameter: 'username'`),
+    `_password_grant_access_token` 在新号场景永远返回 None。
+
+    替代路径:V10 jshook trace 已实证 chatgpt.com `/api/auth/session` 响应含 `accessToken`
+    字段(2080 字符),等价于 SPA 调 `/backend-api/*` 用的 Bearer token。在 register 成功
+    后浏览器 context 已落 chatgpt.com NextAuth session cookie,直接 page.evaluate 调
+    /api/auth/session credentials:include 即可拿到。
+
+    Args:
+        page: Playwright Page 对象,必须已加载 chatgpt.com 域(cookie 在该上下文)。
+
+    Returns:
+        access_token 字符串(200 OK + accessToken 字段非空时);否则 None。永不抛(M-I1 风格)。
+    """
+    if page is None:
+        return None
+
+    try:
+        result = page.evaluate(
+            """
+            async () => {
+                try {
+                    const r = await fetch('/api/auth/session', {
+                        credentials: 'include',
+                        cache: 'no-store',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    if (r.status !== 200) return { status: r.status, accessToken: null };
+                    const ct = r.headers.get('content-type') || '';
+                    if (!ct.includes('application/json')) return { status: r.status, accessToken: null, raw: 'non-json' };
+                    const data = await r.json();
+                    return { status: r.status, accessToken: data && data.accessToken ? data.accessToken : null };
+                } catch (e) {
+                    return { status: 0, accessToken: null, error: String(e) };
+                }
+            }
+            """
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] fetch_nextauth_backend_access_token page.evaluate 异常: %s", exc)
+        return None
+
+    if not isinstance(result, dict):
+        logger.warning("[Codex] fetch_nextauth_backend_access_token 异常返回: %s", str(result)[:200])
+        return None
+
+    status = result.get("status")
+    access_token = result.get("accessToken")
+    if status != 200:
+        logger.warning(
+            "[Codex] fetch_nextauth_backend_access_token /api/auth/session 返回 %s (accessToken=%s)",
+            status,
+            "yes" if access_token else "no",
+        )
+        return None
+    if not access_token:
+        logger.warning(
+            "[Codex] fetch_nextauth_backend_access_token /api/auth/session 200 但 accessToken 字段缺失/空"
+        )
+        return None
+
+    logger.info(
+        "[Codex] fetch_nextauth_backend_access_token 成功 (len=%d)",
+        len(access_token),
+    )
+    return access_token
+
+
+def fetch_personal_uuid(access_token):
+    """Round 11 V8 — POST https://chatgpt.com/backend-api/accounts/personal idempotent getOrCreate.
+
+    Master 控制实验(`research/v7c-master-replay.json`)证实该 endpoint 是 idempotent — 用 Bearer
+    access_token 调一次,200 OK + 返回 `{id: "<personal_uuid>", structure: "personal", created: false}`,
+    用户在 register 阶段已经被自动创建 personal workspace。此 UUID 下游用作 OAuth `allowed_workspace_id`
+    query 参数,绕过 default_workspace_id sticky-Team 死锁。
+
+    ⚠️ Round 11 V13 实证(2026-04-30):用 `requests` 直打该 endpoint 会被 Cloudflare 403 拦
+    (无 cf_clearance / 真实 chrome UA / TLS fingerprint)。生产路径必须用
+    `fetch_personal_uuid_via_page(page, access_token)` 在浏览器内 page.evaluate 调用,绕开 cf
+    bot challenge。本 helper 仅保留作单测 / 离线 CTF 复现脚本用途。
+
+    Args:
+        access_token: 子号刚完成 password login 拿到的临时 Bearer token。
+
+    Returns:
+        UUID 字符串 / None(401 / 403 / 网络异常)。永不抛(M-I1 风格)。
+    """
+    if not access_token:
+        return None
+
+    import requests
+
+    try:
+        resp = requests.post(
+            "https://chatgpt.com/backend-api/accounts/personal",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Origin": "https://chatgpt.com",
+            },
+            json={},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001 — 任何 transport 异常都不抛
+        logger.warning("[Codex] fetch_personal_uuid 请求异常: %s", exc)
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(
+            "[Codex] fetch_personal_uuid 返回 %d: %s",
+            resp.status_code,
+            (resp.text or "")[:200],
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] fetch_personal_uuid 响应非 JSON: %s", exc)
+        return None
+
+    uuid = data.get("id")
+    if not uuid:
+        logger.warning("[Codex] fetch_personal_uuid 响应缺少 id 字段: %s", str(data)[:200])
+        return None
+
+    logger.info(
+        "[Codex] fetch_personal_uuid 成功: %s (created=%s)",
+        uuid,
+        data.get("created"),
+    )
+    return uuid
+
+
+def fetch_personal_uuid_via_page(page, access_token=None):
+    """Round 11 V13 P0.2 — 浏览器内调用 POST /backend-api/accounts/personal,绕过 Cloudflare。
+
+    背景:V12 探活实证 `requests` 直打 `chatgpt.com/backend-api/accounts/personal` 全员被 Cloudflare
+    403 拦(无 cf_clearance / 真实 chrome TLS fingerprint / 真实 UA)。但浏览器在 register 阶段已
+    通过 cf challenge,context 里有 cf_clearance cookie + 完整 chrome 指纹,page.evaluate 在
+    chatgpt.com origin 内 fetch 不会被拦。
+
+    Args:
+        page: Playwright Page 对象,必须已加载 chatgpt.com 域(cookie + cf_clearance 在该上下文)。
+        access_token: 显式 Bearer token(从 `fetch_nextauth_backend_access_token` 拿到);
+            None 时走 `credentials: 'include'` 用浏览器 NextAuth cookie session(SPA 默认行为)。
+
+    Returns:
+        UUID 字符串 / None(page=None / 401 / 403 / 缺 id / 异常)。永不抛(M-I1 风格)。
+    """
+    if page is None:
+        return None
+
+    js = """
+    async (token) => {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            };
+            if (token) headers['Authorization'] = 'Bearer ' + token;
+            const r = await fetch('/backend-api/accounts/personal', {
+                method: 'POST',
+                credentials: 'include',
+                headers: headers,
+                body: '{}',
+            });
+            if (r.status !== 200) {
+                let body = '';
+                try { body = (await r.text()).slice(0, 200); } catch (e) {}
+                return { status: r.status, id: null, body: body };
+            }
+            const ct = r.headers.get('content-type') || '';
+            if (!ct.includes('application/json')) {
+                return { status: r.status, id: null, raw: 'non-json' };
+            }
+            const data = await r.json();
+            return { status: r.status, id: data && data.id ? data.id : null, created: data ? data.created : null };
+        } catch (e) {
+            return { status: 0, id: null, error: String(e) };
+        }
+    }
+    """
+
+    try:
+        result = page.evaluate(js, access_token or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] fetch_personal_uuid_via_page page.evaluate 异常: %s", exc)
+        return None
+
+    if not isinstance(result, dict):
+        logger.warning(
+            "[Codex] fetch_personal_uuid_via_page 异常返回: %s", str(result)[:200]
+        )
+        return None
+
+    status = result.get("status")
+    uuid = result.get("id")
+    if status != 200:
+        logger.warning(
+            "[Codex] fetch_personal_uuid_via_page /accounts/personal 返回 %s (id=%s, body=%s)",
+            status,
+            "yes" if uuid else "no",
+            (result.get("body") or "")[:120],
+        )
+        return None
+    if not uuid:
+        logger.warning(
+            "[Codex] fetch_personal_uuid_via_page 200 但缺 id 字段: %s", str(result)[:200]
+        )
+        return None
+
+    logger.info(
+        "[Codex] fetch_personal_uuid_via_page 成功: %s (created=%s)",
+        uuid,
+        result.get("created"),
+    )
+    return uuid
+
+
+def is_token_pair_invalidated(auth_path):
+    """Round 11 V7 — 双失效探测:access_token + refresh_token 是否被 server-side invalidate。
+
+    研究报告 v7-v10-personal-uuid-exploitation.md §V7 确认 OpenAI 在 user kick 时同步废
+    access_token(`token_invalidated` 401)+ refresh_token(`refresh_token_invalidated` 401)。
+    任意一个仍可用 → 视为可救活,仅 access_token 死可走 refresh_access_token 重生;两个都死才
+    判定 auth_invalid 触发外层清账(避免无谓重登)。
+
+    Args:
+        auth_path: 子号 auth_file 路径(JSON)。
+
+    Returns:
+        True 当且仅当 GET /backend-api/me 返回 401 + POST /oauth/token (refresh_token grant)
+        也返回 401。任何其它结果(网络异常 / 200 / 非 401 错误)→ False(保守不动状态)。
+    """
+    if not auth_path:
+        return False
+    p = Path(auth_path)
+    if not p.exists():
+        return False
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] is_token_pair_invalidated 读取 %s 异常: %s", auth_path, exc)
+        return False
+
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    if not access_token or not refresh_token:
+        return False
+
+    import requests
+
+    try:
+        me_resp = requests.get(
+            "https://chatgpt.com/backend-api/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] is_token_pair_invalidated GET /me 异常: %s", exc)
+        return False
+
+    if me_resp.status_code != 401:
+        return False
+
+    try:
+        rt_resp = requests.post(
+            CODEX_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": CODEX_CLIENT_ID,
+                "refresh_token": refresh_token,
+                "scope": "openid profile email",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex] is_token_pair_invalidated refresh 异常: %s", exc)
+        return False
+
+    if rt_resp.status_code != 401:
+        return False
+
+    logger.warning(
+        "[Codex] is_token_pair_invalidated 命中:access_token + refresh_token 同时被 server-side invalidate (auth_path=%s)",
+        auth_path,
+    )
+    return True
+
+
+def _build_auth_url_with_allowed_workspace(code_challenge, state, allowed_workspace_id):
+    """Round 11 V8 — 在 _build_auth_url 基础上拼 `&allowed_workspace_id=<personal_uuid>` query 参数。
+
+    OAuth issuer 静默接受该参数(实测 v8-result.md:不报 unknown_parameter),让 issuer 在颁
+    token 时优先选 personal workspace 而非 default_workspace_id 指向的 Team。
+    """
+    base = _build_auth_url(code_challenge, state)
+    if not allowed_workspace_id:
+        return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}allowed_workspace_id={urllib.parse.quote(allowed_workspace_id, safe='')}"
 
 
 def _write_auth_file(filepath, bundle):
@@ -527,6 +918,7 @@ def login_codex_via_browser(
     *,
     use_personal=False,
     chatgpt_session_token=None,
+    prefetched_personal_uuid=None,
 ):
     """
     通过 Playwright 自动完成 Codex OAuth 登录。
@@ -536,7 +928,11 @@ def login_codex_via_browser(
     chatgpt_session_token: 注册阶段从 chatgpt.com 抽出的 __Secure-next-auth.session-token,
                            在 use_personal=True 时注入 auth.openai.com 跳过 /log-in 表单。
                            沿用 SessionCodexAuthFlow._inject_auth_cookies 的注入模式(主号专用扩展给子号)。
-    返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type}
+    prefetched_personal_uuid: Round 11 V8 — accounts.json 持久化的 personal_workspace_id;
+                              非空时直接拼到 OAuth `auth_url` 的 allowed_workspace_id 参数,
+                              省一次 silent step-0 内的 POST /accounts/personal。
+    返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type,
+                       personal_workspace_id}
 
     Round 11 五轮 Option A — 两阶段 personal OAuth:
       阶段 1(快路径):有 chatgpt_session_token → silent step-0 双域注入 + NextAuth refresh,
@@ -564,6 +960,41 @@ def login_codex_via_browser(
     )
 
     auth_code = None
+    # Round 11 V8 — personal UUID 在 silent step-0 / stage2 re-login 完成后通过
+    # POST /backend-api/accounts/personal getOrCreate 拿到,之后用 allowed_workspace_id
+    # 注入 OAuth /authorize URL,绕过 default_workspace_id sticky-Team 死锁。
+    # 注入既可来自调用方 prefetched_personal_uuid(accounts.json 持久化字段),
+    # 也可来自 silent step-0 现场 fetch。
+    personal_uuid = prefetched_personal_uuid
+
+    # Round 11 V8 fast-path(verifier #2 P0)+ V12 P0.1 deprecation —
+    # `_password_grant_access_token` 已被 V11 探活实证不可用:OpenAI auth.openai.com/oauth/token
+    # 30 个 client_id/scope/audience 组合全员 HTTP 400 `unknown_parameter: 'username'`,
+    # ROPC password grant 已撤(OAuth 2.1 demand 移除)。保留此 fast-path 仅作为未来
+    # OpenAI 重启 ROPC 的 hook,实际效果在新号场景永远进 logger.warning 分支。
+    # 真正落 personal_uuid 的路径切到 silent step-0 内的 fetch_nextauth_backend_access_token
+    # → fetch_personal_uuid Bearer 链(V12 P0.1)。
+    if use_personal and not personal_uuid and email and password:
+        try:
+            tmp_access = _password_grant_access_token(email, password)
+            if tmp_access:
+                fetched_uuid = fetch_personal_uuid(tmp_access)
+                if fetched_uuid:
+                    personal_uuid = fetched_uuid
+                    logger.info(
+                        "[Codex] fast-path Bearer 拿到 personal_workspace_id=%s",
+                        personal_uuid,
+                    )
+                else:
+                    logger.warning(
+                        "[Codex] fast-path password grant 成功但 fetch_personal_uuid 返回 None,等 silent step-0 NextAuth fallback"
+                    )
+            else:
+                logger.warning(
+                    "[Codex] fast-path password grant 失败(V11 已知 ROPC 不可用),等 silent step-0 NextAuth fallback"
+                )
+        except Exception as exc:  # noqa: BLE001 — fast-path 失败不应阻断 OAuth 主流程
+            logger.warning("[Codex] fast-path 异常,等 silent step-0 NextAuth fallback: %s", exc)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(**get_playwright_launch_options())
@@ -671,6 +1102,71 @@ def login_codex_via_browser(
                         logger.info("[Codex] silent step-0 accounts/check 结果: %s", accounts_resp)
                     except Exception as ck_exc:
                         logger.debug("[Codex] silent step-0 accounts/check 异常(忽略): %s", ck_exc)
+
+                    # Round 11 V13 P0.2 — 浏览器内 fetch_personal_uuid_via_page 绕 Cloudflare。
+                    # 已有 prefetched_personal_uuid 则跳过重复 fetch。否则:
+                    #   primary: /api/auth/session 提 accessToken → page.evaluate Bearer
+                    #            fetch_personal_uuid_via_page(避开 cf bot 拦截)
+                    #   fallback: 原 in-browser POST /accounts/personal cookie 路径(新号场景已知 401)
+                    if not personal_uuid:
+                        try:
+                            nextauth_token = fetch_nextauth_backend_access_token(_silent_page)
+                            if nextauth_token:
+                                fetched_uuid = fetch_personal_uuid_via_page(
+                                    _silent_page, nextauth_token
+                                )
+                                if fetched_uuid:
+                                    personal_uuid = fetched_uuid
+                                    logger.info(
+                                        "[Codex] silent step-0 NextAuth Bearer 路径(浏览器内)拿到 personal_workspace_id=%s",
+                                        personal_uuid,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[Codex] silent step-0 NextAuth accessToken 拿到但 fetch_personal_uuid_via_page 返回 None,降级 cookie fallback"
+                                    )
+                        except Exception as nx_exc:
+                            logger.warning(
+                                "[Codex] silent step-0 NextAuth route 异常,降级 cookie fallback: %s",
+                                nx_exc,
+                            )
+
+                    if not personal_uuid:
+                        try:
+                            personal_resp = _silent_page.evaluate(
+                                """
+                                async () => {
+                                    const r = await fetch('/backend-api/accounts/personal', {
+                                        method: 'POST',
+                                        credentials: 'include',
+                                        headers: {'Content-Type': 'application/json'},
+                                        body: '{}',
+                                        cache: 'no-store',
+                                    });
+                                    let data = null;
+                                    try { data = await r.json(); } catch (_) {}
+                                    return { status: r.status, id: data && data.id, created: data && data.created };
+                                }
+                                """
+                            )
+                            logger.info(
+                                "[Codex] silent step-0 cookie fallback /accounts/personal 结果: %s",
+                                personal_resp,
+                            )
+                            if isinstance(personal_resp, dict) and personal_resp.get("status") == 200:
+                                fetched_uuid = personal_resp.get("id")
+                                if fetched_uuid:
+                                    personal_uuid = fetched_uuid
+                                    logger.info(
+                                        "[Codex] silent step-0 cookie fallback 拿到 personal_workspace_id=%s (created=%s)",
+                                        personal_uuid,
+                                        personal_resp.get("created"),
+                                    )
+                        except Exception as pu_exc:
+                            logger.warning(
+                                "[Codex] silent step-0 cookie fallback /accounts/personal fetch 异常(继续走 OAuth): %s",
+                                pu_exc,
+                            )
 
                     cur = _silent_page.url or ""
                     logger.info("[Codex] silent step-0 完成 URL: %s", cur[:120])
@@ -851,6 +1347,15 @@ def login_codex_via_browser(
                 auth_code = qs.get("code", [None])[0]
                 if auth_code:
                     logger.info("[Codex] 从 response 捕获到 auth code!")
+
+        # Round 11 V8 — 拿到 personal UUID 后,把 OAuth /authorize URL 拼上 allowed_workspace_id,
+        # 让 issuer 在颁 token 时优先选 personal workspace 而非 default_workspace_id 指向的 Team。
+        if use_personal and personal_uuid:
+            auth_url = _build_auth_url_with_allowed_workspace(code_challenge, state, personal_uuid)
+            logger.info(
+                "[Codex] OAuth /authorize 注入 allowed_workspace_id=%s",
+                personal_uuid,
+            )
 
         page = context.new_page()
         page.on("request", on_request)
@@ -1513,7 +2018,73 @@ def login_codex_via_browser(
             # 2) 重新生成 PKCE + state(原 auth_code 已 used,新 OAuth 必须用新 code_verifier)
             stage2_code_verifier, stage2_code_challenge = _generate_pkce()
             stage2_state = secrets.token_urlsafe(16)
-            stage2_auth_url = _build_auth_url(stage2_code_challenge, stage2_state)
+
+            # Round 11 V8 — fresh re-login 已清空 cookies,personal_uuid 之前在 silent step-0
+            # 拿到的值仍可复用(personal workspace UUID 是稳定标识,不会因 re-login 重置)。
+            # 若 stage 1 没拿到(prefetched_personal_uuid 也是 None),这里再尝试一次:
+            #   V13 primary: NextAuth /api/auth/session accessToken → page.evaluate Bearer
+            #                fetch_personal_uuid_via_page(浏览器内,避 cf 拦截)
+            #   fallback: 原 in-browser POST /accounts/personal cookie 路径
+            if use_personal and not personal_uuid:
+                fetch_page = None
+                try:
+                    fetch_page = context.new_page()
+                    fetch_page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=30000)
+
+                    nextauth_token = fetch_nextauth_backend_access_token(fetch_page)
+                    if nextauth_token:
+                        fetched_uuid = fetch_personal_uuid_via_page(
+                            fetch_page, nextauth_token
+                        )
+                        if fetched_uuid:
+                            personal_uuid = fetched_uuid
+                            logger.info(
+                                "[Codex] 阶段 2 NextAuth Bearer 路径(浏览器内)拿到 personal_workspace_id=%s",
+                                personal_uuid,
+                            )
+
+                    if not personal_uuid:
+                        fetched_uuid = fetch_page.evaluate(
+                            """
+                            async () => {
+                              try {
+                                const resp = await fetch('/backend-api/accounts/personal', {
+                                  method: 'POST',
+                                  credentials: 'include',
+                                  headers: {'Accept': 'application/json'},
+                                });
+                                if (!resp.ok) return null;
+                                const j = await resp.json();
+                                return j && j.id ? j.id : null;
+                              } catch (e) { return null; }
+                            }
+                            """
+                        )
+                        if fetched_uuid:
+                            personal_uuid = fetched_uuid
+                            logger.info(
+                                "[Codex] 阶段 2 cookie fallback 拿到 personal_workspace_id=%s",
+                                personal_uuid,
+                            )
+                except Exception as exc:
+                    logger.warning("[Codex] 阶段 2 fetch personal uuid 失败: %s", exc)
+                finally:
+                    if fetch_page is not None:
+                        try:
+                            fetch_page.close()
+                        except Exception:
+                            pass
+
+            if use_personal and personal_uuid:
+                stage2_auth_url = _build_auth_url_with_allowed_workspace(
+                    stage2_code_challenge, stage2_state, personal_uuid
+                )
+                logger.info(
+                    "[Codex] 阶段 2 OAuth /authorize 注入 allowed_workspace_id=%s",
+                    personal_uuid,
+                )
+            else:
+                stage2_auth_url = _build_auth_url(stage2_code_challenge, stage2_state)
 
             # 3) 重新走 OAuth — 在同一 context 内开新 page 监听 callback
             stage2_auth_code = None
@@ -1664,6 +2235,8 @@ def login_codex_via_browser(
                 )
                 return None
 
+            if personal_uuid:
+                stage2_bundle["personal_workspace_id"] = personal_uuid
             return stage2_bundle
 
         # 阶段 1 通过(非 personal 或 plan == free) — 走原退出路径
@@ -1699,6 +2272,8 @@ def login_codex_via_browser(
             )
             return None
 
+    if personal_uuid:
+        stage1_bundle["personal_workspace_id"] = personal_uuid
     return stage1_bundle
 
 
@@ -2361,28 +2936,40 @@ def cheap_codex_smoke(
     access_token,
     account_id=None,
     *,
-    model="gpt-5",
+    model="gpt-5.5",
+    fallback_models=None,
+    instructions=None,
     max_output_tokens=64,
     timeout=15.0,
     force=False,
 ):
     """SPEC-2 shared/quota-classification §4.4 — uninitialized_seat 二次验证。
-    Round 11 升级:加 model + max_output_tokens 参数,读完整 SSE 拿真实对话内容。
+    Round 11 升级(v2 — codex backend payload schema 改版):
+      - 默认 model 升 gpt-5.5(team-only,主路径)
+      - fallback_models 默认 ["gpt-5.4"](通用模型,team + free 都能用),主 model 撞 model_not_supported 时自动 fallback
+      - payload 严格按最新 codex backend schema:
+          * instructions 必填(默认 "You are a concise assistant. Reply with one short word.")
+          * input 改为 list 格式 [{type:message, role:user, content:[{type:input_text, text:"ping"}]}]
+          * 新增 store: false(必填)
+          * 删除 max_output_tokens(后端不再支持,函数签名保留供未来扩展)
 
-    对 codex backend 发一个推理请求(reasoning.effort=none + stream),读完整 SSE 帧
-    直到见到 response.completed,拼出 output_text 真实对话内容。
+    PRD-Round11 Q4:gpt-5.5 是 team-only 模型(只 team 号能用),gpt-5.4 是通用模型
+    (free + team 都能用)。所以 team 号默认走 gpt-5.5,model_not_supported 时
+    fallback 到 gpt-5.4(free 号在主 model 立即 fallback)。
 
     Round 7 FR-D6:24h 去重 cache。account_id 在 24h 内已有 cache 时直接返回,不走网络;
     传 force=True 可绕过 cache(用于强制刷新场景)。
 
     返回 (result, detail):
-        ("alive", {model, response_text, raw_event, ...})  — HTTP 200 + response.completed → 真活号
-        ("alive", None) (cache hit only)                    — 24h cache 命中
+        ("alive", {model, response_text, raw_event, tokens?})  — HTTP 200 + response.completed → 真活号
+                                                                detail.model 反映最终成功用的 model(可能是 fallback)
+        ("alive", None) (cache hit only)                       — 24h cache 命中
         ("auth_invalid", reason_str)  — HTTP 401/403/429 / 4xx 含 quota 关键词 → token/seat 真失效
-        ("uncertain", reason_str)     — HTTP 5xx / network / timeout / 解析异常 → 保留原状态等下轮
+        ("uncertain", reason_str)     — HTTP 5xx / network / timeout / 解析异常 / 主+fallback 全 model_not_supported
         cache 命中时 detail 为 "cache_hit_<原 result>"
 
-    向后兼容:不传 model 时默认 gpt-5;detail 在网络路径下升级为 dict(alive)/str(其他)。
+    向后兼容:max_output_tokens 参数保留但**不再传给后端**(spike 实测后端拒收);
+    instructions=None 时用模块级默认。
     """
     if not access_token:
         return "auth_invalid", "empty_access_token"
@@ -2407,14 +2994,51 @@ def cheap_codex_smoke(
                 )
                 return cached_result, f"cache_hit_{cached_result}"
 
-    # cache miss / force=True — 调网络并写回 cache
-    result, detail = _cheap_codex_smoke_network(
-        access_token,
-        account_id,
-        model=model,
-        max_output_tokens=max_output_tokens,
-        timeout=timeout,
-    )
+    # 构造 model 尝试链:主 model + fallback chain(去重保序)
+    if fallback_models is None:
+        fallback_models = ["gpt-5.4"]
+    elif not isinstance(fallback_models, (list, tuple)):
+        fallback_models = [fallback_models]
+    model_chain: list[str] = []
+    seen: set[str] = set()
+    for m in [model] + list(fallback_models):
+        if not m:
+            continue
+        if m in seen:
+            continue
+        seen.add(m)
+        model_chain.append(m)
+
+    last_result: tuple[str, object] = ("uncertain", "no_models_attempted")
+    for idx, candidate in enumerate(model_chain):
+        result, detail = _cheap_codex_smoke_network(
+            access_token,
+            account_id,
+            model=candidate,
+            instructions=instructions,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+        )
+        # alive / auth_invalid → 直接返回(终态)
+        if result == "alive" or result == "auth_invalid":
+            _write_codex_smoke_cache(account_id, result)
+            return result, detail
+        # uncertain 路径下:仅当 detail 是 model_not_supported 才继续尝试 fallback
+        last_result = (result, detail)
+        is_model_not_supported = (
+            isinstance(detail, str) and detail.startswith("model_not_supported")
+        )
+        if not is_model_not_supported:
+            break  # 非 model 问题(网络 / 5xx / 解析)— 不重试
+        # else:模型不被支持,继续下一个 fallback
+        if idx + 1 < len(model_chain):
+            logger.info(
+                "[Codex smoke] model=%s 不被支持,fallback → %s",
+                candidate,
+                model_chain[idx + 1],
+            )
+
+    result, detail = last_result
     _write_codex_smoke_cache(account_id, result)
     return result, detail
 
@@ -2423,18 +3047,27 @@ def _cheap_codex_smoke_network(
     access_token,
     account_id,
     *,
-    model="gpt-5",
-    max_output_tokens=64,
+    model="gpt-5.5",
+    instructions=None,
+    max_output_tokens=64,  # 保留参数供未来扩展;后端拒收此字段,不再写入 payload
     timeout=15.0,
 ):
-    """实际走网络的 cheap_codex_smoke 内部函数(Round 7 FR-D6 拆出 + Round 11 加 model)。
+    """实际走网络的 cheap_codex_smoke 内部函数(Round 7 FR-D6 拆出 + Round 11 v2 schema 升级)。
 
     与 cheap_codex_smoke 不同点:不查也不写 cache,直接调 codex backend。
     Round 11:读完整 SSE 帧累积 output_text,见 response.completed 时返回 dict 含 response_text。
+    Round 11 v2:payload schema 严格按 codex backend 最新版(spike 实测验证):
+      - instructions 必填(默认 _CODEX_SMOKE_DEFAULT_INSTRUCTIONS)
+      - input 是 list 格式 [{type:message, role:user, content:[{type:input_text, text}]}]
+      - 必含 store: false
+      - **不再**写 max_output_tokens(后端拒收"Unsupported parameter")
 
     返回值语义:
       alive 路径 detail = dict {"model", "response_text", "raw_event", "tokens"}
-      其他路径 detail = str
+      auth_invalid 路径 detail = str(http_<code>[_quota_hint])
+      uncertain 路径 detail = str
+        - "model_not_supported_<code>":4xx 且 body 含 not supported 关键字 → 上层触发 fallback
+        - "http_<code>" / "no_response_created_frame" / "stream:..." / "network:..." 等
     """
     import requests
 
@@ -2448,9 +3081,16 @@ def _cheap_codex_smoke_network(
 
     payload = {
         "model": model,
-        "input": "ping",
-        "max_output_tokens": max_output_tokens,
+        "instructions": instructions if instructions else _CODEX_SMOKE_DEFAULT_INSTRUCTIONS,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ping"}],
+            }
+        ],
         "stream": True,
+        "store": False,
         "reasoning": {"effort": "none"},
     }
 
@@ -2490,7 +3130,10 @@ def _cheap_codex_smoke_network(
             return "uncertain", f"http_{status_code}"
 
         if status_code != 200:
-            # 4xx 非 401/403/429:body 含 quota 关键词视为 auth_invalid;否则 uncertain
+            # 4xx 非 401/403/429:
+            #   1) body 含 model_not_supported 关键词 → uncertain + sentinel,触发上层 fallback
+            #   2) body 含 quota 关键词 → auth_invalid
+            #   3) 其他 → uncertain + http_<code>
             try:
                 body_preview = (resp.text or "").lower()[:1500]
             except Exception:
@@ -2499,6 +3142,8 @@ def _cheap_codex_smoke_network(
                 resp.close()
             except Exception:
                 pass
+            if any(hint in body_preview for hint in _CODEX_SMOKE_MODEL_NOT_SUPPORTED_HINTS):
+                return "uncertain", f"model_not_supported_{status_code}"
             if any(hint in body_preview for hint in _CODEX_SMOKE_QUOTA_HINTS):
                 return "auth_invalid", f"http_{status_code}_quota_hint"
             return "uncertain", f"http_{status_code}"

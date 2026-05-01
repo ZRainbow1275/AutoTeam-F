@@ -119,10 +119,16 @@ def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNO
             "status": STATUS_PENDING,
             "seat_type": seat_type or SEAT_UNKNOWN,
             "workspace_account_id": workspace_account_id,  # 邀请时所在的母号 workspace ID,母号切换检测用
+            # Round 11 V8 — 子号自身的 personal workspace UUID(POST /backend-api/accounts/personal idempotent
+            # getOrCreate),持久化后下次 OAuth 不必再 fetch;失败/旧记录为 None,运行时按需 fetch + 回填。
+            "personal_workspace_id": None,
             "auth_file": None,  # CPA 认证文件路径
             "quota_exhausted_at": None,  # 额度用完的时间
             "quota_resets_at": None,  # 额度恢复时间
             "last_quota_check_at": None,  # 最近一次 wham/usage 探测时间戳,用于 standby 探测去重
+            # Round 11 V7 — 双失效探测(access_token + refresh_token 同时被 server-side invalidate):
+            # 主循环周期性调 is_token_pair_invalidated,命中后落该字段供事后排查 / UI 展示。
+            "last_token_pair_invalidated_at": None,
             "created_at": time.time(),
             "last_active_at": None,
         }

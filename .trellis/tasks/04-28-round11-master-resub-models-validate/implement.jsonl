@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/04-28-round11-master-resub-models-validate/prd.md", "reason": "本任务 PRD,Approach A 决策,AC1-9,Stage A/B 实施大纲,5 个用户 Q&A 答案"}
+{"file": "prompts/0426/spec/shared/master-subscription-health.md", "reason": "v1.1 现有,本任务升 v1.2 加 subscription_grace healthy=True 状态 + grace_until JWT 解析决策矩阵"}
+{"file": "prompts/0426/spec/shared/account-state-machine.md", "reason": "v2.0 现有,本任务升 v2.1 加母号 subscription_grace 与子号 GRACE 双侧 healthy 联动注释"}
+{"file": "prompts/0426/spec/shared/oauth-workspace-selection.md", "reason": "Round 8 v1.0 现有,本任务不动但回归点(SessionCodexAuthFlow workspace 选择不破坏)"}
+{"file": "prompts/0426/spec/shared/master-auth-file.md", "reason": "Round 10 v1.0 现有,本任务读 codex-main-*.json id_token,引用 §3 Auth File Schema"}
+{"file": "prompts/0426/spec/spec-2-account-lifecycle.md", "reason": "v1.6 现有,本任务升 v1.7 引用 master-subscription-health v1.2 + realtime-probe v1.0"}

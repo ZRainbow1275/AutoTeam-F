@@ -56,6 +56,7 @@ from autoteam.codex_auth import (
     check_codex_quota,
     get_quota_exhausted_info,
     get_saved_main_auth_file,
+    is_token_pair_invalidated,
     login_codex_via_browser,
     quota_result_quota_info,
     quota_result_resets_at,
@@ -1208,6 +1209,33 @@ def cmd_check(include_standby: bool = False):
 
     # auth_error + 无认证文件的统一重新登录 Codex
     if auth_error_list:
+        # Round 11 V7 — 双失效预筛:access_token + refresh_token 同时被 server-side invalidate
+        # 的号无法靠重登 / refresh 救活(必须 fresh password login,且子号还在 Team 内时
+        # 注册都救不回来),直接标 STATUS_AUTH_INVALID + stamp 时间戳,跳过昂贵的 Playwright OAuth。
+        survivable_auth_errors = []
+        for acc in auth_error_list:
+            email = acc["email"]
+            auth_file = acc.get("auth_file")
+            try:
+                token_pair_dead = is_token_pair_invalidated(auth_file)
+            except Exception as exc:  # noqa: BLE001 — 探活函数本身吞,这层兜底防御
+                logger.warning("[%s] 双失效探活异常,按可救处理: %s", email, exc)
+                token_pair_dead = False
+            if token_pair_dead:
+                logger.error(
+                    "[%s] access_token + refresh_token 同时被 server-side invalidate,标 AUTH_INVALID 跳过重登",
+                    email,
+                )
+                update_account(
+                    email,
+                    status=STATUS_AUTH_INVALID,
+                    last_token_pair_invalidated_at=time.time(),
+                )
+            else:
+                survivable_auth_errors.append(acc)
+        auth_error_list = survivable_auth_errors
+
+    if auth_error_list:
         logger.info("[检查] 重新登录 %d 个 token 失效的账号...", len(auth_error_list))
         mail_client = CloudMailClient()
         mail_client.login()
@@ -1842,6 +1870,10 @@ def _run_post_register_oauth(
             "last_active_at": time.time(),
             "plan_type_raw": bundle.get("plan_type_raw"),
         }
+        # Round 11 V8 — codex_auth.login_codex_via_browser 拿到的 personal_workspace_id
+        # 透传到 accounts.json,下次 OAuth 复用(避免重复 fetch)。
+        if bundle.get("personal_workspace_id"):
+            update_fields["personal_workspace_id"] = bundle["personal_workspace_id"]
         # SPEC-2 FR-D3 — personal 分支也 quota probe(对称设计):free plan 也可能"未分配 codex 配额"
         access_token = bundle.get("access_token")
         if access_token:

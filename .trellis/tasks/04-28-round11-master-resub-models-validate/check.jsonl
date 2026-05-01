@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/04-28-round11-master-resub-models-validate/prd.md", "reason": "AC1-9 是 quality gate 源真相,特别 AC7 实测自验 6 项硬指标(注册 + 模型实测 + JSON/截图)"}
+{"file": "prompts/0426/spec/shared/master-subscription-health.md", "reason": "升级到 v1.2 后的 subscription_grace 状态守恒 + grace_until 决策矩阵 — 主探针 healthy=True 路径必须新增"}
+{"file": "prompts/0426/spec/shared/account-state-machine.md", "reason": "v2.1 升级后母号 + 子号 GRACE 双侧守恒回归点"}
+{"file": "prompts/0426/spec/shared/realtime-probe.md", "reason": "本轮新建 v1.0 — 子号 + 母号实时探活 force_refresh 契约,API endpoint 行为基准"}
