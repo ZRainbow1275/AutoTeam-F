@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/05-11-s7-multi-workspace-pool/prd.md", "reason": "DoD + 不变量 I1~I7 验收清单"}
+{"file": "src/autoteam/workspace_pool.py", "reason": "新增核心模块 — 验证 register / set_active / mark_unhealthy / 自动 failover / 原子写 / 向后兼容 seed"}
+{"file": "src/autoteam/admin_state.py", "reason": "路由改造 — 验证 pool 为空时回退 state.json，签名不变"}
+{"file": "src/autoteam/master_health.py", "reason": "失败阈值累计 + 调 pool.mark_unhealthy 触发切换"}
+{"file": "tests/unit/test_round12_s7_workspace_pool.py", "reason": "≥ 15 case：注册/切换/故障阈值/原子写回滚/向后兼容/边界"}

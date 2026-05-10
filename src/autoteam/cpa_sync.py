@@ -653,5 +653,45 @@ def sync_main_codex_to_cpa(filepath):
     if not upload_to_cpa(filepath):
         raise RuntimeError(f"上传主号认证文件失败: {name}")
 
-    logger.info("[CPA] 主号 Codex 已同步: %s", name)
+    # Round 12 S7 — 主号同步成功后,记录当前 active workspace,便于上游观测
+    try:
+        active = _get_active_workspace_summary()
+        if active:
+            logger.info(
+                "[CPA] 主号 Codex 已同步 (active workspace: id=%s admin=%s account_id=%s)",
+                active.get("id"), active.get("admin_email"), active.get("account_id"),
+            )
+        else:
+            logger.info("[CPA] 主号 Codex 已同步: %s", name)
+    except Exception:
+        logger.info("[CPA] 主号 Codex 已同步: %s", name)
     return {"uploaded": name}
+
+
+def _get_active_workspace_summary():
+    """Round 12 S7 — return the current active workspace (id/admin/account_id) or None.
+
+    Best-effort: never raises; pool unavailable returns None.
+    """
+    try:
+        from autoteam.workspace_pool import default_pool
+
+        active = default_pool.get_active()
+        if not active:
+            return None
+        return {
+            "id": active.get("id"),
+            "admin_email": active.get("admin_email"),
+            "account_id": active.get("account_id"),
+        }
+    except Exception:
+        return None
+
+
+def get_active_sync_target():
+    """Round 12 S7 — public helper: which workspace identity should CPA sync to?
+
+    Returns dict({id, admin_email, account_id}) or None when single-workspace
+    mode (caller falls back to legacy admin_state).
+    """
+    return _get_active_workspace_summary()

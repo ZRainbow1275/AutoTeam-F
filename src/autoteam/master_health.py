@@ -512,6 +512,62 @@ def is_master_subscription_healthy(
 
 
 # ---------------------------------------------------------------------------
+# Round 12 S7 — WorkspacePool failover hook
+# ---------------------------------------------------------------------------
+
+# reasons that should NOT trip workspace failover (transient / classification noise)
+_TRANSIENT_FAIL_REASONS = ("network_error",)
+# reasons that SHOULD trip failover (real master-side failure)
+_HARD_FAIL_REASONS = ("auth_invalid", "subscription_cancelled", "workspace_missing", "role_not_owner")
+
+
+def apply_pool_health_signal(
+    healthy: bool,
+    reason: str,
+    evidence: dict | None = None,
+    *,
+    pool=None,
+) -> dict | None:
+    """Round 12 S7 — feed a master_health probe result into the WorkspacePool.
+
+    Call this from any caller of :func:`is_master_subscription_healthy` to
+    drive auto failover. Behavior:
+
+    - healthy=True (active or subscription_grace) → pool.mark_healthy(active_id)
+    - healthy=False AND reason in _HARD_FAIL_REASONS → pool.mark_unhealthy(...)
+      which accumulates fail_count + (when ≥ threshold) auto-promotes a
+      warm/cold candidate.
+    - healthy=False AND reason in _TRANSIENT_FAIL_REASONS → no-op (don't
+      flap on intermittent network glitches).
+
+    Returns the **post-call** active workspace snapshot (None if pool empty
+    or failed). Never raises — M-I1 alignment.
+
+    ``pool`` defaults to ``workspace_pool.default_pool``; tests can inject
+    their own.
+    """
+    try:
+        if pool is None:
+            from autoteam.workspace_pool import default_pool as pool_obj
+            pool = pool_obj
+        active = pool.get_active()
+        if active is None:
+            return None
+        ws_id = active.get("id")
+        if not ws_id:
+            return None
+        if healthy and reason in ("active", "subscription_grace"):
+            return pool.mark_healthy(ws_id)
+        if (not healthy) and reason in _HARD_FAIL_REASONS:
+            return pool.mark_unhealthy(ws_id, reason)
+        # transient or unknown → leave state alone but bubble snapshot
+        return active
+    except Exception as exc:
+        logger.warning("[master_health] apply_pool_health_signal failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Round 9 SPEC v1.1 §11~§12 — Retroactive helper + grace 期 JWT 解析
 # ---------------------------------------------------------------------------
 

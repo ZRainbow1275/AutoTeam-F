@@ -111,6 +111,19 @@ def clear_admin_state():
 
 
 def get_admin_email():
+    """Round 12 S7 — route through WorkspacePool active workspace.
+
+    Backwards-compat: if the pool is empty / module unavailable, fall back
+    to the legacy state.json read so single-workspace installs are unaffected.
+    """
+    try:
+        from autoteam.workspace_pool import default_pool
+
+        active = default_pool.get_active()
+        if active and active.get("admin_email"):
+            return active["admin_email"]
+    except Exception:
+        pass
     return load_admin_state().get("email", "")
 
 
@@ -126,6 +139,21 @@ def _is_valid_uuid(value: str) -> bool:
 
 
 def get_chatgpt_account_id():
+    """Round 12 S7 — route through WorkspacePool active workspace.
+
+    Backwards-compat: pool empty → legacy state.json read → CHATGPT_ACCOUNT_ID env.
+    Pool ID still must pass UUID validation (filters legacy `user-xxx` ids).
+    """
+    try:
+        from autoteam.workspace_pool import default_pool
+
+        active = default_pool.get_active()
+        if active:
+            pool_aid = (active.get("account_id") or "").strip()
+            if pool_aid and _is_valid_uuid(pool_aid):
+                return pool_aid
+    except Exception:
+        pass
     state = load_admin_state()
     state_id = state.get("account_id", "")
     # state.json 里的值必须是 UUID 格式才有效（user-xxx 是 user ID 不是 account ID）

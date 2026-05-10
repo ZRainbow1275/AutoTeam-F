@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/prd.md", "reason": "父 PRD — Q2 创新方向 5 多 workspace 池化 scope + 子任务依赖图 + round-12 波次范围"}
+{"file": "src/autoteam/admin_state.py", "reason": "改造目标 1：get_admin_email / get_chatgpt_account_id 路由到 WorkspacePool.get_active()，向后兼容回退 state.json"}
+{"file": "src/autoteam/master_health.py", "reason": "改造目标 2：失败路径（subscription_cancelled / auth_invalid / network_error）调 pool.mark_unhealthy 触发故障切换"}
+{"file": "src/autoteam/cpa_sync.py", "reason": "改造目标 3：sync_to_cpa / sync_main_codex_to_cpa 同步目标跟随 active workspace（感知失败切换后立即新 workspace 推送）"}
+{"file": "src/autoteam/account_state.py", "reason": "S1 状态机参考实现 — atomic 写盘 + .bak 回滚 + subscribe 事件总线 + IllegalTransitionError 风格对齐"}
