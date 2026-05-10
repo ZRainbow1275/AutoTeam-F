@@ -1,0 +1,10 @@
+{"file": ".trellis/tasks/05-11-s0-upstream-team-rotate-diff/research/upstream-diff.md", "reason": "S0 diff report — authoritative cherry-pick classification (which functions, which lines, paste vs adapt)"}
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/prd.md", "reason": "parent PRD — Approach 1 cherry-pick decision + S3 scope + child task dependencies"}
+{"file": ".trellis/tasks/05-11-s3-cherry-pick-team-rotate/prd.md", "reason": "this task PRD — acceptance criteria + DoD"}
+{"file": ".upstream/manager.py", "reason": "upstream baseline (3137 lines, snapshot 2026-04-30) — read by line number per S0 report"}
+{"file": "src/autoteam/account_state.py", "reason": "S1 state machine — AccountState enum + StateMachine.transition + AUTH_PENDING auth_invalid mapping"}
+{"file": "src/autoteam/accounts.py", "reason": "update_account auto-routes status changes through default_machine.transition; STATUS_AUTH_INVALID == AUTH_PENDING"}
+{"file": "src/autoteam/mail/__init__.py", "reason": "S2 mail provider factory — get_mail_client() / MAIL_PROVIDER_CHAIN; provider routing for per-account ensure_account_mail"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "ruff + type hints + DRY guidance"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "explicit error handling + custom exceptions for IllegalTransitionError propagation"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "structured log on auth_repair transitions / seat release outcomes"}

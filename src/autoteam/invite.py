@@ -187,8 +187,17 @@ def wait_for_cloudflare(page, max_wait=60):
     return False
 
 
-def register_with_invite(page, invite_link, email, mail_client, password=None):
-    """用邀请链接注册 ChatGPT 账号并加入 workspace，返回 (success, password)"""
+def register_with_invite(page, invite_link, email, mail_client, password=None, signup_profile=None):
+    """用邀请链接注册 ChatGPT 账号并加入 workspace，返回 (success, password)。
+
+    signup_profile (Round 12 S3 cherry-pick from upstream)：
+        可选 :class:`autoteam.signup_profile.SignupProfile` 实例。传入时 about-you
+        阶段的姓名/生日/年龄从该 snapshot 取，调用方再把同一份 profile 透传给
+        Codex OAuth about-you，确保两阶段一致(避免 OpenAI 风控对前后不一致的
+        身份信息触发 add_phone)。
+
+        默认 None → 保持原 fork 的"每次随机"行为(向后兼容,不影响现有调用方)。
+    """
 
     logger.info("[注册] 打开邀请链接...")
     page.goto(invite_link, wait_until="domcontentloaded", timeout=60000)
@@ -364,9 +373,16 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     assert_not_blocked(page, "code_submit")
 
     # 随机身份（每个账号不同，降低批量注册特征）
-    bday = random_birthday()
-    full_name = random_full_name()
-    age_value = random_age()
+    # signup_profile 优先：调用方传入时直接复用其字段，确保注册 about-you
+    # 阶段与 Codex OAuth about-you 阶段拿到的姓名/生日/年龄完全一致。
+    if signup_profile is not None:
+        bday = dict(signup_profile.birthday or {})
+        full_name = signup_profile.full_name
+        age_value = signup_profile.age_text or signup_profile.age
+    else:
+        bday = random_birthday()
+        full_name = random_full_name()
+        age_value = random_age()
     logger.info(
         "[注册] 本次身份: name=%s birthday=%s/%s/%s age=%s",
         full_name,

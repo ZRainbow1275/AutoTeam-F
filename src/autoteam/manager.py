@@ -144,6 +144,419 @@ def _auto_reuse_skip_reason(acc: dict | None) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# Round 12 S3 — cherry-pick from upstream `.upstream/manager.py` (3137 行)
+# 详见 `.trellis/tasks/05-11-s0-upstream-team-rotate-diff/research/upstream-diff.md`
+# --------------------------------------------------------------------------
+
+# 失败类型常量（上游 `.upstream/manager.py:96`）。Hard failure → 立即暂停 + 释放席位。
+AUTH_REPAIR_HARD_FAILURE_TYPES = frozenset({"human_verification"})
+
+
+def _chatgpt_session_ready(chatgpt_api) -> bool:
+    """判断 chatgpt_api 是否处于"已启动浏览器"状态(上游 `.upstream/manager.py:84`)。
+
+    本地 ChatGPTTeamAPI 没有 `is_started()` 方法,但有 `browser` 属性。getattr 容错
+    保证未来上游加 `is_started()` 时自动适配。
+    """
+    if not chatgpt_api:
+        return False
+    is_started = getattr(chatgpt_api, "is_started", None)
+    if callable(is_started):
+        try:
+            return bool(is_started())
+        except Exception:
+            pass
+    return bool(getattr(chatgpt_api, "browser", None))
+
+
+def _has_auth_file(acc: dict | None) -> bool:
+    """本地 acc 是否有可用 auth_file(上游 `.upstream/manager.py:153`)。"""
+    acc = acc or {}
+    auth_file = (acc.get("auth_file") or "").strip()
+    return bool(auth_file) and Path(auth_file).exists()
+
+
+def _pool_active_target(team_target: int) -> int:
+    """除去主号后的"子号 active 池"目标(上游 `.upstream/manager.py:159`)。
+
+    主号占 1 席,target_seats=5 时子号 active 目标 = 4。轮转主循环 5/5 终止条件用此值。
+    """
+    return max(0, int(team_target) - 1)
+
+
+def _count_pool_active_accounts(accounts: list[dict] | None = None, *, require_auth: bool = False) -> int:
+    """统计非主号 + status=ACTIVE 的账号数(上游 `.upstream/manager.py:163`)。
+
+    require_auth=True 时还要求本地有可用 auth_file,用于"双指标终止条件"
+    防止"Team 满 5 但本地都是 standby/auth_invalid → 实际可用 0"假满足.
+    """
+    accounts = accounts if accounts is not None else load_accounts()
+    count = 0
+    for acc in accounts:
+        if _is_main_account_email(acc.get("email")) or acc.get("status") != STATUS_ACTIVE:
+            continue
+        if require_auth and not _has_auth_file(acc):
+            continue
+        count += 1
+    return count
+
+
+def _count_local_team_seat_accounts(accounts: list[dict] | None = None) -> int:
+    """统计本地"占着 Team 席位"的非主号账号(上游 `.upstream/manager.py:175`).
+
+    席位状态包含 ACTIVE / EXHAUSTED / AUTH_INVALID(等价上游 STATUS_AUTH_PENDING):
+    本地 STATUS_AUTH_INVALID 与状态机 AccountState.AUTH_PENDING 同 literal "auth_invalid".
+    """
+    accounts = accounts if accounts is not None else load_accounts()
+    seat_statuses = {STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID}
+    return sum(
+        1
+        for acc in accounts
+        if not _is_main_account_email(acc.get("email")) and acc.get("status") in seat_statuses
+    )
+
+
+def _estimate_local_team_member_count(team_target: int, accounts: list[dict] | None = None) -> int:
+    """估算 Team 实际成员数(含主号)(上游 `.upstream/manager.py:183`).
+
+    用于 cmd_rotate API 拿不到 member_count 时的更精确兜底,替代旧的
+    `local_active = sum(... STATUS_ACTIVE)`(后者会漏掉 EXHAUSTED / AUTH_INVALID).
+    """
+    accounts = accounts if accounts is not None else load_accounts()
+    reserved_main = 1 if int(team_target) > 0 else 0
+    return _count_local_team_seat_accounts(accounts) + reserved_main
+
+
+def _auth_repair_reset_fields() -> dict:
+    """auth_repair 状态字段清零模板(上游 `.upstream/manager.py:197`).
+
+    一次性把所有 auth_retry_* 字段写空,适用于:
+      - 手动巡检成功后重置
+      - 注册成功后重置
+      - status 从 AUTH_INVALID/STANDBY 恢复 ACTIVE 时重置
+    """
+    return {
+        "auth_retry_count": 0,
+        "auth_last_error": None,
+        "auth_last_error_detail": None,
+        "auth_last_failed_at": None,
+        "auth_retry_after": None,
+        "auth_retry_paused": False,
+    }
+
+
+def _auth_repair_retry_delays() -> tuple[int, int, int]:
+    """衰退式 retry_after 三档延迟(上游 `.upstream/manager.py:208`).
+
+    返回 (2x, 4x, 6x) * AUTO_CHECK_INTERVAL,常用 5min 间隔时为 (10min, 20min, 30min).
+    """
+    from autoteam.config import AUTO_CHECK_INTERVAL
+
+    interval = AUTO_CHECK_INTERVAL
+    try:
+        from autoteam.api import _auto_check_config
+
+        interval = int(_auto_check_config.get("interval", interval) or interval)
+    except Exception:
+        pass
+
+    interval = max(60, int(interval))
+    return (interval * 2, interval * 4, interval * 6)
+
+
+def _auth_repair_retry_add_phone_enabled() -> bool:
+    """add_phone 软重试开关(上游 `.upstream/manager.py:223`).
+
+    True → 命中 add_phone 时按指数退避重试 N 次再放弃; False → 命中即 hard fail.
+    """
+    from autoteam.config import AUTO_CHECK_RETRY_ADD_PHONE
+
+    enabled = AUTO_CHECK_RETRY_ADD_PHONE
+    try:
+        from autoteam.api import _auto_check_config
+
+        enabled = bool(_auto_check_config.get("retry_add_phone", enabled))
+    except Exception:
+        pass
+
+    return bool(enabled)
+
+
+def _auth_repair_add_phone_max_retries() -> int:
+    """add_phone 最大重试次数(上游 `.upstream/manager.py:237`).
+
+    超过此次数(从 1 起算) → next_count > max_retries → 暂停 + 释放席位.
+    """
+    from autoteam.config import AUTO_CHECK_ADD_PHONE_MAX_RETRIES
+
+    retries = AUTO_CHECK_ADD_PHONE_MAX_RETRIES
+    try:
+        from autoteam.api import _auto_check_config
+
+        retries = int(_auto_check_config.get("add_phone_max_retries", retries) or retries)
+    except Exception:
+        pass
+
+    return max(1, int(retries))
+
+
+def _auth_repair_add_phone_retry_delays(max_retries: int | None = None) -> tuple[int, ...]:
+    """add_phone 指数退避延迟序列(上游 `.upstream/manager.py:251`).
+
+    返回 (interval*2^0, interval*2^1, ...) 长度 = max_retries.
+    """
+    from autoteam.config import AUTO_CHECK_INTERVAL
+
+    interval = AUTO_CHECK_INTERVAL
+    try:
+        from autoteam.api import _auto_check_config
+
+        interval = int(_auto_check_config.get("interval", interval) or interval)
+    except Exception:
+        pass
+
+    retries = _auth_repair_add_phone_max_retries() if max_retries is None else max_retries
+    interval = max(60, int(interval))
+    retries = max(1, int(retries))
+    return tuple(interval * (2**idx) for idx in range(retries))
+
+
+def _auth_repair_error_label(error_type: str | None) -> str:
+    """error_type → 中文用户可读标签(上游 `.upstream/manager.py:268`).
+
+    UI / 日志用,未识别的 error_type 原样返回.
+    """
+    mapping = {
+        "add_phone": "手机号验证",
+        "human_verification": "人机验证",
+        "email_verification": "邮箱验证码页卡住",
+        "workspace_selection": "workspace 选择未完成",
+        "login_state_lost": "登录态丢失",
+        "site_unavailable": "站点不可用/代理异常",
+        "token_exchange_failed": "token 交换失败",
+        "non_team_plan": "未进入 Team workspace",
+        "auth_code_missing": "未获取到 auth code",
+        "login_failed": "登录失败",
+        "exception": "登录异常",
+    }
+    return mapping.get(error_type or "", error_type or "未知错误")
+
+
+def _auth_repair_state_suffix(state: dict | None) -> str:
+    """根据 auth_retry_after / auth_retry_paused 字段拼后缀(上游 `.upstream/manager.py:285`)."""
+    state = state or {}
+    if state.get("auth_retry_paused"):
+        return "，已暂停自动修复"
+    retry_after = state.get("auth_retry_after")
+    if retry_after:
+        mins = max(1, int((retry_after - time.time() + 59) // 60))
+        return f"，约 {mins} 分钟后重试"
+    return ""
+
+
+def _auth_repair_reset(email: str) -> None:
+    """注册/复用成功后清空 auth_repair 状态字段(上游 `.upstream/manager.py:296`).
+
+    不修改 status — 调用方在调用本 helper 前已经把 status 写为 ACTIVE.
+    """
+    update_account(email, **_auth_repair_reset_fields())
+
+
+def _release_auth_repair_team_seat(email: str, *, chatgpt_api=None) -> str:
+    """复用或新建 ChatGPTTeamAPI 移除受损账号的 Team 席位(上游 `.upstream/manager.py:300`).
+
+    返回 "removed" / "already_absent" / "failed".
+    给 _record_auth_repair_failure 在 hard failure / add_phone 超限时用.
+    """
+    managed_chatgpt = chatgpt_api
+    started_here = False
+
+    try:
+        if managed_chatgpt is None:
+            managed_chatgpt = ChatGPTTeamAPI()
+
+        if not _chatgpt_session_ready(managed_chatgpt):
+            managed_chatgpt.start()
+            started_here = True
+
+        return str(remove_from_team(managed_chatgpt, email, return_status=True))
+    except Exception as exc:
+        logger.warning("[认证修复] 释放 %s 的 Team 席位失败: %s", email, exc)
+        return "failed"
+    finally:
+        if started_here and _chatgpt_session_ready(managed_chatgpt):
+            managed_chatgpt.stop()
+
+
+def _auth_repair_result_suffix(result: dict | None) -> str:
+    """补充"已释放 Team 席位"语义到日志后缀(上游 `.upstream/manager.py:321`)."""
+    result = result or {}
+    suffix = _auth_repair_state_suffix(result)
+    if result.get("seat_released"):
+        return f"{suffix}，已释放 Team 席位"
+    if result.get("release_attempted") and result.get("remove_status") == "failed":
+        return f"{suffix}，释放 Team 席位失败"
+    return suffix
+
+
+def _auth_repair_skip_reason(acc: dict | None, *, force: bool = False, now: float | None = None) -> str | None:
+    """判断是否应跳过自动修复(上游 `.upstream/manager.py:331`).
+
+    返回 None  → 可走修复; 非 None → 中文跳过原因(冷却中 / 已暂停).
+    force=True 永远不跳过(给 cmd_check force_auth_repair=True 用).
+    """
+    if force or not acc:
+        return None
+
+    if acc.get("auth_retry_paused"):
+        label = _auth_repair_error_label(acc.get("auth_last_error"))
+        return f"已暂停自动修复（{label}）"
+
+    retry_after = acc.get("auth_retry_after")
+    now = time.time() if now is None else now
+    if retry_after and retry_after > now:
+        remain_secs = max(0, int(retry_after - now))
+        remain_mins = max(1, (remain_secs + 59) // 60)
+        label = _auth_repair_error_label(acc.get("auth_last_error"))
+        return f"自动修复冷却中（{label}，约 {remain_mins} 分钟后重试）"
+    return None
+
+
+def _record_auth_repair_failure(
+    email: str,
+    error_type: str | None = None,
+    error_detail: str | None = None,
+    *,
+    chatgpt_api=None,
+) -> dict:
+    """OAuth 修复失败 → 写衰退式 retry_after 状态 + 决定是否释放 Team 席位.
+
+    上游 `.upstream/manager.py:349`. 三分支:
+      1. add_phone + 软重试开 + 未超限 → 指数退避 retry_after, paused=False
+      2. add_phone(超限) | hard_failure → paused=True + 释放席位
+      3. 普通错误 → 衰退式三档 retry_after, paused=False
+
+    本地适配:
+      - 上游 STATUS_AUTH_PENDING → 本地 STATUS_AUTH_INVALID
+        (literal 同为 "auth_invalid", AccountState.AUTH_PENDING 等价)
+      - 所有 status / 字段写入走 update_account → default_machine.transition
+        自动校验合法性 + 写 state_log + 发事件.
+    """
+    now = time.time()
+    acc = find_account(load_accounts(), email) or {"email": email}
+    error_type = error_type or "login_failed"
+    error_detail = error_detail or _auth_repair_error_label(error_type)
+    retry_delays = _auth_repair_retry_delays()
+    release_team_seat = False
+
+    if error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
+        prev_count = int(acc.get("auth_retry_count") or 0) if acc.get("auth_last_error") == "add_phone" else 0
+        next_count = prev_count + 1
+        max_retries = _auth_repair_add_phone_max_retries()
+        add_phone_delays = _auth_repair_add_phone_retry_delays(max_retries)
+
+        if next_count > max_retries:
+            state = {
+                "auth_retry_count": next_count,
+                "auth_last_error": error_type,
+                "auth_last_error_detail": error_detail,
+                "auth_last_failed_at": now,
+                "auth_retry_after": None,
+                "auth_retry_paused": True,
+            }
+            release_team_seat = True
+        else:
+            state = {
+                "auth_retry_count": next_count,
+                "auth_last_error": error_type,
+                "auth_last_error_detail": error_detail,
+                "auth_last_failed_at": now,
+                "auth_retry_after": now + add_phone_delays[next_count - 1],
+                "auth_retry_paused": False,
+            }
+    elif error_type in AUTH_REPAIR_HARD_FAILURE_TYPES or error_type == "add_phone":
+        retry_count = max(int(acc.get("auth_retry_count") or 0), len(retry_delays))
+        state = {
+            "auth_retry_count": retry_count,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        release_team_seat = True
+    else:
+        prev_count = int(acc.get("auth_retry_count") or 0)
+        next_count = min(prev_count + 1, len(retry_delays))
+        delay = retry_delays[max(0, next_count - 1)]
+        retry_after = now + delay
+        state = {
+            "auth_retry_count": next_count,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": retry_after,
+            "auth_retry_paused": False,
+        }
+
+    update_account(email, **state)
+
+    is_team_member = _is_email_in_team(email)
+    if not is_team_member and acc.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_INVALID):
+        is_team_member = True
+
+    release_attempted = False
+    remove_status = None
+    seat_released = False
+    if release_team_seat and is_team_member:
+        release_attempted = True
+        remove_status = _release_auth_repair_team_seat(email, chatgpt_api=chatgpt_api)
+        seat_released = remove_status in ("removed", "already_absent")
+
+    # 上游用 STATUS_AUTH_PENDING; 本地 STATUS_AUTH_INVALID 同 literal "auth_invalid",
+    # 走 default_machine.transition 时映射到 AccountState.AUTH_PENDING.
+    final_status = STATUS_STANDBY if seat_released or not is_team_member else STATUS_AUTH_INVALID
+    update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
+
+    return {
+        **state,
+        "status": final_status,
+        "seat_released": seat_released,
+        "release_attempted": release_attempted,
+        "remove_status": remove_status,
+    }
+
+
+def invite_to_team(chatgpt_api, email, seat_type="default"):
+    """邀请账号加入 Team(上游 `.upstream/manager.py:1209`,直接回贴).
+
+    旧账号默认走 default(ChatGPT+Codex 双席); 失败自动 fallback usage_based(仅 Codex).
+
+    返回 bool。本地 chatgpt_api.invite_member 内部已自带 default→usage_based fallback
+    + errored_emails 处理 + 重试退避,但本 helper 仍提供:
+      - 模块级 helper(可被 reinvite_account 直接调用,不必走完整 OAuth 链路重邀);
+      - 简化的 bool 返回(调用方不关心 errored_emails 细节时).
+    """
+    status, data = chatgpt_api.invite_member(email, seat_type=seat_type)
+    if status == 200 and isinstance(data, dict):
+        errored = data.get("errored_emails", [])
+        if errored:
+            err_msg = errored[0].get("error", "unknown") if isinstance(errored[0], dict) else "unknown"
+            logger.warning("[Team] 邀请 %s 被拒绝: %s", email, err_msg)
+            # default 失败则尝试 usage_based(本地 invite_member 已自带,但保持上游兜底语义)
+            if seat_type == "default":
+                logger.info("[Team] 尝试 usage_based 方式...")
+                return invite_to_team(chatgpt_api, email, seat_type="usage_based")
+            return False
+    return status == 200
+
+
+# --------------------------------------------------------------------------
+# end Round 12 S3 cherry-pick block
+# --------------------------------------------------------------------------
+
+
 # Team 子账号(非主号)硬上限。主号 + 4 子号 = 5 席,与 cmd_rotate / cmd_fill 默认 target=5 一致。
 # 超过这个数说明有"假 standby / 假 personal"在 Team 里占席位(同步延迟或历史 bug 遗留),
 # _reconcile_team_members 会按优先级 kick 多余者,永不让 Team 超出 4 子号。
@@ -2089,8 +2502,16 @@ def _run_post_register_oauth(
 
 
 def _complete_registration(email, password, invite_link, mail_client, *, leave_workspace=False, out_outcome=None):
-    """完成注册 + Codex 登录（从已有邀请链接继续）。out_outcome 透传给 _run_post_register_oauth。"""
+    """完成注册 + Codex 登录（从已有邀请链接继续）。out_outcome 透传给 _run_post_register_oauth。
+
+    Round 12 S3 cherry-pick (上游 `.upstream/manager.py:1225`): 一次性生成
+    SignupProfile 并透传给 register_with_invite,确保注册 about-you 与后续
+    Codex OAuth about-you 拿到完全一致的姓名/生日/年龄(降低 OpenAI 风控触发率).
+    """
     from autoteam.invite import register_with_invite
+    from autoteam.signup_profile import generate_signup_profile
+
+    signup_profile = generate_signup_profile()
 
     logger.info("[注册] 开始注册 %s...", email)
     with sync_playwright() as p:
@@ -2100,7 +2521,14 @@ def _complete_registration(email, password, invite_link, mail_client, *, leave_w
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         )
         page = context.new_page()
-        result, password = register_with_invite(page, invite_link, email, mail_client, password=password)
+        result, password = register_with_invite(
+            page,
+            invite_link,
+            email,
+            mail_client,
+            password=password,
+            signup_profile=signup_profile,
+        )
         browser.close()
 
     if not result:
@@ -3506,8 +3934,15 @@ def cmd_rotate(target_seats=5):
     3. 统计当前 Team 空缺数
     4. 优先从 standby 中选额度已恢复的旧账号填补
     5. 仅当所有旧账号都不可用时，才创建新账号
+
+    Round 12 S3 cherry-pick:
+      - vacancy 兜底改用 _estimate_local_team_member_count(替代旧 STATUS_ACTIVE 单字段统计).
+      - ensure_account_mail(acc) 按账号 mail_provider 路由 mail client(S2 多 provider 必备).
+      - 双指标终止条件: current_count >= TARGET AND pool_active >= ACTIVE_TARGET
+        (避免 "Team 满 5 但本地全是 standby/auth_invalid" 假满足).
     """
     TARGET = target_seats
+    ACTIVE_TARGET = _pool_active_target(TARGET)
 
     from autoteam.config import AUTO_CHECK_THRESHOLD
 
@@ -3520,6 +3955,8 @@ def cmd_rotate(target_seats=5):
 
     chatgpt = None
     mail_client = None
+    # 按账号 mail_provider 复用 mail client(同 provider 只 login 一次,避免 N 个号 N 次握手)
+    reuse_mail_clients: dict[str, object] = {}
 
     def ensure_chatgpt():
         nonlocal chatgpt
@@ -3529,11 +3966,58 @@ def cmd_rotate(target_seats=5):
         return chatgpt
 
     def ensure_mail():
+        """全局默认 mail client(给"创建新号"等不绑定具体 acc 的路径用).
+
+        旧路径仍走 CloudMailClient()(等价 get_mail_client(),由 MAIL_PROVIDER /
+        MAIL_PROVIDER_CHAIN 决定). 已绑定 mail_provider 的旧 acc 复用走
+        ensure_account_mail(acc).
+        """
         nonlocal mail_client
         if not mail_client:
             mail_client = CloudMailClient()
             mail_client.login()
         return mail_client
+
+    def ensure_account_mail(acc):
+        """按账号 mail_provider 路由 mail client(上游 `.upstream/manager.py:132` _get_account_mail_client 等价).
+
+        - 已绑定 mail_provider / mail_account_id / cloudmail_account_id 的 acc → 走对应 provider
+          (从 reuse_mail_clients 缓存复用).
+        - 未绑定 → fallback 全局默认 ensure_mail()(向后兼容旧 CloudMail 主路径).
+
+        S2 多 provider 接入(addy_io / simplelogin / maillab / cf_temp_email)的关键基础设施.
+        """
+        acc = acc or {}
+        provider_name = (acc.get("mail_provider") or "").strip().lower()
+        has_explicit_binding = bool(provider_name) or acc.get("mail_account_id") is not None
+        has_legacy_binding = acc.get("cloudmail_account_id") is not None
+
+        if not (has_explicit_binding or has_legacy_binding):
+            return ensure_mail()
+
+        # 缓存键: provider 名优先,其次 account_id 单 provider 模式
+        cache_key = provider_name or f"_legacy_cloudmail:{acc.get('cloudmail_account_id')}"
+        cached = reuse_mail_clients.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            from autoteam.mail import get_mail_client
+
+            client = get_mail_client()
+            login = getattr(client, "login", None)
+            if callable(login):
+                login()
+            reuse_mail_clients[cache_key] = client
+            return client
+        except Exception as exc:
+            logger.warning(
+                "[轮转] 账号 %s 指定 mail_provider=%s 路由失败,回退默认: %s",
+                acc.get("email"),
+                provider_name or "<legacy>",
+                exc,
+            )
+            return ensure_mail()
 
     logger.info("[1/5] 同步 Team 状态...")
     sync_account_states()
@@ -3580,10 +4064,15 @@ def cmd_rotate(target_seats=5):
             already_absent_count,
         )
         if api_count <= 0:
-            # API 返回异常，用本地 active 账号数兜底
-            local_active = sum(1 for a in load_accounts() if a["status"] == STATUS_ACTIVE)
-            logger.warning("[4/5] API 成员数异常 (%d)，使用本地 active 数: %d", api_count, local_active)
-            current_count = local_active
+            # API 返回异常,用 _estimate_local_team_member_count 兜底
+            # (上游 `.upstream/manager.py:183` 等价: ACTIVE+EXHAUSTED+AUTH_INVALID 全算席位).
+            local_estimate = _estimate_local_team_member_count(TARGET)
+            logger.warning(
+                "[4/5] API 成员数异常 (%d)，使用本地估算: %d (含 ACTIVE/EXHAUSTED/AUTH_INVALID + 主号)",
+                api_count,
+                local_estimate,
+            )
+            current_count = local_estimate
         else:
             # 保守估算当前成员数：
             # - api_count 是移除后的最新观察值
@@ -3734,7 +4223,7 @@ def cmd_rotate(target_seats=5):
             logger.info("[4/5] 复用: %s", email)
             if not chatgpt or not chatgpt.browser:
                 ensure_chatgpt()
-            if reinvite_account(chatgpt, ensure_mail(), acc):
+            if reinvite_account(chatgpt, ensure_account_mail(acc), acc):
                 filled += 1
                 current_count += 1
             else:
@@ -3764,11 +4253,28 @@ def cmd_rotate(target_seats=5):
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
         final_count = get_team_member_count(chatgpt)
-        logger.info("[轮转] 最终 Team 成员数: %d（目标: %d）", final_count, TARGET)
+        # 双指标终止条件 (Round 12 S3 cherry-pick, 上游 `.upstream/manager.py` 终止条件):
+        #   final_count >= TARGET 且 pool_active >= ACTIVE_TARGET 才算"真满员".
+        # 避免"Team 满 5 但本地全是 standby/auth_invalid → 实际可用 0"假正常状态.
+        final_pool_active = _count_pool_active_accounts()
+        logger.info(
+            "[轮转] 最终 Team 成员数: %d（目标: %d），子号 pool_active=%d（目标: %d）",
+            final_count,
+            TARGET,
+            final_pool_active,
+            ACTIVE_TARGET,
+        )
         if final_count > TARGET:
             logger.warning("[轮转] 最终 Team 成员数超出目标，后续将按清理逻辑修正")
         elif 0 <= final_count < TARGET:
             logger.warning("[轮转] 最终 Team 成员数仍低于目标 (%d/%d)", final_count, TARGET)
+        elif final_pool_active < ACTIVE_TARGET:
+            logger.warning(
+                "[轮转] Team 满员但本地子号 pool_active 不足 (%d/%d) — 子号多为 standby/auth_invalid,"
+                "下一轮会继续修复或补号",
+                final_pool_active,
+                ACTIVE_TARGET,
+            )
 
     finally:
         if chatgpt and chatgpt.browser:

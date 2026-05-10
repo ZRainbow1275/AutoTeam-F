@@ -56,6 +56,15 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "t")
 
 
+# Round 12 S3 — auth_repair 状态机配置(cherry-pick from upstream).
+# AUTO_CHECK_RETRY_ADD_PHONE=true(默认): 注册被 OpenAI 要求 add_phone 时,
+#   不立即放弃,而是按指数退避(2^n * AUTO_CHECK_INTERVAL)重试 N 次,N 由
+#   AUTO_CHECK_ADD_PHONE_MAX_RETRIES 控制. 关掉后 add_phone 命中即视为
+#   hard failure → 立即暂停 + 释放席位.
+AUTO_CHECK_RETRY_ADD_PHONE = _get_bool_env("AUTO_CHECK_RETRY_ADD_PHONE", True)
+AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIES", 3)
+
+
 # 对账策略开关
 # RECONCILE_KICK_ORPHAN=true: 残废成员(workspace 有 + 本地 auth_file 缺失)自动 kick。
 #   关掉后改为打 STATUS_ORPHAN 标记等人工处理,避免"席位卡死"时仍被本地策略自动清理。

@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "ruff + pytest + code review baseline"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "verify IllegalTransitionError still propagates from update_account"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "verify structured logging on cherry-picked helpers"}
+{"file": ".trellis/tasks/05-11-s3-cherry-pick-team-rotate/prd.md", "reason": "acceptance criteria + DoD checklist"}
+{"file": ".trellis/tasks/05-11-s0-upstream-team-rotate-diff/research/upstream-diff.md", "reason": "verify cherry-pick coverage matches S0 classification"}
