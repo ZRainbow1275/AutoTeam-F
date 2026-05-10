@@ -734,6 +734,17 @@ def _apply_master_degraded_classification(
         except Exception as exc:
             out["skipped_reason"] = f"probe_exception:{type(exc).__name__}"
             return out
+
+        # Round 12 wire-up (C2) — feed every retroactive helper probe into
+        # WorkspacePool so connect 3 unhealthy → auto failover gets a chance
+        # to trigger.  apply_pool_health_signal swallows all exceptions
+        # internally (M-I1 alignment), so it cannot break the helper.
+        try:
+            apply_pool_health_signal(healthy, reason, evidence)
+        except Exception as exc:  # pragma: no cover — defensive double-net
+            logger.warning(
+                "[master_health] retroactive helper: pool signal failed: %s", exc,
+            )
     finally:
         if api_owns and api is not None:
             try:

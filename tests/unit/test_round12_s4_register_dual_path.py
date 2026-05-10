@@ -372,8 +372,11 @@ def test_alias_reader_login_calls_both():
     token = pair.login()
     assert alias.login_called == 1
     assert reader.login_called == 1
-    assert "token-addy" in token
-    assert "token-maillab" in token
+    # Round 12 wire-up (minor m1) — login() now returns a fixed "ok" literal
+    # instead of concatenating real tokens (avoids accidental token leakage
+    # through accounts.json / log).
+    assert token == "ok"
+    assert "token" not in token
 
 
 def test_alias_reader_composite_name():

@@ -84,8 +84,25 @@ class QuotaPredictor:
                 self._history_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._history_path, "a", encoding="utf-8") as fp:
                     fp.write(line)
-            except OSError:
-                logger.exception("quota_predictor.record: cannot append to %s", self._history_path)
+                    # Round 12 wire-up — flush + fsync so a crash mid-write does
+                    # not leave a half line (load_history skips JSONDecodeError
+                    # lines, but predictor accuracy suffers from gaps).
+                    try:
+                        fp.flush()
+                        import os
+                        os.fsync(fp.fileno())
+                    except OSError as exc:
+                        logger.warning(
+                            "quota_predictor.record: fsync failed for %s: %s",
+                            self._history_path, exc,
+                        )
+            except OSError as exc:
+                # Round 12 wire-up — downgrade exception to warning so a missing
+                # disk does not crash the rotate hot path.
+                logger.warning(
+                    "quota_predictor.record: cannot append to %s: %s",
+                    self._history_path, exc,
+                )
 
     # ------------------------------------------------------------------- read
     def load_history(self, email: str, *, max_points: int = 50) -> list[dict[str, Any]]:

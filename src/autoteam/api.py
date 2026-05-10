@@ -1081,6 +1081,16 @@ def get_admin_master_health(request: Request):
                 healthy, reason, evidence = is_master_subscription_healthy(
                     api, force_refresh=force_refresh,
                 )
+                # Round 12 wire-up (C2) — feed every "force-refresh re-probe"
+                # into WorkspacePool so connect 3 unhealthy → auto failover.
+                # apply_pool_health_signal swallows internally (M-I1).
+                try:
+                    from autoteam.master_health import apply_pool_health_signal
+                    apply_pool_health_signal(healthy, reason, evidence)
+                except Exception as pool_exc:  # pragma: no cover — defensive
+                    logger.warning(
+                        "[master-health] pool signal failed: %s", pool_exc,
+                    )
                 return {
                     "healthy": healthy,
                     "reason": reason,
@@ -2800,19 +2810,33 @@ def _build_sse_event_stream(machine, *, heartbeat_seconds: float = 15.0):
     Pulled out of the route so unit tests can drive it without spinning up
     Starlette/uvicorn — see ``tests/unit/test_round12_rotate_sse_stream.py``.
     """
-    q: _sse_queue.SimpleQueue = _sse_queue.SimpleQueue()
+    q: _sse_queue.Queue = _sse_queue.Queue(maxsize=1024)
     _SENTINEL = object()
 
     def _on_transition(transition):
         try:
-            q.put({
+            payload = {
                 "email": transition.email,
                 "from": transition.from_state.value if transition.from_state else None,
                 "to": transition.to_state.value,
                 "reason": transition.reason or "",
                 "ts": transition.timestamp,
                 "extra": dict(transition.extra or {}),
-            })
+            }
+            # Round 12 wire-up (minor m7) — bounded queue. If the slow SSE
+            # client lets the buffer fill, drop oldest to make room rather
+            # than growing unbounded memory.
+            try:
+                q.put_nowait(payload)
+            except _sse_queue.Full:
+                try:
+                    q.get_nowait()  # drop oldest
+                except _sse_queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(payload)
+                except _sse_queue.Full:
+                    logger.warning("[sse] queue still full after drop, event lost")
         except Exception:
             logger.exception("[sse] failed to enqueue transition %r", transition)
 

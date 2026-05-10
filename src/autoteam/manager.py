@@ -1005,6 +1005,24 @@ def sync_account_states(chatgpt_api=None):
     changed = False
     local_email_set = {a["email"].lower() for a in accounts}
 
+    # Round 12 wire-up (M1) — 把"直写 acc['status']=X 之后批量 save_accounts"改成
+    # 实时 update_account → default_machine.transition. 收益:
+    #   * state_log.jsonl 落每条变更
+    #   * 事件总线广播 → F2 SSE 推送 sync 引起的 transition
+    #   * IllegalTransition 合法性兜底
+    # 注: update_account 是 RMW + 锁内 save,O(N) 次 IO,但 sync 不在 hot path
+    # 而是 cmd_rotate 的 1/5 阶段,延迟开销可接受.
+
+    def _transition_status(email: str, new_status: str, **extra) -> None:
+        """走状态机的 update_account 包装. 出错降级 warning,不打断 sync."""
+        try:
+            update_account(email, status=new_status, **extra)
+        except Exception as exc:
+            logger.warning(
+                "[同步] update_account(%s -> %s) 抛异常(忽略): %s",
+                email, new_status, exc,
+            )
+
     # SPEC-2 FR-E1~E4 — 区分人工踢出 vs 自然待机:
     # 不在 Team 的 active 号 → wham/usage 401/403 → AUTH_INVALID(被踢);ok / network → STANDBY(自然)。
     # 探测有并发上限 5 + 单调用 5s + 整体 30s + 30 分钟 last_quota_check_at 去重。
@@ -1020,8 +1038,15 @@ def sync_account_states(chatgpt_api=None):
         in_team = email in team_emails
 
         if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING):
+            # Round 12 wire-up M1 — go through state machine (default_machine.transition).
+            ws_id = account_id or None
+            _transition_status(
+                acc["email"], STATUS_ACTIVE,
+                workspace_account_id=ws_id,
+                _reason="sync_account_states:in_team",
+            )
+            # 内存里也同步,后续 need_probe / domain_suffix 分支基于刷新后的状态判断
             acc["status"] = STATUS_ACTIVE
-            # 把当前 workspace 指纹打到记录上,后续若母号切换可以靠这字段识别
             if account_id:
                 acc["workspace_account_id"] = account_id
             changed = True
@@ -1042,6 +1067,10 @@ def sync_account_states(chatgpt_api=None):
             # FR-E3 探测去重:30 分钟内不重复探测,直接降级 STANDBY 走旧行为
             last_check = float(acc.get("last_quota_check_at") or 0)
             if (now_ts - last_check) < cooldown_secs:
+                _transition_status(
+                    acc["email"], STATUS_STANDBY,
+                    _reason="sync_account_states:probe_cooldown",
+                )
                 acc["status"] = STATUS_STANDBY
                 changed = True
                 continue
@@ -1050,6 +1079,10 @@ def sync_account_states(chatgpt_api=None):
                 need_probe.append(acc)
             else:
                 # 没 auth_file 无法探测 → 直接降级 STANDBY(等用户重 OAuth)
+                _transition_status(
+                    acc["email"], STATUS_STANDBY,
+                    _reason="sync_account_states:no_auth_file",
+                )
                 acc["status"] = STATUS_STANDBY
                 changed = True
 
@@ -1073,6 +1106,12 @@ def sync_account_states(chatgpt_api=None):
                     acc["last_quota_check_at"] = finalize_ts
 
                     if status_str == "auth_error":
+                        _transition_status(
+                            acc["email"], STATUS_AUTH_INVALID,
+                            last_kicked_at=finalize_ts,
+                            last_quota_check_at=finalize_ts,
+                            _reason="sync_account_states:probe_auth_error",
+                        )
                         acc["status"] = STATUS_AUTH_INVALID
                         acc["last_kicked_at"] = finalize_ts
                         logger.warning(
@@ -1081,10 +1120,20 @@ def sync_account_states(chatgpt_api=None):
                         )
                     elif status_str == "no_quota":
                         # 不会自然恢复
+                        _transition_status(
+                            acc["email"], STATUS_AUTH_INVALID,
+                            last_quota_check_at=finalize_ts,
+                            _reason="sync_account_states:probe_no_quota",
+                        )
                         acc["status"] = STATUS_AUTH_INVALID
                         logger.warning("[同步] %s wham no_quota → AUTH_INVALID", acc["email"])
                     else:
                         # ok / exhausted / network_error / None → 自然待机
+                        _transition_status(
+                            acc["email"], STATUS_STANDBY,
+                            last_quota_check_at=finalize_ts,
+                            _reason="sync_account_states:probe_natural_standby",
+                        )
                         acc["status"] = STATUS_STANDBY
                     changed = True
 
@@ -1096,6 +1145,10 @@ def sync_account_states(chatgpt_api=None):
         except Exception as exc:
             logger.warning("[同步] 探测段抛异常,降级所有 need_probe 为 STANDBY: %s", exc)
             for acc in need_probe:
+                _transition_status(
+                    acc["email"], STATUS_STANDBY,
+                    _reason="sync_account_states:probe_exception",
+                )
                 acc["status"] = STATUS_STANDBY
                 changed = True
 
@@ -2508,9 +2561,9 @@ def _get_mail_client_for_account(acc):
     供 `_complete_registration` / `create_account_direct` / `create_new_account` 等
     入口在没有外部 mail_client 时使用。
 
-    路由优先级:
-      1. acc.mail_provider 显式指定 → 按 MAIL_PROVIDER_CHAIN/MAIL_PROVIDER 解析对应单 provider
-         (走 get_mail_client 内部 env 路径,保持解析一致)
+    路由优先级(Round 12 wire-up M4 — 现在真正读 acc 字段了):
+      1. acc.mail_provider 显式指定 → 用 mail._resolve_provider_factory(name) 构造单 provider
+         (绕开 MAIL_PROVIDER_CHAIN 的 fallback dispatch,保证账号锁定到原 provider)
       2. 否则走 get_mail_client() 默认(MAIL_PROVIDER_CHAIN 优先,然后 MAIL_PROVIDER)
 
     无 acc 或 acc 无 mail_provider 字段 → 等价于直接 get_mail_client()。
@@ -2520,7 +2573,31 @@ def _get_mail_client_for_account(acc):
     """
     from autoteam.mail import get_mail_client
 
-    client = get_mail_client()
+    provider_name = ((acc or {}).get("mail_provider") or "").strip().lower() if acc else ""
+    client = None
+    if provider_name:
+        # Round 12 wire-up M4 — 显式 acc 级 provider 锁定。
+        # _resolve_provider_factory 可能没有 export,使用 dynamic getattr 兜底回退默认.
+        try:
+            from autoteam import mail as _mail_pkg
+
+            resolver = getattr(_mail_pkg, "_resolve_provider_factory", None)
+            if callable(resolver):
+                factory = resolver(provider_name)
+                if callable(factory):
+                    client = factory()
+        except Exception as exc:
+            logger.warning(
+                "[mail-route] 账号 %s mail_provider=%s resolve 失败,回退默认: %s",
+                (acc or {}).get("email"),
+                provider_name,
+                exc,
+            )
+            client = None
+
+    if client is None:
+        client = get_mail_client()
+
     login = getattr(client, "login", None)
     if callable(login):
         try:
@@ -3379,7 +3456,7 @@ def _extract_session_token_from_context(context):
     return session_token or None
 
 
-def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None):
+def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None):
     """
     直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
     流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
@@ -3398,8 +3475,21 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
     env 驱动:配置 chain 时 `get_mail_client()` 返回 `FallbackMailProvider`,
     自动在 mail-API 级失败时降级;邮箱-粒度的 provider 切换通过 `RegisterPathRotator`
     包装(参见 `autoteam.mail.register_dual_path`),业务调用方可自行编排。
+
+    Round 12 wire-up (M3): `path_rotator` 可选 — 传入 `RegisterPathRotator` 实例时
+    启用邮箱-粒度的 provider 切换(OTP_TIMEOUT / DOMAIN_REJECTED / INVITE_LINK_MISSING
+    自动切下一 provider 重试整个注册流程);None 时走旧逻辑(单 provider + retry 3 次).
     """
     from autoteam.invite import RegisterBlocked
+
+    # Round 12 wire-up M3 — 邮箱-粒度 provider 切换。
+    if path_rotator is not None:
+        return _create_account_direct_via_rotator(
+            path_rotator,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+        )
 
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
 
@@ -3546,7 +3636,86 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
     )
 
 
-def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None):
+def _create_account_direct_via_rotator(path_rotator, *, leave_workspace=False, out_outcome=None, acc=None):
+    """Round 12 wire-up (M3) — 用 RegisterPathRotator 编排邮箱-粒度的 provider 切换。
+
+    流程:
+      1. rotator.try_each(action) 内,对每个 strategy 调 factory() 拿一个 mail provider,
+         action 调用 create_account_direct(client=that_provider) 跑一遍注册。
+      2. 若 action 抛 OTP_TIMEOUT / INVITE_LINK_MISSING / DOMAIN_REJECTED, rotator
+         记账后切下一个 provider 重试整个流程(包括创建新邮箱)。
+      3. 全失败 → 抛 RegisterPathExhausted, 调用方决定如何写 out_outcome / 上报失败.
+
+    与 `create_account_direct(mail_client=...)` 串行路径的关键差异:rotator 路径
+    把"创建邮箱"与"注册账号"绑在同一个 strategy 内, OTP 超时不再死循环单 provider,
+    而是切到下一个 provider 重新创建邮箱.
+    """
+    from autoteam.mail.register_dual_path import (
+        InviteLinkMissingError,  # noqa: F401 — 仅供 docstring 引用,实际由调用方抛
+        RegisterPathExhausted,
+        classify_register_failure,
+    )
+
+    def _action(mail_client, provider_name, ctx):
+        # 在 action 内部执行注册.失败时 action 必须把 RegisterBlocked /
+        # TimeoutError / InviteLinkMissingError 原样抛, rotator 内的
+        # classify_register_failure 决定是否切下一 provider.
+        local_outcome = {}
+        result_email = create_account_direct(
+            mail_client=mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=local_outcome,
+            acc=acc,
+            path_rotator=None,  # 避免递归
+        )
+        if result_email is None:
+            status = local_outcome.get("status") or "register_failed"
+            reason = local_outcome.get("reason") or "create_account_direct returned None"
+            # 把外层 outcome 透传给 caller(最后一次 strategy 的细节也保留)
+            if out_outcome is not None:
+                out_outcome.clear()
+                out_outcome.update(local_outcome)
+                out_outcome["provider"] = provider_name
+                out_outcome["provider_chain_history"] = list(ctx.get("history") or [])
+            # 抛一个携带 status/reason 的 ValueError, rotator 用 classify_register_failure
+            # 决定是否切换. OTP / domain / invite_missing 文本会被识别为切换信号.
+            raise RuntimeError(f"create_account_direct failed: {status} — {reason}")
+        # 成功 → 透传 outcome
+        if out_outcome is not None:
+            out_outcome.clear()
+            out_outcome.update(local_outcome)
+            out_outcome["provider"] = provider_name
+            out_outcome["provider_chain_history"] = list(ctx.get("history") or [])
+        return result_email
+
+    try:
+        return path_rotator.try_each(_action)
+    except RegisterPathExhausted as exhausted:
+        logger.error(
+            "[直接注册-rotator] 所有 provider 均失败: %s (history=%s)",
+            exhausted, exhausted.history,
+        )
+        if out_outcome is not None:
+            out_outcome.setdefault("status", "register_failed")
+            out_outcome["reason"] = (
+                f"register path exhausted: {len(exhausted.history)} provider(s) tried"
+            )
+            out_outcome["provider_chain_history"] = list(exhausted.history)
+        return None
+    except Exception as exc:
+        # rotator 对 OTHER 类直接 raise(spec §Q2);上层调用方决定如何处理
+        ftype = classify_register_failure(exc)
+        logger.warning(
+            "[直接注册-rotator] non-rotating failure (%s): %s",
+            ftype.value, exc,
+        )
+        if out_outcome is not None:
+            out_outcome.setdefault("status", "register_failed")
+            out_outcome["reason"] = f"unrecoverable failure ({ftype.value}): {exc}"
+        return None
+
+
+def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None):
     """
     创建新账号。优先用直接注册模式（域名自动加入 workspace）。
     chatgpt_api 可为 None（直接注册不需要）。
@@ -3575,7 +3744,11 @@ def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, 
     if chatgpt_api and chatgpt_api.browser:
         chatgpt_api.stop()
     return create_account_direct(
-        mail_client, leave_workspace=leave_workspace, out_outcome=out_outcome
+        mail_client,
+        leave_workspace=leave_workspace,
+        out_outcome=out_outcome,
+        acc=acc,
+        path_rotator=path_rotator,
     )
 
 
@@ -3622,6 +3795,20 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         logger.warning("[轮转] %s reinvite OAuth 被 add-phone/duplicate 阻断: %s", email, exc)
         _cleanup_team_leftover("oauth_phone_blocked")
         update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        # Round 12 wire-up (C1) — 记录 auth_retry_* 状态字段(衰退式 retry / pause).
+        # 注意调用顺序: 已经 _cleanup_team_leftover 过, _record_auth_repair_failure 内
+        # 的 _release_auth_repair_team_seat 走 already_absent 路径, 不会重复 kick.
+        try:
+            _record_auth_repair_failure(
+                email, error_type="add_phone",
+                error_detail=str(exc),
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
         try:
             from autoteam.register_failures import record_failure
             record_failure(email, "oauth_phone_blocked", stage="reinvite_account", detail=str(exc))
@@ -3633,6 +3820,18 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         logger.warning("[轮转] 旧账号 OAuth 登录失败，保持 standby: %s", email)
         _cleanup_team_leftover("no_bundle")
         update_account(email, status=STATUS_STANDBY)
+        # Round 12 wire-up (C1) — bundle 缺失走衰退式 retry, 而非死循环.
+        try:
+            _record_auth_repair_failure(
+                email, error_type="login_failed",
+                error_detail="oauth bundle missing",
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
         return False
 
     plan_type_raw = bundle.get("plan_type_raw") or bundle.get("plan_type") or ""
@@ -3643,6 +3842,19 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         logger.warning("[轮转] %s reinvite 后 plan_type=%s 不被支持,标 AUTH_INVALID", email, plan_type_raw)
         _cleanup_team_leftover(f"plan_unsupported={plan_type_raw}")
         update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        # Round 12 wire-up (C1) — plan_unsupported 为永久失败, 走衰退式 retry 不
+        # 立刻无限循环(实际更可能等下次 OAuth 拿到正确 plan).
+        try:
+            _record_auth_repair_failure(
+                email, error_type="non_team_plan",
+                error_detail=f"plan_type={plan_type_raw}",
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
         try:
             from autoteam.register_failures import record_failure
             record_failure(email, "plan_unsupported", stage="reinvite_account", detail=f"plan_type={plan_type_raw}")
@@ -3656,6 +3868,18 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         logger.warning("[轮转] %s reinvite 后 plan=%s 漂移,不是 team,标 AUTH_INVALID", email, plan_type or "unknown")
         _cleanup_team_leftover(f"plan_drift={plan_type or 'unknown'}")
         update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        # Round 12 wire-up (C1) — 同 plan_unsupported, 走衰退式 retry.
+        try:
+            _record_auth_repair_failure(
+                email, error_type="non_team_plan",
+                error_detail=f"plan_drift plan_type={plan_type or 'unknown'}",
+                chatgpt_api=chatgpt_api,
+            )
+        except Exception as repair_exc:
+            logger.warning(
+                "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
+                email, repair_exc,
+            )
         try:
             from autoteam.register_failures import record_failure
             record_failure(email, "plan_drift", stage="reinvite_account", detail=f"plan_type={plan_type or 'unknown'}")
@@ -3782,6 +4006,15 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         auth_file=auth_file,
         workspace_account_id=get_chatgpt_account_id() or None,
     )
+    # Round 12 wire-up (C1) — 注册/复用成功后清空 auth_repair 状态字段,
+    # 避免历史 auth_retry_* 累积影响下次 cmd_rotate 跳过判断.
+    try:
+        _auth_repair_reset(email)
+    except Exception as repair_exc:
+        logger.warning(
+            "[轮转] %s _auth_repair_reset 抛异常(忽略): %s",
+            email, repair_exc,
+        )
     logger.info("[轮转] 旧账号已恢复: %s", email)
     return True
 
@@ -3996,9 +4229,14 @@ def cmd_replace_batch(emails, trigger=""):
 #
 # 把原 cmd_rotate 内 for 循环里"额度校验 → reinvite_account"两段抽出来,
 # 让 ROTATE_CONCURRENCY > 1 时多个席位的 mail wait 可并行(主要 IO 瓶颈).
-# chatgpt browser 调用本身仍由调用方决定是否需要序列化(本任务仅在主线程
-# pre-ensure 一次,reinvite_account 内部对 browser 的多次访问由 Playwright
-# session 自身保证并发安全 — 单 BrowserContext + 多 Page 模式).
+#
+# ⚠️ Round 12 wire-up (C3 fix) — chatgpt browser 调用 (reinvite_account 内的
+# chatgpt.invite_member / remove_from_team / fetch_team_state) 走 Playwright
+# sync_api,该 API **非线程安全**:多个 worker 共享同一 BrowserContext 会触发
+# `greenlet.error: cannot switch to a different thread` / `Connection closed`.
+# 因此 cmd_rotate 在 ROTATE_CONCURRENCY > 1 时会自动降级为串行,只让 mail
+# wait + auth file IO 单线程跑.要真正实现 per-worker browser context 需要
+# 重构 chatgpt_api 的 lifecycle (round-13 backlog).
 # ---------------------------------------------------------------------------
 _STANDBY_REUSE_RESULTS = frozenset({"reused", "skipped_quota", "skipped_auto", "failed"})
 
@@ -4047,6 +4285,13 @@ def _reuse_one_standby(
         skip_reason = _auto_reuse_skip_reason(acc)
         if skip_reason:
             logger.info("[4/5] 跳过 %s（%s）", email, skip_reason)
+            return {"email": email, "result": "skipped_auto", "error": None}
+
+        # Round 12 wire-up (C1) — auth_repair 冷却 / 已暂停账号跳过本轮复用.
+        # _auth_repair_skip_reason 返回非空字符串 = 跳过(包含中文标签便于日志).
+        repair_skip = _auth_repair_skip_reason(acc)
+        if repair_skip:
+            logger.info("[4/5] 跳过 %s（%s）", email, repair_skip)
             return {"email": email, "result": "skipped_auto", "error": None}
 
         auth_file = acc.get("auth_file")
@@ -4391,7 +4636,27 @@ def cmd_rotate(target_seats=5):
             )
 
         outcomes: list[dict] = []
-        if ROTATE_CONCURRENCY <= 1 or len(candidates) <= 1:
+        # Round 12 wire-up (C3) — Playwright sync_api is not thread-safe;
+        # multiple workers sharing the same chatgpt BrowserContext crash
+        # with greenlet.error.  Until per-worker browser lifecycle is added
+        # (round-13 backlog), force serial when reinvite_account is the
+        # action (it touches chatgpt browser).  Allow opt-out via
+        # ROTATE_CONCURRENCY_ALLOW_BROWSER_RACE=1 for advanced users who
+        # mock chatgpt away (only tests do that).
+        _allow_browser_race = os.environ.get(
+            "ROTATE_CONCURRENCY_ALLOW_BROWSER_RACE", "0"
+        ).strip().lower() in ("1", "true", "yes")
+        effective_concurrency = ROTATE_CONCURRENCY
+        if ROTATE_CONCURRENCY > 1 and not _allow_browser_race:
+            logger.warning(
+                "[4/5] ROTATE_CONCURRENCY=%d 已配置,但 reinvite_account 走 "
+                "Playwright sync_api(非线程安全),自动降级为串行以避免 "
+                "BrowserContext 跨线程崩溃 (C3). 如已通过 mock 绕开 browser "
+                "调用,可设 ROTATE_CONCURRENCY_ALLOW_BROWSER_RACE=1 强制并发.",
+                ROTATE_CONCURRENCY,
+            )
+            effective_concurrency = 1
+        if effective_concurrency <= 1 or len(candidates) <= 1:
             # 串行: 完全等同改造前的 for 循环行为(测试可复现)
             for acc in candidates:
                 if cancel_signal.is_cancelled():
@@ -4410,7 +4675,7 @@ def cmd_rotate(target_seats=5):
             # 比串行多做一些"探测",换取吞吐. 已 reused 数量达到 vacancies 后停止 submit.
             import concurrent.futures
 
-            workers = max(1, min(ROTATE_CONCURRENCY, len(candidates), vacancies))
+            workers = max(1, min(effective_concurrency, len(candidates), vacancies))
             logger.info("[4/5] 并发复用 standby(候选 %d,max_workers=%d)...", len(candidates), workers)
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 future_map: dict = {}

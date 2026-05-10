@@ -311,7 +311,14 @@ def sync_from_cpa():
     - 非主号文件会导入/修复到 accounts.json，默认状态为 standby（保守导入）
     - 不删除本地账号记录，仅补充/更新 auth_file
     """
-    from autoteam.accounts import STATUS_STANDBY, find_account, load_accounts, save_accounts
+    from autoteam.accounts import (
+        STATUS_STANDBY,
+        add_account,
+        find_account,
+        load_accounts,
+        save_accounts,
+        update_account,
+    )
 
     AUTH_DIR.mkdir(exist_ok=True)
 
@@ -467,19 +474,38 @@ def sync_from_cpa():
                 changed_accounts = True
                 updated_accounts += 1
         else:
-            accounts.append(
-                {
-                    "email": email,
-                    "password": "",
-                    "cloudmail_account_id": None,
-                    "status": STATUS_STANDBY,
-                    "auth_file": resolved_path,
-                    "quota_exhausted_at": None,
-                    "quota_resets_at": None,
-                    "created_at": time.time(),
-                    "last_active_at": None,
-                }
-            )
+            # Round 12 wire-up (M2) — 改用 add_account API 触发 None→PENDING transition,
+            # 紧接着 update_account → STANDBY 一次性带上 auth_file. 这样状态机能落每条
+            # state_log.jsonl + F2 SSE 推送, 不再静默直 append 旁路.
+            try:
+                add_account(email, "", cloudmail_account_id=None)
+                update_account(
+                    email,
+                    status=STATUS_STANDBY,
+                    auth_file=resolved_path,
+                    quota_exhausted_at=None,
+                    quota_resets_at=None,
+                    _reason="cpa_sync:import_unknown",
+                )
+                accounts = load_accounts()  # 刷新 in-memory snapshot 给后续 _cleanup_local_duplicates 用
+            except Exception as exc:
+                logger.warning(
+                    "[CPA] 反向同步 add_account/transition 抛异常,回退直 append: %s (%s)",
+                    email, exc,
+                )
+                accounts.append(
+                    {
+                        "email": email,
+                        "password": "",
+                        "cloudmail_account_id": None,
+                        "status": STATUS_STANDBY,
+                        "auth_file": resolved_path,
+                        "quota_exhausted_at": None,
+                        "quota_resets_at": None,
+                        "created_at": time.time(),
+                        "last_active_at": None,
+                    }
+                )
             changed_accounts = True
             added_accounts += 1
 

@@ -60,16 +60,21 @@ class AliasWithReaderProvider(MailProvider):
 
     # ------------------------------------------------------------------ auth
     def login(self) -> str:
-        """同时初始化 alias 与 reader,任一抛异常视为整体不可用。"""
-        alias_tok = self.alias.login()
-        reader_tok = self.reader.login()
+        """同时初始化 alias 与 reader,任一抛异常视为整体不可用。
+
+        返回值仅用于"是否成功登录"的简单语义,**不**包含任何真实 token —
+        历史版本曾把两个 provider 的 token 用 ``|`` 拼接返回,有调用方误存到
+        accounts.json / log 的风险(round-12 wire-up audit minor m1)。
+        现在改为返回固定 ``"ok"`` 字面量,token 仅在 provider 实例内部保持。
+        """
+        self.alias.login()
+        self.reader.login()
         logger.info(
             "[alias_with_reader] login OK (alias=%s, reader=%s)",
             getattr(self.alias, "provider_name", "alias"),
             getattr(self.reader, "provider_name", "reader"),
         )
-        # token 只用于日志,拼接返回防止外部解析
-        return f"{alias_tok or ''}|{reader_tok or ''}"
+        return "ok"
 
     # ------------------------------------------------------------------ write → alias
     def create_temp_email(

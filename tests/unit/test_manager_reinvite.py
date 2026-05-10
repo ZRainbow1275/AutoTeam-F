@@ -49,9 +49,13 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
     )
 
     assert result is True
-    # 第一条 update 是 quota probe 写 last_quota,第二条是 active 终态
+    # 第一条 update 是 quota probe 写 last_quota,第二条是 active 终态,
+    # Round 12 wire-up C1 之后还会追一条 _auth_repair_reset(清 auth_retry_* 字段).
     assert len(updates) >= 1
-    final_email, final_kwargs = updates[-1]
+    # 找到最后一条带 status 的 update,跳过 _auth_repair_reset 那条(无 status).
+    status_updates = [u for u in updates if "status" in u[1]]
+    assert status_updates, f"no status update recorded: {updates}"
+    final_email, final_kwargs = status_updates[-1]
     assert final_email == "tmp-user@example.com"
     assert final_kwargs["status"] == accounts.STATUS_ACTIVE
     assert final_kwargs["last_active_at"] == 1234567890
@@ -94,6 +98,14 @@ def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(m
     )
 
     assert result is False
-    assert updates == [
-        ("tmp-user@example.com", {"status": accounts.STATUS_AUTH_INVALID, "auth_file": None})
+    # Round 12 wire-up C1 — 失败路径除了 status=AUTH_INVALID, 还会调
+    # _record_auth_repair_failure → 写 auth_retry_* + final status.
+    # 关注 status=AUTH_INVALID 落盘即可,其余字段允许.
+    auth_invalid_updates = [
+        u for u in updates
+        if u[1].get("status") == accounts.STATUS_AUTH_INVALID
     ]
+    assert auth_invalid_updates, f"expected at least one AUTH_INVALID update, got {updates}"
+    assert auth_invalid_updates[0] == (
+        "tmp-user@example.com", {"status": accounts.STATUS_AUTH_INVALID, "auth_file": None}
+    )

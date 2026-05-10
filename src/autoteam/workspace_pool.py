@@ -11,7 +11,13 @@
 - I4: 单 workspace 模式向后兼容 — workspaces.json 不存在时 seed 自 state.json
 - I5: register / set_active / mark_unhealthy / promote 均追加 transition_log
 - I6: 与 default_machine 风格一致(lock 内修改、lock 外发布事件)
-- I7: 永不抛未捕获异常(与 master_health.py M-I1 看齐)
+- I7: 健康检查 hot-path(`mark_unhealthy` / `mark_healthy`)在收到非法
+       workspace_id 时**抛 KeyError**;`register` 在重复 / 非法 tier 时
+       **抛 ValueError**. 这与 master_health.py M-I1 的语义对齐 ——
+       输入验证错误抛(快失败,便于调用方排查),probe / 重试 hot-path
+       通过 `apply_pool_health_signal()` 用 broad try/except 包裹 raise,
+       不会让异常蔓延到顶层流程. 永远不会因为正常运行时状态(读盘失败 /
+       schema 漂移 / 并发写覆盖)抛异常.
 """
 from __future__ import annotations
 
