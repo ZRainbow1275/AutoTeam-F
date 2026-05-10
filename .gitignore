@@ -19,6 +19,7 @@ web/node_modules/
 # 运行时配置 / 失败记录 / 备份(含真实邮箱与 session,严禁入库)
 runtime_config.json
 register_failures.json
+mail_provider_state.json
 *.bak-*
 auths.bak-*/
 .backup_docker/
