@@ -2,13 +2,21 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ── 全局基线 ─────────────────────────────────────────── */
+/* ── AutoTeam Bright v1 全局基线 ──────────────────────────────────── */
 :root {
-  color-scheme: dark;
-  --bg-mesh-blue: rgba(56, 87, 220, 0.12);
-  --bg-mesh-violet: rgba(126, 87, 220, 0.10);
-  --bg-mesh-emerald: rgba(28, 152, 116, 0.06);
-  --grid-line: rgba(148, 163, 184, 0.05);
+  color-scheme: light;
+  --bg-canvas: #fafafa;
+  --bg-surface: #ffffff;
+  --bg-surface-hover: #f5f5f5;
+  --hairline: #e5e5e5;
+  --hairline-strong: #d4d4d4;
+  --ink-950: #0a0a0a;
+  --ink-700: #404040;
+  --ink-600: #525252;
+  --ink-500: #737373;
+  --ink-400: #a3a3a3;
+  --accent: #4f46e5;
+  --accent-soft: #eef2ff;
 }
 
 html, body {
@@ -19,55 +27,40 @@ html, body {
 }
 
 body {
-  background-color: #070912;
-  background-image:
-    radial-gradient(ellipse 120% 80% at 8% -10%, var(--bg-mesh-blue), transparent 60%),
-    radial-gradient(ellipse 90% 60% at 92% 0%, var(--bg-mesh-violet), transparent 65%),
-    radial-gradient(ellipse 60% 40% at 50% 110%, var(--bg-mesh-emerald), transparent 70%),
-    linear-gradient(180deg, rgba(255,255,255,0.012) 0%, rgba(255,255,255,0) 60%);
-  background-attachment: fixed;
+  background-color: var(--bg-canvas);
+  background-image: none;
+  color: var(--ink-700);
 }
 
-/* 微噪点纹理 (subtle grain),0.018 alpha 不影响识别但破除"渲染感" */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background-image: url("data:image/svg+xml;utf8,<svg viewBox='0 0 240 240' xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.018 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-  z-index: 0;
-  opacity: 1;
-  mix-blend-mode: overlay;
-}
-
-/* 高级感:font-numeric tabular,数字列对齐 */
+/* 高级感：font-numeric tabular,数字列对齐 */
 .font-mono, code, pre, .tabular {
   font-variant-numeric: tabular-nums;
 }
 
-/* 玻璃面板 */
+/* ── 卡片面板（替换原"玻璃面板"语义）─────────────────────────────── */
 .glass {
-  background: linear-gradient(180deg, rgba(20, 26, 46, 0.72) 0%, rgba(12, 16, 32, 0.72) 100%);
-  backdrop-filter: blur(8px);
-  border: 1px solid rgba(148, 163, 184, 0.08);
+  background: var(--bg-surface);
+  backdrop-filter: none;
+  border: 1px solid var(--hairline);
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
-    0 24px 48px -24px rgba(0, 0, 0, 0.6);
+    0 1px 2px 0 rgba(0, 0, 0, 0.04),
+    0 1px 3px 0 rgba(0, 0, 0, 0.06);
 }
 
 .glass-soft {
-  background: linear-gradient(180deg, rgba(28, 35, 60, 0.6) 0%, rgba(16, 22, 40, 0.6) 100%);
-  border: 1px solid rgba(148, 163, 184, 0.07);
+  background: var(--bg-surface);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03);
 }
 
-/* shimmer 用于 loading row */
+/* ── shimmer (loading row) ────────────────────────────────────────── */
 .shimmer-bg {
-  background: linear-gradient(90deg, rgba(148,163,184,0.04) 0%, rgba(148,163,184,0.12) 50%, rgba(148,163,184,0.04) 100%);
+  background: linear-gradient(90deg, rgba(0,0,0,0.03) 0%, rgba(0,0,0,0.08) 50%, rgba(0,0,0,0.03) 100%);
   background-size: 200% 100%;
   animation: shimmer 2.4s ease-in-out infinite;
 }
 
-/* 行 hover 高亮 (subtle blue tint + left border accent) */
+/* ── 行 hover 高亮 ───────────────────────────────────────────────── */
 .row-hoverable {
   position: relative;
   transition: background-color 180ms ease, transform 180ms ease;
@@ -79,42 +72,168 @@ body::before {
   top: 0;
   bottom: 0;
   width: 2px;
-  background: linear-gradient(180deg, transparent, rgba(96, 165, 250, 0.5), transparent);
+  background: linear-gradient(180deg, transparent, rgba(79, 70, 229, 0.5), transparent);
   opacity: 0;
   transition: opacity 220ms ease;
 }
 .row-hoverable:hover::before {
   opacity: 1;
 }
+.row-hoverable:hover {
+  background-color: var(--bg-surface-hover);
+}
 
-/* GRACE 状态 — 倒计时小于 7 天闪烁 */
+/* GRACE 倒计时 < 7d 闪烁 */
 @keyframes graceUrgent {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(251, 113, 133, 0); }
-  50% { box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.18); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(225, 29, 72, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(225, 29, 72, 0.18); }
 }
 .grace-urgent { animation: graceUrgent 2.2s ease-in-out infinite; }
 
-/* 滚动条 */
+/* 滚动条（浅色版） */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.18);
+  background: rgba(0, 0, 0, 0.12);
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.28); background-clip: padding-box; border: 2px solid transparent; }
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.20);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
 
-/* main 内容浮在噪点之上 */
 #app { position: relative; z-index: 1; }
 
-/* 工具类:hover 抬升 + 内阴影 */
+/* hover 抬升 + 内阴影 */
 .lift-hover { transition: transform 180ms cubic-bezier(0.22,1,0.36,1), box-shadow 180ms ease; }
-.lift-hover:hover:not(:disabled) { transform: translateY(-1px); }
+.lift-hover:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.08), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+}
 .lift-hover:active:not(:disabled) { transform: translateY(0); }
 
-/* 选择/聚焦的 ring */
+/* focus ring (indigo) */
 .focus-ring:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.35), 0 0 0 4px rgba(96, 165, 250, 0.18);
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.40), 0 0 0 4px rgba(79, 70, 229, 0.15);
+}
+
+/* ── 路由切换过渡 (App.vue Transition name="page") ────────────────── */
+.page-enter-from { opacity: 0; transform: translateY(4px); }
+.page-enter-active { transition: opacity 180ms cubic-bezier(0.22, 1, 0.36, 1), transform 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+.page-enter-to { opacity: 1; transform: translateY(0); }
+.page-leave-from { opacity: 1; transform: translateY(0); }
+.page-leave-active { transition: opacity 120ms ease-in, transform 120ms ease-in; }
+.page-leave-to { opacity: 0; transform: translateY(-2px); }
+
+/* ── 渐变按钮上的白前景（绕过 §Compat 层 text-white 翻转）──────── */
+.text-on-accent { color: #ffffff !important; }
+
+/* ─────────────────────────────────────────────────────────────────
+ * § Compat Layer — 旧深色 utility → 明亮等价值
+ * 21 组件仍硬编码 text-white / text-gray-X / bg-white/[0.0X] / border-white/[X]
+ * 统一在此一次性翻转,避免逐文件改 21 套类名;视觉影响整体可控。
+ * 渐变按钮等需要保留白前景的元素请使用 .text-on-accent。
+ * ───────────────────────────────────────────────────────────────── */
+@layer utilities {
+  /* 文字色翻转 */
+  .text-white { color: #0a0a0a; }
+  .text-gray-100 { color: #171717; }
+  .text-gray-200 { color: #262626; }
+  .text-gray-300 { color: #404040; }
+  .text-gray-400 { color: #525252; }
+  .text-gray-500 { color: #737373; }
+  .text-gray-600 { color: #a3a3a3; }
+  .text-gray-700 { color: #d4d4d4; }
+  .hover\:text-white:hover { color: #0a0a0a; }
+  .hover\:text-gray-100:hover { color: #171717; }
+  .hover\:text-gray-200:hover { color: #262626; }
+  .hover\:text-gray-300:hover { color: #404040; }
+
+  /* 半透明白底 → 半透明黑底 */
+  .bg-white\/\[0\.02\] { background-color: rgba(0,0,0,0.02); }
+  .bg-white\/\[0\.03\] { background-color: rgba(0,0,0,0.03); }
+  .bg-white\/\[0\.04\] { background-color: rgba(0,0,0,0.04); }
+  .bg-white\/\[0\.05\] { background-color: rgba(0,0,0,0.05); }
+  .bg-white\/\[0\.06\] { background-color: rgba(0,0,0,0.05); }
+  .bg-white\/\[0\.07\] { background-color: rgba(0,0,0,0.06); }
+  .bg-white\/\[0\.08\] { background-color: rgba(0,0,0,0.06); }
+  .bg-white\/\[0\.10\] { background-color: rgba(0,0,0,0.07); }
+  .bg-white\/5 { background-color: rgba(0,0,0,0.04); }
+  .bg-white\/10 { background-color: rgba(0,0,0,0.06); }
+  .hover\:bg-white\/\[0\.04\]:hover { background-color: rgba(0,0,0,0.04); }
+  .hover\:bg-white\/\[0\.06\]:hover { background-color: rgba(0,0,0,0.05); }
+  .hover\:bg-white\/\[0\.07\]:hover { background-color: rgba(0,0,0,0.06); }
+  .hover\:bg-white\/\[0\.10\]:hover { background-color: rgba(0,0,0,0.07); }
+
+  /* black/30 输入框深色背景 → 浅灰 */
+  .bg-black\/30 { background-color: #f5f5f5; }
+  .bg-black\/40 { background-color: #efefef; }
+  .bg-black\/50 { background-color: #ebebeb; }
+
+  /* gray-700/800/900 灰阶（Settings 等组件硬编码深色 input）→ 浅灰 */
+  .bg-gray-700 { background-color: #ebebeb; }
+  .bg-gray-800 { background-color: #f5f5f5; }
+  .bg-gray-900 { background-color: #fafafa; }
+  .bg-gray-800\/30 { background-color: rgba(0,0,0,0.02); }
+  .bg-gray-800\/40 { background-color: rgba(0,0,0,0.03); }
+  .bg-gray-800\/60 { background-color: rgba(0,0,0,0.04); }
+  .hover\:bg-gray-700:hover { background-color: #e5e5e5; }
+  .disabled\:bg-gray-700:disabled { background-color: #f5f5f5; }
+  .disabled\:hover\:bg-gray-700:disabled:hover { background-color: #f5f5f5; }
+  .border-gray-600 { border-color: #d4d4d4; }
+  .border-gray-700 { border-color: #d4d4d4; }
+  .border-gray-800 { border-color: #e5e5e5; }
+  .border-gray-900 { border-color: #e5e5e5; }
+
+  /* border-white/X → hairline */
+  .border-white\/\[0\.04\] { border-color: rgba(0,0,0,0.06); }
+  .border-white\/\[0\.05\] { border-color: rgba(0,0,0,0.06); }
+  .border-white\/\[0\.06\] { border-color: rgba(0,0,0,0.07); }
+  .border-white\/\[0\.08\] { border-color: rgba(0,0,0,0.08); }
+  .border-white\/\[0\.10\] { border-color: rgba(0,0,0,0.10); }
+  .border-white\/5 { border-color: rgba(0,0,0,0.06); }
+  .border-white\/10 { border-color: rgba(0,0,0,0.10); }
+  .border-white\/20 { border-color: rgba(0,0,0,0.15); }
+  .hover\:border-white\/20:hover { border-color: rgba(0,0,0,0.15); }
+
+  /* placeholder */
+  .placeholder\:text-gray-600::placeholder { color: #a3a3a3; }
+  .placeholder\:text-gray-500::placeholder { color: #a3a3a3; }
+
+  /* tone-300/200 文字（深色主题里的明亮态）→ tone-700/800 (light 上更易读) */
+  .text-emerald-100, .text-emerald-200 { color: #065f46; }
+  .text-emerald-300 { color: #047857; }
+  .text-amber-100, .text-amber-200 { color: #92400e; }
+  .text-amber-300 { color: #b45309; }
+  .text-rose-100, .text-rose-200 { color: #9f1239; }
+  .text-rose-300 { color: #be123c; }
+  .text-orange-200 { color: #9a3412; }
+  .text-orange-300 { color: #c2410c; }
+  .text-violet-100, .text-violet-200 { color: #5b21b6; }
+  .text-violet-300 { color: #6d28d9; }
+  .text-indigo-100, .text-indigo-200 { color: #3730a3; }
+  .text-indigo-300 { color: #4338ca; }
+  .text-blue-200 { color: #1e3a8a; }
+  .text-blue-300 { color: #1d4ed8; }
+  .text-yellow-200 { color: #854d0e; }
+  .text-yellow-300 { color: #a16207; }
+  .text-fuchsia-100, .text-fuchsia-200 { color: #86198f; }
+  .text-fuchsia-300 { color: #a21caf; }
+  .text-cyan-100, .text-cyan-200 { color: #155e75; }
+  .text-cyan-300 { color: #0e7490; }
+  .text-sky-100, .text-sky-200 { color: #0c4a6e; }
+  .text-sky-300 { color: #0369a1; }
+  .text-slate-300 { color: #475569; }
+  .text-slate-400 { color: #64748b; }
+  .text-slate-500 { color: #64748b; }
+  .text-red-300 { color: #b91c1c; }
+
+  .hover\:text-rose-200:hover { color: #9f1239; }
+  .hover\:text-rose-300:hover { color: #be123c; }
+  .hover\:text-emerald-200:hover { color: #065f46; }
+  .hover\:text-amber-200:hover { color: #92400e; }
 }

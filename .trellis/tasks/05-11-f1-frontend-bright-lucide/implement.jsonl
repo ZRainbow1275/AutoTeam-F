@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/prd.md", "reason": "父任务 PRD,Decision Q4 锁定 lucide-vue-next + Bright v1 + vue-query + Vue Transition,本子任务的设计权威来源"}
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/research/frontend-bright-icon.md", "reason": "前端调研:icon set 选型对比 / Bright v1 调色板 / vue-query 集成范例 / emoji→Lucide 映射表"}

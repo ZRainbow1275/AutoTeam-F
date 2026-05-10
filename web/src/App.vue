@@ -50,33 +50,35 @@
         </span>
       </div>
 
-      <!-- 页面内容 -->
-      <Dashboard v-if="currentPage === 'dashboard'"
-        :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus"
-        :master-health="masterHealth" @refresh="refresh" @reload-master-health="reloadMasterHealth" />
+      <!-- 页面内容 — round-12 F1 加 Vue Transition page 过渡 -->
+      <Transition name="page" mode="out-in">
+        <Dashboard v-if="currentPage === 'dashboard'" key="dashboard"
+          :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus"
+          :master-health="masterHealth" @refresh="refresh" @reload-master-health="reloadMasterHealth" />
 
-      <TeamMembers v-else-if="currentPage === 'team'" />
+        <TeamMembers v-else-if="currentPage === 'team'" key="team" />
 
-      <PoolPage v-else-if="currentPage === 'pool'"
-        :running-task="busyTask" :admin-status="adminStatus" :master-health="masterHealth" :status="status"
-        @task-started="onTaskStarted" @refresh="refresh" @reload-master-health="reloadMasterHealth" />
+        <PoolPage v-else-if="currentPage === 'pool'" key="pool"
+          :running-task="busyTask" :admin-status="adminStatus" :master-health="masterHealth" :status="status"
+          @task-started="onTaskStarted" @refresh="refresh" @reload-master-health="reloadMasterHealth" />
 
-      <SyncPage v-else-if="currentPage === 'sync'"
-        :running-task="busyTask" :admin-status="adminStatus"
-        @task-started="onTaskStarted" @refresh="refresh" />
+        <SyncPage v-else-if="currentPage === 'sync'" key="sync"
+          :running-task="busyTask" :admin-status="adminStatus"
+          @task-started="onTaskStarted" @refresh="refresh" />
 
-      <OAuthPage v-else-if="currentPage === 'oauth'"
-        :manual-account-status="manualAccountStatus" @refresh="refresh" @progress="onAdminProgress" />
+        <OAuthPage v-else-if="currentPage === 'oauth'" key="oauth"
+          :manual-account-status="manualAccountStatus" @refresh="refresh" @progress="onAdminProgress" />
 
-      <TaskHistoryPage v-else-if="currentPage === 'tasks'"
-        :tasks="tasks" />
+        <TaskHistoryPage v-else-if="currentPage === 'tasks'" key="tasks"
+          :tasks="tasks" />
 
-      <LogViewer v-else-if="currentPage === 'logs'" />
+        <LogViewer v-else-if="currentPage === 'logs'" key="logs" />
 
-      <Settings v-else-if="currentPage === 'settings'"
-        :admin-status="adminStatus" :codex-status="codexStatus"
-        :master-health="masterHealth" :status="status"
-        @refresh="refresh" @admin-progress="onAdminProgress" @reload-master-health="reloadMasterHealth" />
+        <Settings v-else-if="currentPage === 'settings'" key="settings"
+          :admin-status="adminStatus" :codex-status="codexStatus"
+          :master-health="masterHealth" :status="status"
+          @refresh="refresh" @admin-progress="onAdminProgress" @reload-master-health="reloadMasterHealth" />
+      </Transition>
     </div>
 
     <ToastHost />

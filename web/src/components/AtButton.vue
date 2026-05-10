@@ -63,39 +63,40 @@ const sizeClasses = {
 
 const variantClasses = computed(() => {
   if (props.variant === 'primary') {
+    // round-12 F1 — text-on-accent 绕过 §Compat 层 text-white 翻转,保留白前景
     return [
-      'text-white border border-blue-400/30',
-      'bg-gradient-to-br from-blue-500 via-indigo-500 to-violet-500',
-      'shadow-glow-blue hover:shadow-[0_12px_32px_-10px_rgba(99,102,241,0.6)]',
-      'hover:from-blue-400 hover:via-indigo-400 hover:to-violet-400',
-      'active:from-blue-600 active:via-indigo-600 active:to-violet-600',
+      'text-on-accent border border-indigo-500/30',
+      'bg-gradient-to-br from-indigo-500 via-indigo-600 to-violet-600',
+      'shadow-card hover:shadow-ring-accent',
+      'hover:from-indigo-400 hover:via-indigo-500 hover:to-violet-500',
+      'active:from-indigo-600 active:via-indigo-700 active:to-violet-700',
     ].join(' ')
   }
   if (props.variant === 'danger') {
     if (confirming.value) {
       return [
-        'text-white border border-rose-400/40',
-        'bg-gradient-to-br from-rose-600 via-red-600 to-rose-700',
-        'shadow-glow-rose ring-2 ring-rose-400/40',
+        'text-on-accent border border-rose-500/30',
+        'bg-gradient-to-br from-rose-500 via-red-600 to-rose-700',
+        'shadow-card ring-2 ring-rose-400/40',
       ].join(' ')
     }
     return [
-      'text-rose-300 border border-rose-500/30',
-      'bg-rose-500/[0.08] hover:bg-rose-500/15',
-      'hover:text-rose-200 hover:border-rose-400/50',
+      'text-rose-700 border border-rose-200',
+      'bg-rose-50 hover:bg-rose-100',
+      'hover:text-rose-800 hover:border-rose-300',
     ].join(' ')
   }
   if (props.variant === 'ghost') {
     return [
-      'text-gray-400 border border-transparent',
-      'hover:bg-white/[0.04] hover:text-white',
+      'text-ink-600 border border-transparent',
+      'hover:bg-ink-100 hover:text-ink-950',
     ].join(' ')
   }
   // secondary
   return [
-    'text-gray-300 border border-white/10 bg-white/[0.03]',
-    'hover:bg-white/[0.07] hover:text-white hover:border-white/20',
-    'active:bg-white/[0.10]',
+    'text-ink-700 border border-hairline bg-surface',
+    'hover:bg-ink-100 hover:text-ink-950 hover:border-hairline-strong',
+    'active:bg-ink-200',
   ].join(' ')
 })
 

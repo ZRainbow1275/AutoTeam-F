@@ -1,28 +1,21 @@
 <!--
   UsabilityCell — F1 "实际可用"列
-  四档:✅ 可用 / ⚠️ Grace + 倒计时 / 💤 待机 / ❌ 不可用
+  四档:可用 / Grace + 倒计时 / 待机 / 不可用
+  round-12 F1 — emoji & inline-svg → Lucide,Bright v1 配色
 -->
 <template>
   <div class="flex items-center gap-2 min-w-0">
-    <span class="relative flex shrink-0 w-6 h-6 rounded-md items-center justify-center text-xs font-bold"
+    <span class="relative flex shrink-0 w-6 h-6 rounded-md items-center justify-center"
       :class="badgeClass" :title="usability.hint">
-      <span v-if="kind === 'usable'" aria-hidden="true">
-        <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="currentColor" d="M6.5 11.4L3.6 8.5l1.1-1.1 1.8 1.8L11.3 4l1.1 1.1z"/></svg>
-      </span>
-      <span v-else-if="kind === 'grace'" aria-hidden="true">
-        <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="currentColor" d="M8 1.5l7 12.5H1L8 1.5zm0 4.5v3M8 11h.01" stroke="currentColor" stroke-width="0.5"/></svg>
-      </span>
-      <span v-else-if="kind === 'standby'" aria-hidden="true">
-        <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5V8l2.2 1.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-      </span>
-      <span v-else-if="kind === 'unusable'" aria-hidden="true">
-        <svg viewBox="0 0 16 16" class="w-3.5 h-3.5"><path fill="currentColor" d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </span>
+      <CircleCheck v-if="kind === 'usable'" class="w-3.5 h-3.5" :stroke-width="2.25" />
+      <TriangleAlert v-else-if="kind === 'grace'" class="w-3.5 h-3.5" :stroke-width="2.25" />
+      <Hourglass v-else-if="kind === 'standby'" class="w-3.5 h-3.5" :stroke-width="2.25" />
+      <CircleX v-else-if="kind === 'unusable'" class="w-3.5 h-3.5" :stroke-width="2.25" />
       <span v-else>—</span>
     </span>
     <div class="min-w-0">
       <div class="text-xs font-semibold leading-tight" :class="textClass">{{ usability.label }}</div>
-      <div v-if="usability.hint" class="text-[10px] leading-tight opacity-60 truncate" :class="textClass">
+      <div v-if="usability.hint" class="text-[10px] leading-tight opacity-70 truncate" :class="textClass">
         {{ usability.hint }}
       </div>
     </div>
@@ -31,6 +24,7 @@
 
 <script setup>
 import { computed } from 'vue'
+import { CircleCheck, CircleX, TriangleAlert, Hourglass } from 'lucide-vue-next'
 import { computeUsability } from '../composables/useStatus.js'
 
 const props = defineProps({
@@ -43,24 +37,24 @@ const kind = computed(() => usability.value.kind)
 const badgeClass = computed(() => {
   switch (kind.value) {
     case 'usable':
-      return 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/30'
+      return 'bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-600/20'
     case 'grace':
-      return 'bg-orange-500/15 text-orange-300 ring-1 ring-orange-400/40'
+      return 'bg-orange-50 text-orange-700 ring-1 ring-inset ring-orange-600/25'
     case 'standby':
-      return 'bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/30'
+      return 'bg-amber-50 text-amber-800 ring-1 ring-inset ring-amber-600/25'
     case 'unusable':
-      return 'bg-rose-500/15 text-rose-300 ring-1 ring-rose-400/30'
+      return 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-600/25'
     default:
-      return 'bg-slate-500/15 text-slate-300 ring-1 ring-slate-400/20'
+      return 'bg-slate-100 text-slate-600 ring-1 ring-inset ring-slate-400/30'
   }
 })
 const textClass = computed(() => {
   switch (kind.value) {
-    case 'usable': return 'text-emerald-300'
-    case 'grace': return 'text-orange-200'
-    case 'standby': return 'text-amber-200'
-    case 'unusable': return 'text-rose-200'
-    default: return 'text-slate-300'
+    case 'usable': return 'text-emerald-700'
+    case 'grace': return 'text-orange-700'
+    case 'standby': return 'text-amber-800'
+    case 'unusable': return 'text-rose-700'
+    default: return 'text-slate-600'
   }
 })
 </script>

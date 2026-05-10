@@ -27,10 +27,10 @@
         :disabled="isDisabled(action)"
         class="relative h-10 px-4 rounded-xl text-sm font-semibold border transition-all
                lift-hover focus-ring select-none whitespace-nowrap
-               disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-white/[0.02] disabled:text-gray-500 disabled:border-white/[0.06]"
+               disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-ink-100 disabled:text-ink-400 disabled:border-hairline"
         :class="actionColorClass(action)">
         <span class="inline-flex items-center gap-2">
-          <span class="text-base leading-none">{{ action.icon }}</span>
+          <component :is="action.icon" class="w-4 h-4 shrink-0" :stroke-width="2" />
           {{ action.label }}
         </span>
       </button>
@@ -69,6 +69,17 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import {
+  RotateCw,
+  ChartPie,
+  Plus,
+  Coins,
+  UserPlus,
+  Brush,
+  RefreshCw,
+  Download,
+  Users,
+} from 'lucide-vue-next'
 import { api } from '../api.js'
 import AtButton from './AtButton.vue'
 
@@ -81,16 +92,17 @@ const props = defineProps({
 })
 const emit = defineEmits(['task-started', 'refresh'])
 
+// round-12 F1 — emoji → Lucide
 const actions = [
-  { key: 'rotate', group: 'pool', label: '智能轮转', icon: '🔁', method: 'startRotate', needParam: true, paramName: 'target', tone: 'primary' },
-  { key: 'check', group: 'pool', label: '检查额度', icon: '📊', method: 'startCheck', needParam: false, tone: 'emerald' },
-  { key: 'fill', group: 'pool', label: '补满成员', icon: '➕', method: 'startFill', needParam: true, paramName: 'target', tone: 'violet' },
-  { key: 'fill-personal', group: 'pool', label: '生成免费号', icon: '🪙', method: 'startFillPersonal', needParam: true, paramName: 'count', tone: 'fuchsia' },
-  { key: 'add', group: 'pool', label: '添加账号', icon: '🆕', method: 'startAdd', needParam: false, tone: 'amber' },
-  { key: 'cleanup', group: 'pool', label: '清理成员', icon: '🧹', method: 'startCleanup', needParam: false, tone: 'rose' },
-  { key: 'sync', group: 'sync', label: '同步 CPA', icon: '🔄', method: 'postSync', needParam: false, sync: true, allowWithoutAdmin: true, tone: 'cyan' },
-  { key: 'pull-cpa', group: 'sync', label: '拉取 CPA', icon: '⬇️', method: 'postSyncFromCpa', needParam: false, sync: true, allowWithoutAdmin: true, tone: 'emerald' },
-  { key: 'sync-accounts', group: 'sync', label: '同步账号', icon: '👥', method: 'postSyncAccounts', needParam: false, sync: true, allowWithoutAdmin: true, tone: 'sky' },
+  { key: 'rotate', group: 'pool', label: '智能轮转', icon: RotateCw, method: 'startRotate', needParam: true, paramName: 'target', tone: 'primary' },
+  { key: 'check', group: 'pool', label: '检查额度', icon: ChartPie, method: 'startCheck', needParam: false, tone: 'emerald' },
+  { key: 'fill', group: 'pool', label: '补满成员', icon: Plus, method: 'startFill', needParam: true, paramName: 'target', tone: 'violet' },
+  { key: 'fill-personal', group: 'pool', label: '生成免费号', icon: Coins, method: 'startFillPersonal', needParam: true, paramName: 'count', tone: 'fuchsia' },
+  { key: 'add', group: 'pool', label: '添加账号', icon: UserPlus, method: 'startAdd', needParam: false, tone: 'amber' },
+  { key: 'cleanup', group: 'pool', label: '清理成员', icon: Brush, method: 'startCleanup', needParam: false, tone: 'rose' },
+  { key: 'sync', group: 'sync', label: '同步 CPA', icon: RefreshCw, method: 'postSync', needParam: false, sync: true, allowWithoutAdmin: true, tone: 'cyan' },
+  { key: 'pull-cpa', group: 'sync', label: '拉取 CPA', icon: Download, method: 'postSyncFromCpa', needParam: false, sync: true, allowWithoutAdmin: true, tone: 'emerald' },
+  { key: 'sync-accounts', group: 'sync', label: '同步账号', icon: Users, method: 'postSyncAccounts', needParam: false, sync: true, allowWithoutAdmin: true, tone: 'sky' },
 ]
 
 const showParams = ref(false)
@@ -202,17 +214,17 @@ function isDisabled(action) {
   return false
 }
 
-// 按 tone 给按钮配色,统一玻璃化
+// 按 tone 给按钮配色 — round-12 F1 Bright v1
 function actionColorClass(action) {
   const map = {
-    primary: 'text-indigo-100 bg-gradient-to-br from-indigo-500/25 to-violet-500/25 border-indigo-400/40 hover:from-indigo-500/40 hover:to-violet-500/40 shadow-glow-blue',
-    emerald: 'text-emerald-100 bg-emerald-500/15 border-emerald-400/30 hover:bg-emerald-500/25',
-    violet: 'text-violet-100 bg-violet-500/15 border-violet-400/30 hover:bg-violet-500/25',
-    fuchsia: 'text-fuchsia-100 bg-fuchsia-500/15 border-fuchsia-400/30 hover:bg-fuchsia-500/25',
-    amber: 'text-amber-100 bg-amber-500/15 border-amber-400/30 hover:bg-amber-500/25',
-    rose: 'text-rose-100 bg-rose-500/15 border-rose-400/30 hover:bg-rose-500/25',
-    cyan: 'text-cyan-100 bg-cyan-500/15 border-cyan-400/30 hover:bg-cyan-500/25',
-    sky: 'text-sky-100 bg-sky-500/15 border-sky-400/30 hover:bg-sky-500/25',
+    primary: 'text-indigo-700 bg-indigo-50 border-indigo-200 hover:bg-indigo-100 hover:border-indigo-300',
+    emerald: 'text-emerald-700 bg-emerald-50 border-emerald-200 hover:bg-emerald-100',
+    violet: 'text-violet-700 bg-violet-50 border-violet-200 hover:bg-violet-100',
+    fuchsia: 'text-fuchsia-700 bg-fuchsia-50 border-fuchsia-200 hover:bg-fuchsia-100',
+    amber: 'text-amber-800 bg-amber-50 border-amber-200 hover:bg-amber-100',
+    rose: 'text-rose-700 bg-rose-50 border-rose-200 hover:bg-rose-100',
+    cyan: 'text-cyan-700 bg-cyan-50 border-cyan-200 hover:bg-cyan-100',
+    sky: 'text-sky-700 bg-sky-50 border-sky-200 hover:bg-sky-100',
   }
   return map[action.tone] || map.primary
 }

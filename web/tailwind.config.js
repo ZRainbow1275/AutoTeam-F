@@ -1,4 +1,7 @@
 /** @type {import('tailwindcss').Config} */
+// AutoTeam Bright v1 — round-12 F1
+// 深色玻璃风 → 明亮 dashboard
+// 调研：.trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/research/frontend-bright-icon.md
 export default {
   content: ['./index.html', './src/**/*.{vue,js}'],
   theme: {
@@ -8,21 +11,40 @@ export default {
         mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
       },
       colors: {
+        // 中性灰阶（保留 ink 命名，所有引用 ink-* 的组件无须改）
         ink: {
-          950: '#070912',
-          900: '#0c1020',
-          800: '#141a2e',
-          700: '#1c233c',
-          600: '#2a3354',
+          50: '#fafafa',
+          100: '#f5f5f5',
+          200: '#e5e5e5',
+          300: '#d4d4d4',
+          400: '#a3a3a3',
+          500: '#737373',
+          600: '#525252',
+          700: '#404040',
+          800: '#262626',
+          900: '#171717',
+          950: '#0a0a0a',
         },
+        // 语义 token
+        canvas: '#fafafa',
+        surface: { DEFAULT: '#ffffff', hover: '#f5f5f5' },
+        hairline: { DEFAULT: '#e5e5e5', strong: '#d4d4d4' },
       },
       boxShadow: {
-        'glow-blue': '0 8px 24px -8px rgba(96, 165, 250, 0.45)',
-        'glow-violet': '0 8px 24px -8px rgba(167, 139, 250, 0.45)',
-        'glow-rose': '0 8px 24px -8px rgba(251, 113, 133, 0.45)',
-        'glow-amber': '0 8px 24px -8px rgba(251, 191, 36, 0.45)',
-        'glow-emerald': '0 8px 24px -8px rgba(52, 211, 153, 0.45)',
-        'inner-soft': 'inset 0 1px 0 0 rgba(255, 255, 255, 0.06)',
+        // Linear/Vercel 风轻盈 elevation
+        'card': '0 1px 2px 0 rgba(0,0,0,0.04), 0 1px 3px 0 rgba(0,0,0,0.06)',
+        'card-hover': '0 4px 12px -2px rgba(0,0,0,0.08), 0 2px 4px -2px rgba(0,0,0,0.04)',
+        'ring-accent': '0 0 0 3px rgba(79, 70, 229, 0.15)',
+        // 兼容旧 glow-* 命名 → 改为微弱 elevation，避免组件硬引用炸（视觉显著弱化是 by design）
+        'glow-blue': '0 6px 16px -8px rgba(79, 70, 229, 0.25)',
+        'glow-violet': '0 6px 16px -8px rgba(124, 58, 237, 0.25)',
+        'glow-rose': '0 6px 16px -8px rgba(225, 29, 72, 0.20)',
+        'glow-amber': '0 6px 16px -8px rgba(217, 119, 6, 0.20)',
+        'glow-emerald': '0 6px 16px -8px rgba(5, 150, 105, 0.20)',
+        'inner-soft': 'inset 0 1px 0 0 rgba(0, 0, 0, 0.03)',
+      },
+      ringColor: {
+        DEFAULT: '#4f46e5',
       },
       animation: {
         'pulse-dot': 'pulseDot 1.8s ease-in-out infinite',

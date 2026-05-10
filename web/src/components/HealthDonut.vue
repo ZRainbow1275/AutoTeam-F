@@ -7,7 +7,7 @@
     <svg :viewBox="`0 0 ${size} ${size}`" class="block">
       <!-- 背景圈 -->
       <circle :cx="size/2" :cy="size/2" :r="radius"
-        fill="none" stroke="rgba(148, 163, 184, 0.10)" :stroke-width="thickness" />
+        fill="none" stroke="rgba(0, 0, 0, 0.06)" :stroke-width="thickness" />
       <!-- 段 -->
       <circle v-for="(seg, i) in arcs" :key="seg.key"
         :cx="size/2" :cy="size/2" :r="radius"
