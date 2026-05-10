@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "lint / type-check 标准"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "异常处理风格"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "日志格式约定"}
+{"file": ".trellis/tasks/05-11-s5s6-predictive-concurrent-rotate/prd.md", "reason": "本任务 DoD / Acceptance Criteria"}

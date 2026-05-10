@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
+
+# Round 12 S6 — 并发 cmd_rotate 引入: 包裹 load → mutate → save 的 RMW 段,
+# 避免两个 worker thread 各读一份后互相覆盖. update_account / delete_account /
+# add_account 调用方都已通过此锁串行,纯只读的 load_accounts/find_account
+# 仍然 lock-free(append-only JSONL state_log 的 atomic write 在状态机内).
+_accounts_io_lock = threading.RLock()
 
 # 账号状态
 STATUS_ACTIVE = "active"  # 在 team 中，额度可用
@@ -119,29 +126,34 @@ def add_account(email, password, cloudmail_account_id=None, seat_type=SEAT_UNKNO
             update_account(email, **patch)
         return
 
-    accounts.append(
-        {
-            "email": email,
-            "password": password,
-            "cloudmail_account_id": cloudmail_account_id,
-            "status": STATUS_PENDING,
-            "seat_type": seat_type or SEAT_UNKNOWN,
-            "workspace_account_id": workspace_account_id,  # 邀请时所在的母号 workspace ID,母号切换检测用
-            # Round 11 V8 — 子号自身的 personal workspace UUID(POST /backend-api/accounts/personal idempotent
-            # getOrCreate),持久化后下次 OAuth 不必再 fetch;失败/旧记录为 None,运行时按需 fetch + 回填。
-            "personal_workspace_id": None,
-            "auth_file": None,  # CPA 认证文件路径
-            "quota_exhausted_at": None,  # 额度用完的时间
-            "quota_resets_at": None,  # 额度恢复时间
-            "last_quota_check_at": None,  # 最近一次 wham/usage 探测时间戳,用于 standby 探测去重
-            # Round 11 V7 — 双失效探测(access_token + refresh_token 同时被 server-side invalidate):
-            # 主循环周期性调 is_token_pair_invalidated,命中后落该字段供事后排查 / UI 展示。
-            "last_token_pair_invalidated_at": None,
-            "created_at": time.time(),
-            "last_active_at": None,
-        }
-    )
-    save_accounts(accounts)
+    with _accounts_io_lock:
+        # 二次 load,避免在拿锁前已被其他 worker 追加
+        accounts = load_accounts()
+        if find_account(accounts, email):
+            return
+        accounts.append(
+            {
+                "email": email,
+                "password": password,
+                "cloudmail_account_id": cloudmail_account_id,
+                "status": STATUS_PENDING,
+                "seat_type": seat_type or SEAT_UNKNOWN,
+                "workspace_account_id": workspace_account_id,  # 邀请时所在的母号 workspace ID,母号切换检测用
+                # Round 11 V8 — 子号自身的 personal workspace UUID(POST /backend-api/accounts/personal idempotent
+                # getOrCreate),持久化后下次 OAuth 不必再 fetch;失败/旧记录为 None,运行时按需 fetch + 回填。
+                "personal_workspace_id": None,
+                "auth_file": None,  # CPA 认证文件路径
+                "quota_exhausted_at": None,  # 额度用完的时间
+                "quota_resets_at": None,  # 额度恢复时间
+                "last_quota_check_at": None,  # 最近一次 wham/usage 探测时间戳,用于 standby 探测去重
+                # Round 11 V7 — 双失效探测(access_token + refresh_token 同时被 server-side invalidate):
+                # 主循环周期性调 is_token_pair_invalidated,命中后落该字段供事后排查 / UI 展示。
+                "last_token_pair_invalidated_at": None,
+                "created_at": time.time(),
+                "last_active_at": None,
+            }
+        )
+        save_accounts(accounts)
     # Round 12 S1 — 新号入池触发 None → PENDING 转移,产生事件 + state_log 行
     try:
         default_machine.transition(
@@ -161,43 +173,49 @@ def update_account(email, **kwargs):
     做合法性校验 + 写 state_log + 发事件。其余字段照常 update。
 
     可选 kwarg ``_reason`` (内部约定): 状态转移日志里的 reason,默认 "update_account"。
+
+    Round 12 S6 — RMW 段(load → mutate → save)由 ``_accounts_io_lock`` 串行,
+    并发 cmd_rotate worker 不会互相覆盖. state_machine.transition 内部已有
+    自己的锁负责 state_log atomic write,本锁仅保证 accounts.json 一致性.
     """
-    accounts = load_accounts()
-    acc = find_account(accounts, email)
-    if not acc:
-        return None
+    with _accounts_io_lock:
+        accounts = load_accounts()
+        acc = find_account(accounts, email)
+        if not acc:
+            return None
 
-    new_status = kwargs.get("status")
-    cur_status = acc.get("status")
-    reason = kwargs.pop("_reason", "update_account")
+        new_status = kwargs.get("status")
+        cur_status = acc.get("status")
+        reason = kwargs.pop("_reason", "update_account")
 
-    if new_status is not None and new_status != cur_status:
-        extra_payload = {k: v for k, v in kwargs.items() if k != "status"}
-        try:
-            default_machine.transition(
-                email=email,
-                to_state=new_status,
-                reason=reason,
-                extra=extra_payload or None,
-                from_state=cur_status,
-            )
-        except IllegalTransitionError:
-            # 合法性校验失败一律抛给调用方,避免静默写坏 accounts.json
-            raise
+        if new_status is not None and new_status != cur_status:
+            extra_payload = {k: v for k, v in kwargs.items() if k != "status"}
+            try:
+                default_machine.transition(
+                    email=email,
+                    to_state=new_status,
+                    reason=reason,
+                    extra=extra_payload or None,
+                    from_state=cur_status,
+                )
+            except IllegalTransitionError:
+                # 合法性校验失败一律抛给调用方,避免静默写坏 accounts.json
+                raise
 
-    acc.update(kwargs)
-    save_accounts(accounts)
-    return acc
+        acc.update(kwargs)
+        save_accounts(accounts)
+        return acc
 
 
 def delete_account(email):
     """从账号池彻底移除（不动认证文件、不动 CloudMail 邮箱）。返回是否真的删除了记录。"""
-    accounts = load_accounts()
-    remaining = [a for a in accounts if a.get("email") != email]
-    if len(remaining) == len(accounts):
-        return False
-    save_accounts(remaining)
-    return True
+    with _accounts_io_lock:
+        accounts = load_accounts()
+        remaining = [a for a in accounts if a.get("email") != email]
+        if len(remaining) == len(accounts):
+            return False
+        save_accounts(remaining)
+        return True
 
 
 def get_active_accounts():

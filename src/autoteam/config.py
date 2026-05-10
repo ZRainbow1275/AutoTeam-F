@@ -65,6 +65,23 @@ AUTO_CHECK_RETRY_ADD_PHONE = _get_bool_env("AUTO_CHECK_RETRY_ADD_PHONE", True)
 AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIES", 3)
 
 
+# Round 12 S5 — 预测式抢先替换配置.
+# PREDICTIVE_ENABLED=false(默认 安全): cmd_rotate 不做预测式 preempt,
+#   保持 round-9~12 旧行为. 用户在前端 settings 主动开启后才参与预测.
+# PREDICTIVE_LEAD_MIN=15(默认): 预测剩余时间 < 15 分钟时触发主动 standby + 替换.
+# PREDICTIVE_HISTORY_FILE: quota 历史 JSONL 路径(供 QuotaPredictor 使用).
+PREDICTIVE_ENABLED = _get_bool_env("PREDICTIVE_ENABLED", False)
+PREDICTIVE_LEAD_MIN = _get_int_env("PREDICTIVE_LEAD_MIN", 15)
+PREDICTIVE_HISTORY_FILE = PROJECT_ROOT / os.environ.get("PREDICTIVE_HISTORY_FILE", "quota_history.jsonl")
+
+# Round 12 S6 — 并发批量替换配置.
+# ROTATE_CONCURRENCY=1(默认 向后兼容): cmd_rotate 串行处理 standby 复用,
+#   行为完全等同改造前. 用户调到 N>=2 后启用 ThreadPoolExecutor 并发,
+#   每席位独立 try/except,失败聚合不阻塞其他席位.
+# 上限保守设 8 — Playwright + ChatGPT API 并发更高反而引入抗扰风险.
+ROTATE_CONCURRENCY = max(1, min(8, _get_int_env("ROTATE_CONCURRENCY", 1)))
+
+
 # 对账策略开关
 # RECONCILE_KICK_ORPHAN=true: 残废成员(workspace 有 + 本地 auth_file 缺失)自动 kick。
 #   关掉后改为打 STATUS_ORPHAN 标记等人工处理,避免"席位卡死"时仍被本地策略自动清理。

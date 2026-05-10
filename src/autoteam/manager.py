@@ -3991,6 +3991,144 @@ def cmd_replace_batch(emails, trigger=""):
     return outcomes
 
 
+# ---------------------------------------------------------------------------
+# Round 12 S6 — standby 复用单元(可被 ThreadPoolExecutor 并发调度).
+#
+# 把原 cmd_rotate 内 for 循环里"额度校验 → reinvite_account"两段抽出来,
+# 让 ROTATE_CONCURRENCY > 1 时多个席位的 mail wait 可并行(主要 IO 瓶颈).
+# chatgpt browser 调用本身仍由调用方决定是否需要序列化(本任务仅在主线程
+# pre-ensure 一次,reinvite_account 内部对 browser 的多次访问由 Playwright
+# session 自身保证并发安全 — 单 BrowserContext + 多 Page 模式).
+# ---------------------------------------------------------------------------
+_STANDBY_REUSE_RESULTS = frozenset({"reused", "skipped_quota", "skipped_auto", "failed"})
+
+
+def _reuse_one_standby(
+    acc: dict,
+    threshold: int,
+    *,
+    chatgpt_provider,
+    mail_provider,
+    reinvite_fn=None,
+    quota_fn=None,
+    now=None,
+) -> dict:
+    """Process one standby account end-to-end.
+
+    Parameters
+    ----------
+    acc:
+        Standby account dict (already filtered for non-main + STATUS_STANDBY).
+    threshold:
+        AUTO_CHECK_THRESHOLD percent — quota below this is treated as "not recovered".
+    chatgpt_provider:
+        Zero-arg callable returning a started :class:`ChatGPTTeamAPI` instance.
+    mail_provider:
+        ``acc -> mail_client`` callable (per-acc routed, S3 ensure_account_mail).
+    reinvite_fn:
+        Override for :func:`reinvite_account` (tests pass a mock).
+    quota_fn:
+        Override for :func:`check_codex_quota` (tests pass a mock).
+    now:
+        Override for ``time.time()`` (tests inject deterministic time).
+
+    Returns
+    -------
+    dict with keys ``email`` / ``result`` (one of ``_STANDBY_REUSE_RESULTS``) /
+    ``error`` (None on success, str on caught exception). Never raises —
+    failures land in ``result="failed"`` so concurrent map can aggregate.
+    """
+    reinvite_callable = reinvite_fn or reinvite_account
+    quota_callable = quota_fn or check_codex_quota
+    current_ts = now if now is not None else time.time()
+    email = (acc or {}).get("email") or "<unknown>"
+
+    try:
+        skip_reason = _auto_reuse_skip_reason(acc)
+        if skip_reason:
+            logger.info("[4/5] 跳过 %s（%s）", email, skip_reason)
+            return {"email": email, "result": "skipped_auto", "error": None}
+
+        auth_file = acc.get("auth_file")
+        quota_ok = False
+        if auth_file and Path(auth_file).exists():
+            try:
+                auth_data = json.loads(read_text(Path(auth_file)))
+                access_token = auth_data.get("access_token")
+                if access_token:
+                    status_str, info = quota_callable(access_token)
+                    if status_str == "exhausted":
+                        quota_info = quota_result_quota_info(info)
+                        if quota_info:
+                            update_account(email, last_quota=quota_info)
+                        logger.info("[4/5] 跳过 %s（额度未恢复）", email)
+                        return {"email": email, "result": "skipped_quota", "error": None}
+                    if status_str == "ok" and isinstance(info, dict):
+                        p_remain = 100 - info.get("primary_pct", 0)
+                        if p_remain < threshold:
+                            logger.info("[4/5] 跳过 %s（剩余 %d%% < %d%%）", email, p_remain, threshold)
+                            return {"email": email, "result": "skipped_quota", "error": None}
+                        quota_ok = True
+                    if status_str == "network_error":
+                        logger.info("[4/5] 跳过 %s（临时网络错误,本轮无法验证额度）", email)
+                        return {"email": email, "result": "skipped_quota", "error": None}
+                    if status_str == "auth_error":
+                        lq = acc.get("last_quota")
+                        if lq:
+                            exhausted_info = _pending_historical_exhausted_info(lq)
+                            if exhausted_info:
+                                window_label = _quota_window_label(exhausted_info.get("window"))
+                                logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
+                                return {"email": email, "result": "skipped_quota", "error": None}
+                            p_resets = lq.get("primary_resets_at", 0)
+                            if p_resets and current_ts >= p_resets:
+                                logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                                quota_ok = True
+                            else:
+                                p_remain = 100 - lq.get("primary_pct", 0)
+                                if p_remain < threshold:
+                                    logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
+                                    return {"email": email, "result": "skipped_quota", "error": None}
+                                quota_ok = True
+            except Exception:
+                pass
+
+        if not quota_ok:
+            lq = acc.get("last_quota")
+            if lq:
+                exhausted_info = _pending_historical_exhausted_info(lq)
+                if exhausted_info:
+                    window_label = _quota_window_label(exhausted_info.get("window"))
+                    logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
+                    return {"email": email, "result": "skipped_quota", "error": None}
+                p_resets = lq.get("primary_resets_at", 0)
+                if p_resets and current_ts >= p_resets:
+                    logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                else:
+                    p_remain = 100 - lq.get("primary_pct", 0)
+                    if p_remain < threshold:
+                        logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
+                        return {"email": email, "result": "skipped_quota", "error": None}
+            else:
+                resets_at = acc.get("quota_resets_at")
+                if resets_at and current_ts < resets_at:
+                    mins = max(0, int((resets_at - current_ts) / 60))
+                    logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
+                    return {"email": email, "result": "skipped_quota", "error": None}
+
+        logger.info("[4/5] 复用: %s", email)
+        chatgpt = chatgpt_provider()
+        mail_client = mail_provider(acc)
+        ok = reinvite_callable(chatgpt, mail_client, acc)
+        if ok:
+            return {"email": email, "result": "reused", "error": None}
+        return {"email": email, "result": "failed", "error": "reinvite_account returned False"}
+    except Exception as exc:
+        # 关键: 并发模式下任何席位异常都不能波及其他席位,聚合层做 failed 计数.
+        logger.exception("[4/5] %s 复用流程抛异常,标记 failed: %s", email, exc)
+        return {"email": email, "result": "failed", "error": str(exc)}
+
+
 def cmd_rotate(target_seats=5):
     """
     智能轮转 - 保持 Team 始终有 target_seats 个可用成员，尽量少创建新账号。
@@ -4092,6 +4230,45 @@ def cmd_rotate(target_seats=5):
     logger.info("[2/5] 检查额度...")
     cmd_check()
 
+    # Round 12 S5 — 预测式抢先替换(可选,默认关).
+    # 仅当 PREDICTIVE_ENABLED=true 时执行: 遍历 ACTIVE 子号,基于 quota_history
+    # 时序拟合预测耗尽时刻,在 PREDICTIVE_LEAD_MIN 分钟内的主动 kick → STANDBY,
+    # 让后续 [3/5] vacancy 兜底 + [5/5] 新号填补流程自动接管.
+    try:
+        from autoteam.config import PREDICTIVE_ENABLED, PREDICTIVE_LEAD_MIN
+    except ImportError:
+        PREDICTIVE_ENABLED = False
+        PREDICTIVE_LEAD_MIN = 15
+    if PREDICTIVE_ENABLED:
+        try:
+            from autoteam.quota_predictor import default_predictor
+
+            preempt_candidates = []
+            for acc in load_accounts():
+                if _is_main_account_email(acc.get("email")) or acc.get("status") != STATUS_ACTIVE:
+                    continue
+                # 先记录当前 last_quota → 累积历史(用 acc.last_quota,避免重复 API 调用)
+                lq = acc.get("last_quota") or {}
+                p_remain = 100 - lq.get("primary_pct", 0) if "primary_pct" in lq else None
+                if p_remain is not None:
+                    default_predictor.record(acc["email"], p_remain, lq.get("primary_resets_at"))
+                if default_predictor.should_preempt(acc["email"], PREDICTIVE_LEAD_MIN):
+                    preempt_candidates.append(acc)
+            if preempt_candidates:
+                logger.info("[2.5/5] 预测式抢先替换 %d 个即将耗尽的账号...", len(preempt_candidates))
+                if not chatgpt or not chatgpt.browser:
+                    ensure_chatgpt()
+                for acc in preempt_candidates:
+                    email = acc["email"]
+                    remove_status = remove_from_team(chatgpt, email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(email, status=STATUS_STANDBY, _reason="predictive_preempt")
+                        logger.info("[2.5/5] %s → standby（预测式抢先,lead=%dmin）", email, PREDICTIVE_LEAD_MIN)
+            else:
+                logger.debug("[2.5/5] 预测式: 无 ACTIVE 子号需要抢先替换")
+        except Exception as exc:
+            logger.warning("[2.5/5] 预测式抢先替换异常(忽略,走旧路径): %s", exc)
+
     try:
         # 移出所有 exhausted 账号（包括之前已标记的）
         all_accounts = load_accounts()
@@ -4184,116 +4361,105 @@ def cmd_rotate(target_seats=5):
         logger.info("[4/5] 填补 %d 个空缺 (当前 %d/%d)...", vacancies, current_count, TARGET)
 
         # 优先复用旧账号（先验证额度是否真的恢复了）
+        # Round 12 S6 — ROTATE_CONCURRENCY > 1 时用 ThreadPoolExecutor 并发,
+        # 否则保持串行(向后兼容老行为). 每席位独立 try/except 在 _reuse_one_standby
+        # 内已收敛 → result ∈ {reused / skipped_quota / skipped_auto / failed}.
         filled = 0
         standby_list = [a for a in get_standby_accounts() if not _is_main_account_email(a.get("email"))]
-        quota_skipped = []
-        auto_reuse_skipped = []
+        quota_skipped: list[dict] = []
+        auto_reuse_skipped: list[dict] = []
 
         from autoteam import cancel_signal
+        from autoteam.config import ROTATE_CONCURRENCY
 
-        for acc in standby_list:
-            if cancel_signal.is_cancelled():
-                logger.warning("[轮转] 收到取消请求,中止 standby 复用阶段")
-                break
-            if filled >= vacancies:
-                break
-            email = acc["email"]
-            auth_file = acc.get("auth_file")
+        # 注: 不截断到 vacancies — 旧行为会迭代全部 standby,遇到不可复用的(skipped_auto/
+        # skipped_quota)就继续看下一个,直到 filled >= vacancies 才 break. 截断会导致
+        # 第一个候选若 skipped 则放弃后续可用候选,破坏 test_cmd_rotate_skips_google_accounts.
+        candidates = list(standby_list)
 
-            skip_reason = _auto_reuse_skip_reason(acc)
-            if skip_reason:
-                logger.info("[4/5] 跳过 %s（%s）", email, skip_reason)
-                auto_reuse_skipped.append(acc)
-                continue
-
-            # 验证额度是否真的恢复了
-            quota_ok = False
-            if auth_file and Path(auth_file).exists():
-                try:
-                    auth_data = json.loads(read_text(Path(auth_file)))
-                    access_token = auth_data.get("access_token")
-                    if access_token:
-                        status_str, info = check_codex_quota(access_token)
-                        if status_str == "exhausted":
-                            quota_info = quota_result_quota_info(info)
-                            if quota_info:
-                                update_account(email, last_quota=quota_info)
-                            logger.info("[4/5] 跳过 %s（额度未恢复）", email)
-                            quota_skipped.append(acc)
-                            continue
-                        if status_str == "ok" and isinstance(info, dict):
-                            p_remain = 100 - info.get("primary_pct", 0)
-                            if p_remain < threshold:
-                                logger.info("[4/5] 跳过 %s（剩余 %d%% < %d%%）", email, p_remain, threshold)
-                                quota_skipped.append(acc)
-                                continue
-                            quota_ok = True
-                        # network_error: 临时网络故障,不能当"额度已恢复"凭证。本轮跳过,
-                        # 不动 acc 状态,等下一轮再试。
-                        if status_str == "network_error":
-                            logger.info("[4/5] 跳过 %s（临时网络错误,本轮无法验证额度）", email)
-                            quota_skipped.append(acc)
-                            continue
-                        # auth_error: token 失效，用 last_quota 判断（但重置时间已过的不算）
-                        if status_str == "auth_error":
-                            lq = acc.get("last_quota")
-                            if lq:
-                                exhausted_info = _pending_historical_exhausted_info(lq)
-                                if exhausted_info:
-                                    window_label = _quota_window_label(exhausted_info.get("window"))
-                                    logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
-                                    quota_skipped.append(acc)
-                                    continue
-                                p_resets = lq.get("primary_resets_at", 0)
-                                if p_resets and time.time() >= p_resets:
-                                    logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
-                                    quota_ok = True
-                                else:
-                                    p_remain = 100 - lq.get("primary_pct", 0)
-                                    if p_remain < threshold:
-                                        logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
-                                        quota_skipped.append(acc)
-                                        continue
-                                    quota_ok = True
-                except Exception:
-                    pass
-
-            # 没有认证文件或无法查询额度时，用 last_quota / quota_resets_at 兜底
-            if not quota_ok:
-                lq = acc.get("last_quota")
-                if lq:
-                    exhausted_info = _pending_historical_exhausted_info(lq)
-                    if exhausted_info:
-                        window_label = _quota_window_label(exhausted_info.get("window"))
-                        logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
-                        quota_skipped.append(acc)
-                        continue
-                    p_resets = lq.get("primary_resets_at", 0)
-                    if p_resets and time.time() >= p_resets:
-                        # 重置时间已过，旧数据作废，视为额度已恢复
-                        logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
-                    else:
-                        p_remain = 100 - lq.get("primary_pct", 0)
-                        if p_remain < threshold:
-                            logger.info("[4/5] 跳过 %s（历史额度 %d%% < %d%%）", email, p_remain, threshold)
-                            quota_skipped.append(acc)
-                            continue
-                else:
-                    # 没有 last_quota，看 quota_resets_at 是否已过
-                    resets_at = acc.get("quota_resets_at")
-                    if resets_at and time.time() < resets_at:
-                        mins = max(0, int((resets_at - time.time()) / 60))
-                        logger.info("[4/5] 跳过 %s（%d 分钟后恢复）", email, mins)
-                        quota_skipped.append(acc)
-                        continue
-
-            logger.info("[4/5] 复用: %s", email)
+        def _chatgpt_provider():
             if not chatgpt or not chatgpt.browser:
                 ensure_chatgpt()
-            if reinvite_account(chatgpt, ensure_account_mail(acc), acc):
-                filled += 1
-                current_count += 1
-            else:
+            return chatgpt
+
+        def _process(acc):
+            return _reuse_one_standby(
+                acc,
+                threshold,
+                chatgpt_provider=_chatgpt_provider,
+                mail_provider=ensure_account_mail,
+            )
+
+        outcomes: list[dict] = []
+        if ROTATE_CONCURRENCY <= 1 or len(candidates) <= 1:
+            # 串行: 完全等同改造前的 for 循环行为(测试可复现)
+            for acc in candidates:
+                if cancel_signal.is_cancelled():
+                    logger.warning("[轮转] 收到取消请求,中止 standby 复用阶段")
+                    break
+                if filled >= vacancies:
+                    break
+                result = _process(acc)
+                outcomes.append(result)
+                if result["result"] == "reused":
+                    filled += 1
+                    current_count += 1
+        else:
+            # 并发: 邮件 wait + OTP 提取是主要 IO 瓶颈,ThreadPoolExecutor 显著缩短
+            # 轮转总时长. 注意 — 并发模式会同时处理至多 vacancies + concurrency 个候选,
+            # 比串行多做一些"探测",换取吞吐. 已 reused 数量达到 vacancies 后停止 submit.
+            import concurrent.futures
+
+            workers = max(1, min(ROTATE_CONCURRENCY, len(candidates), vacancies))
+            logger.info("[4/5] 并发复用 standby(候选 %d,max_workers=%d)...", len(candidates), workers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                future_map: dict = {}
+                # 先 submit 一批(数量 = workers),后续按 future 完成情况补 submit.
+                pending = iter(candidates)
+                for _ in range(workers):
+                    nxt = next(pending, None)
+                    if nxt is None:
+                        break
+                    future_map[pool.submit(_process, nxt)] = nxt
+
+                while future_map and filled < vacancies:
+                    done, _not_done = concurrent.futures.wait(
+                        future_map, return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    for future in done:
+                        future_map.pop(future, None)
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            logger.exception("[4/5] 并发任务异常: %s", exc)
+                            result = {"email": "<unknown>", "result": "failed", "error": str(exc)}
+                        outcomes.append(result)
+                        if result["result"] == "reused":
+                            filled += 1
+                            current_count += 1
+                        # 还能补 submit 且未达 vacancies → 拉新候选
+                        if filled < vacancies and not cancel_signal.is_cancelled():
+                            nxt = next(pending, None)
+                            if nxt is not None:
+                                future_map[pool.submit(_process, nxt)] = nxt
+                # cancel pending(已 submit 但还未完成的会跑完),不再 submit 新 task
+                if cancel_signal.is_cancelled():
+                    logger.warning("[轮转] 收到取消请求,等待 in-flight 完成后中止")
+                # 收尾: 等剩余 in-flight 完成(filled 已够了仍要收 result 避免线程泄漏)
+                for future in concurrent.futures.as_completed(list(future_map)):
+                    try:
+                        outcomes.append(future.result())
+                    except Exception as exc:
+                        outcomes.append({"email": "<unknown>", "result": "failed", "error": str(exc)})
+
+        # 聚合分类: 并发模式 outcomes 顺序与候选不同,但分类计数稳定
+        for outcome in outcomes:
+            email = outcome["email"]
+            acc = next((a for a in candidates if a.get("email") == email), {"email": email})
+            res = outcome["result"]
+            if res == "skipped_auto":
+                auto_reuse_skipped.append(acc)
+            elif res == "skipped_quota" or res == "failed":
                 quota_skipped.append(acc)
 
         if quota_skipped:

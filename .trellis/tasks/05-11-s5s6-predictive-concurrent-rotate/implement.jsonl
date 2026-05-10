@@ -1,0 +1,10 @@
+{"file": ".trellis/tasks/05-11-upstream-align-register-multimail-frontend-refresh/prd.md", "reason": "父 PRD: Q2 创新点 1+2 范围 + S5/S6 调度上下文"}
+{"file": ".trellis/tasks/05-11-s0-upstream-team-rotate-diff/research/upstream-diff.md", "reason": "上游 diff 报告: cmd_rotate 9 函数现状 + 双指标终止条件"}
+{"file": ".trellis/tasks/05-11-s3-cherry-pick-team-rotate/prd.md", "reason": "S3 cherry-pick 后 manager.py 现状 (helper + auth_repair)"}
+{"file": "src/autoteam/account_state.py", "reason": "S1 状态机 default_machine.transition / IllegalTransitionError API"}
+{"file": "src/autoteam/accounts.py", "reason": "update_account 统一路由 + 即将新增 _accounts_io_lock"}
+{"file": "src/autoteam/manager.py", "reason": "cmd_rotate S3 cherry-pick 后实体 (要在其中加预测分支 + 并发)"}
+{"file": "src/autoteam/config.py", "reason": "env 配置范式 (_get_int_env / _get_bool_env)"}
+{"file": ".upstream/manager.py", "reason": "上游 cmd_rotate baseline 行 2178-2520"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "异常处理风格"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "日志格式约定"}
