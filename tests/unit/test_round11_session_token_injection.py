@@ -191,9 +191,18 @@ def test_post_register_oauth_forwards_session_token_to_login(monkeypatch):
     """personal 路径下,_run_post_register_oauth 必须把 chatgpt_session_token 透给 login_codex_via_browser。"""
     captured = {}
 
-    def fake_login(email, password, *, mail_client=None, use_personal=False, chatgpt_session_token=None):
+    def fake_login(
+        email,
+        password,
+        *,
+        mail_client=None,
+        use_personal=False,
+        chatgpt_session_token=None,
+        signup_profile=None,
+    ):
         captured["use_personal"] = use_personal
         captured["chatgpt_session_token"] = chatgpt_session_token
+        captured["signup_profile"] = signup_profile
         # 直接返回失败 bundle 让上层 5 次重试结束(再失败也继续测试关注的 forward 行为)
         return None
 
@@ -262,18 +271,24 @@ def test_create_account_direct_threads_session_token_into_post_oauth():
     assert "chatgpt_session_token=session_token" in src
 
 
-def test_register_direct_once_extracts_session_token_before_close():
-    """注册主路径里必须在 browser.close() 之前调用 extract helper。
+def test_register_direct_once_extracts_session_token_before_cleanup():
+    """注册主路径里必须在统一 Playwright cleanup 之前调用 extract helper。
 
-    `_register_direct_once` 有多处 early-return browser.close(失败路径),
-    成功路径的 close 是最后那个,extract 必须在它之前。
+    `_register_direct_once` 有多处 early-return cleanup(失败路径),
+    成功路径的 cleanup 是最后一个,extract 必须在它之前。
     """
     src = inspect.getsource(manager._register_direct_once)
     extract_idx = src.find("_extract_session_token_from_context")
-    final_close_idx = src.rfind("browser.close()")
+    final_cleanup_idx = src.rfind("cleanup_direct_register()")
     assert extract_idx != -1, "_register_direct_once 必须调 _extract_session_token_from_context"
-    assert final_close_idx != -1
-    assert extract_idx < final_close_idx, "extract 必须在成功路径的最终 browser.close() 之前"
+    assert final_cleanup_idx != -1
+    assert extract_idx < final_cleanup_idx, "extract 必须在成功路径的最终 cleanup 之前"
+
+
+def test_register_direct_once_uses_unified_playwright_cleanup():
+    src = inspect.getsource(manager._register_direct_once)
+    assert "browser.close()" not in src
+    assert "close_playwright_objects(page, context, browser" in src
 
 
 # ---------------------------------------------------------------------------

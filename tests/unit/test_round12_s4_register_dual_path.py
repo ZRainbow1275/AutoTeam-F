@@ -522,7 +522,11 @@ def test_create_account_direct_accepts_optional_mail_client(monkeypatch):
     routed = _FakeProvider("routed")
     monkeypatch.setattr(mgr, "_get_mail_client_for_account", lambda acc: routed)
     # patch 内部 _register_direct_once 让它直接返回 success
-    monkeypatch.setattr(mgr, "_register_direct_once", lambda mc, e, p, cloudmail_account_id=None: (True, None))
+    monkeypatch.setattr(
+        mgr,
+        "_register_direct_once",
+        lambda mc, e, p, cloudmail_account_id=None, signup_profile=None: (True, None),
+    )
     monkeypatch.setattr(mgr, "add_account", lambda *a, **kw: None)
     monkeypatch.setattr(mgr, "_run_post_register_oauth", lambda *a, **kw: kw.get("email") or a[0])
     monkeypatch.setattr(mgr, "get_chatgpt_account_id", lambda: None)

@@ -88,6 +88,30 @@ class _StubAPI:
         self.browser = None
 
 
+class _HttpOnlyStubAPI:
+    """Simulate CHATGPT_API_TRANSPORT=auto succeeding without Playwright."""
+
+    def __init__(self, items, status=200):
+        self.browser = None
+        self.http_transport = object()
+        self._items = items
+        self._status = status
+        self.fetch_calls = []
+        self.stop_calls = 0
+
+    def is_started(self):
+        return True
+
+    def _api_fetch(self, method, path):
+        self.fetch_calls.append((method, path))
+        if path == "/backend-api/accounts":
+            return {"status": self._status, "body": json.dumps({"items": self._items})}
+        return {"status": 404, "body": ""}
+
+    def stop(self):
+        self.stop_calls += 1
+
+
 def test_master_active_no_grace_candidates_skipped(tmp_path):
     """master 健康(active)且无 GRACE 子号 → skipped_reason=master_active_no_grace_candidates。"""
     from autoteam.master_health import _apply_master_degraded_classification
@@ -105,6 +129,33 @@ def test_master_active_no_grace_candidates_skipped(tmp_path):
     assert result["skipped_reason"] == "master_active_no_grace_candidates"
     assert result["marked_grace"] == []
     assert result["marked_standby"] == []
+
+
+def test_helper_reuses_http_transport_session_without_browser(monkeypatch):
+    """auto transport 下 browser=None 但 session 已启动时,retro helper 不应再启动第二个 API。"""
+    from autoteam.master_health import _apply_master_degraded_classification
+
+    def _unexpected_start():
+        raise AssertionError("ChatGPTTeamAPI should not be constructed for a ready HTTP transport session")
+
+    monkeypatch.setattr("autoteam.chatgpt_api.ChatGPTTeamAPI", _unexpected_start)
+    api = _HttpOnlyStubAPI([
+        {
+            "id": "test-master",
+            "structure": "workspace",
+            "current_user_role": "account-owner",
+            "eligible_for_auto_reactivation": False,
+        },
+    ])
+    _seed_accounts([
+        {"email": "a@x.com", "status": "active", "workspace_account_id": "test-master"},
+    ])
+
+    result = _apply_master_degraded_classification(chatgpt_api=api)
+
+    assert result["skipped_reason"] == "master_active_no_grace_candidates"
+    assert api.fetch_calls == [("GET", "/backend-api/accounts")]
+    assert api.stop_calls == 0
 
 
 def test_master_cancelled_grace_period_marks_grace(tmp_path, grace_jwt_future):

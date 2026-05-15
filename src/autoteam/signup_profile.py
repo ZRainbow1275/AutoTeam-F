@@ -27,6 +27,42 @@ MIN_SIGNUP_AGE = 22
 MAX_SIGNUP_AGE = 42
 
 
+class _FrozenBirthday(dict[str, str]):
+    """Read-compatible birthday mapping that rejects in-place mutation."""
+
+    _ERROR = "SignupProfile.birthday is immutable"
+
+    def __init__(self, values=None, **kwargs):
+        super().__init__(values or {}, **kwargs)
+
+    def __hash__(self) -> int:
+        return hash(tuple(sorted(self.items())))
+
+    def __setitem__(self, key, value):
+        raise TypeError(self._ERROR)
+
+    def __delitem__(self, key):
+        raise TypeError(self._ERROR)
+
+    def clear(self):
+        raise TypeError(self._ERROR)
+
+    def pop(self, key, default=None):
+        raise TypeError(self._ERROR)
+
+    def popitem(self):
+        raise TypeError(self._ERROR)
+
+    def setdefault(self, key, default=None):
+        raise TypeError(self._ERROR)
+
+    def update(self, *args, **kwargs):
+        raise TypeError(self._ERROR)
+
+    def __ior__(self, other):
+        raise TypeError(self._ERROR)
+
+
 @dataclass(frozen=True)
 class SignupProfile:
     """Immutable random identity snapshot for a single account registration.
@@ -40,6 +76,12 @@ class SignupProfile:
     full_name: str
     birthday: dict[str, str] = field(default_factory=dict)
     age: str = ""
+
+    def __post_init__(self) -> None:
+        frozen_birthday = _FrozenBirthday(
+            {str(key): str(value) for key, value in (self.birthday or {}).items()}
+        )
+        object.__setattr__(self, "birthday", frozen_birthday)
 
     # ------------------------------------------------------------ properties
     @property
@@ -63,15 +105,20 @@ class SignupProfile:
     def positional_birthday_orders(self) -> list[list[str]]:
         """Yield candidate orderings for the React-Aria DateField spinbuttons.
 
-        The OpenAI about-you DateField renders three ``role="spinbutton"`` cells
-        in order ``year / month / day`` for the en-US locale. We return the
-        canonical Y/M/D ordering as the only candidate — the surrounding code
-        path tries the locator and falls back to a flat ``input[name='age']``
-        if the spinbuttons are absent, so a single best-guess ordering is
-        sufficient.
+        Prefer the canonical ``year / month / day`` ordering, but keep the
+        month/day/year and day/month/year fallbacks from the autoteam-1
+        template for pages where React-Aria exposes the same spinbuttons in a
+        locale-dependent visual order.
         """
         bday = self.birthday or {}
-        return [[bday.get("year", ""), bday.get("month", ""), bday.get("day", "")]]
+        year = bday.get("year", "")
+        month = bday.get("month", "")
+        day = bday.get("day", "")
+        return [
+            [year, month, day],
+            [month, day, year],
+            [day, month, year],
+        ]
 
 
 def calculate_age(birth_date: date, today: date) -> int:
@@ -123,7 +170,7 @@ def generate_signup_profile(
         raise ValueError(f"generated invalid signup age {age} for birth date {birth_date.isoformat()}")
 
     return SignupProfile(
-        full_name=random_full_name(),
+        full_name=random_full_name(rng=rng),
         birthday=_birthday_dict(birth_date),
         age=str(age),
     )

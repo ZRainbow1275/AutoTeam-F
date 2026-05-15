@@ -1,8 +1,9 @@
+import inspect
 import threading
 
 import pytest
 
-from autoteam import api, chatgpt_api
+from autoteam import api, chatgpt_api, codex_auth, invite, manager
 
 
 def test_launch_browser_stops_playwright_when_browser_launch_fails(tmp_path, monkeypatch):
@@ -69,6 +70,234 @@ def test_chatgpt_stop_closes_page_context_browser_and_playwright():
     assert client.context is None
     assert client.browser is None
     assert client.playwright is None
+
+
+def test_start_with_session_stops_partially_started_browser_session():
+    calls = []
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakePlaywright:
+        def stop(self):
+            calls.append("stop:playwright")
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+
+    def fail_after_browser_started(_session_token):
+        client.page = FakeClosable("page")
+        client.context = FakeClosable("context")
+        client.browser = FakeClosable("browser")
+        client.playwright = FakePlaywright()
+        raise RuntimeError("token fetch failed")
+
+    client._start_browser_session = fail_after_browser_started
+
+    with pytest.raises(RuntimeError, match="token fetch failed"):
+        client.start_with_session("session-token", "account-id", require_browser=True)
+
+    assert calls == ["close:page", "close:context", "close:browser", "stop:playwright"]
+    assert client.page is None
+    assert client.context is None
+    assert client.browser is None
+    assert client.playwright is None
+
+
+def test_api_fetch_browser_fallback_cleans_partial_browser_session():
+    calls = []
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakePlaywright:
+        def stop(self):
+            calls.append("stop:playwright")
+
+    client = chatgpt_api.ChatGPTTeamAPI()
+    client.session_token = "session-token"
+    client.http_transport = FakeClosable("transport")
+
+    def fail_after_browser_started(_session_token):
+        client.page = FakeClosable("page")
+        client.context = FakeClosable("context")
+        client.browser = FakeClosable("browser")
+        client.playwright = FakePlaywright()
+        raise RuntimeError("cloudflare fallback failed")
+
+    client._start_browser_session = fail_after_browser_started
+
+    with pytest.raises(RuntimeError, match="cloudflare fallback failed"):
+        client._ensure_browser_session()
+
+    assert calls == [
+        "close:transport",
+        "close:page",
+        "close:context",
+        "close:browser",
+        "stop:playwright",
+    ]
+    assert client.http_transport is None
+    assert client.page is None
+    assert client.context is None
+    assert client.browser is None
+    assert client.playwright is None
+
+
+def test_complete_registration_closes_page_context_browser_when_invite_registration_raises(monkeypatch):
+    calls = []
+
+    class FakeClosable:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            calls.append(f"close:{self.name}")
+
+    class FakeContext(FakeClosable):
+        def __init__(self):
+            super().__init__("context")
+
+        def new_page(self):
+            return FakeClosable("page")
+
+    class FakeBrowser(FakeClosable):
+        def __init__(self):
+            super().__init__("browser")
+
+        def new_context(self, **_kwargs):
+            return FakeContext()
+
+    class FakeChromium:
+        def launch(self, **_kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeSyncPlaywright:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fail_register(*_args, **_kwargs):
+        raise RuntimeError("registration crashed")
+
+    monkeypatch.setattr(manager, "sync_playwright", lambda: FakeSyncPlaywright())
+    monkeypatch.setattr(invite, "register_with_invite", fail_register)
+
+    with pytest.raises(RuntimeError, match="registration crashed"):
+        manager._complete_registration(
+            "child@example.com",
+            "password",
+            "https://invite.example",
+            mail_client=object(),
+        )
+
+    assert calls == ["close:page", "close:context", "close:browser"]
+
+
+def test_register_direct_once_cleans_browser_context_on_unhandled_page_error(monkeypatch):
+    calls = []
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, *_args, **_kwargs):
+            raise RuntimeError("navigation exploded")
+
+        def close(self):
+            calls.append("close:page")
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+        def close(self):
+            calls.append("close:context")
+
+    class FakeBrowser:
+        def new_context(self, **_kwargs):
+            return FakeContext()
+
+        def close(self):
+            calls.append("close:browser")
+
+    class FakeChromium:
+        def launch(self, **_kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeSyncPlaywright:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(manager, "sync_playwright", lambda: FakeSyncPlaywright())
+
+    with pytest.raises(RuntimeError, match="navigation exploded"):
+        manager._register_direct_once(object(), "child@example.com", "password")
+
+    assert calls == ["close:page", "close:context", "close:browser"]
+
+
+def test_registration_and_oauth_paths_use_unified_playwright_cleanup():
+    assert "browser.close()" not in inspect.getsource(manager._complete_registration)
+    assert "browser.close()" not in inspect.getsource(manager._register_direct_once)
+    assert "browser.close()" not in inspect.getsource(invite.run)
+    assert "browser.close()" not in inspect.getsource(codex_auth.login_codex_via_browser)
+    assert "close_playwright_objects" in inspect.getsource(manager._register_direct_once)
+    assert "close_playwright_objects" in inspect.getsource(codex_auth.login_codex_via_browser)
+
+
+def test_session_codex_auth_flow_stops_chatgpt_when_page_start_fails(monkeypatch):
+    instances = []
+
+    class FakeContext:
+        def new_page(self):
+            raise RuntimeError("new page failed")
+
+    class FakeChatGPTTeamAPI:
+        def __init__(self):
+            self.context = FakeContext()
+            self.stopped = False
+            instances.append(self)
+
+        def start_with_session(self, *_args, **_kwargs):
+            return None
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr("autoteam.chatgpt_api.ChatGPTTeamAPI", FakeChatGPTTeamAPI)
+
+    flow = codex_auth.SessionCodexAuthFlow(
+        email="admin@example.com",
+        session_token="session-token",
+        account_id="account-id",
+        workspace_name="workspace",
+    )
+
+    with pytest.raises(RuntimeError, match="new page failed"):
+        flow.start()
+
+    assert len(instances) == 1
+    assert instances[0].stopped is True
+    assert flow.chatgpt is None
+    assert flow.page is None
 
 
 def test_post_admin_login_start_stops_api_when_begin_login_fails(monkeypatch):

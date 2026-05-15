@@ -61,6 +61,27 @@ _RAW_ITEM_PERSIST_KEYS = (
 _LOCK = threading.Lock()
 
 
+def _chatgpt_api_ready(chatgpt_api) -> bool:
+    """Return whether a ChatGPTTeamAPI-like object has a usable API session.
+
+    `CHATGPT_API_TRANSPORT=auto` can start a backend API session through HTTP
+    transport only. Retroactive master-health checks only need `_api_fetch`, so
+    a browser object is not required here.
+    """
+    if chatgpt_api is None:
+        return False
+    is_started = getattr(chatgpt_api, "is_started", None)
+    if callable(is_started):
+        try:
+            return bool(is_started())
+        except Exception:
+            pass
+    return bool(
+        getattr(chatgpt_api, "browser", None)
+        or getattr(chatgpt_api, "http_transport", None)
+    )
+
+
 def _ensure_dir():
     try:
         ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -719,7 +740,7 @@ def _apply_master_degraded_classification(
     api_owns = False
     api = chatgpt_api
     try:
-        if api is None or not getattr(api, "browser", None):
+        if not _chatgpt_api_ready(api):
             try:
                 from autoteam.chatgpt_api import ChatGPTTeamAPI
 

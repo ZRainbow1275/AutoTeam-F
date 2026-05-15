@@ -62,6 +62,52 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
     assert final_kwargs["auth_file"] == "/tmp/tmp-user@example.com.json"
 
 
+def test_reinvite_account_stops_http_transport_session_before_oauth(monkeypatch):
+    """HTTP-only Team API sessions must be stopped before browser OAuth starts."""
+    updates = []
+
+    class FakeHttpOnlyApi:
+        browser = None
+
+        def __init__(self):
+            self.stopped = False
+
+        def is_started(self):
+            return True
+
+        def stop(self):
+            self.stopped = True
+
+    api = FakeHttpOnlyApi()
+
+    monkeypatch.setattr(
+        manager,
+        "login_codex_via_browser",
+        lambda email, password, mail_client=None: {
+            "email": email,
+            "access_token": "token-1",
+            "refresh_token": "refresh-1",
+            "plan_type": "team",
+            "plan_type_raw": "team",
+        },
+    )
+    monkeypatch.setattr(manager, "save_auth_file", lambda bundle: f"/tmp/{bundle['email']}.json")
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+    monkeypatch.setattr(manager, "check_codex_quota", lambda token: ("ok", {"primary_pct": 0}))
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "wsk-1")
+    monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
+
+    result = manager.reinvite_account(
+        api,
+        None,
+        {"email": "tmp-user@example.com", "password": "secret"},
+    )
+
+    assert result is True
+    assert api.stopped is True
+    assert any(kwargs.get("status") == accounts.STATUS_ACTIVE for _email, kwargs in updates)
+
+
 def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(monkeypatch):
     """SPEC-2 §3.3 plan_drift — 白名单内但 plan!=team → STATUS_AUTH_INVALID(不是 STANDBY)。
 

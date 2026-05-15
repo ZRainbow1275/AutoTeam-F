@@ -91,12 +91,44 @@ class TestSignupProfile:
             age="25",
         )
         orders = profile.positional_birthday_orders()
-        assert orders == [["2000", "01", "02"]]
+        assert orders == [
+            ["2000", "01", "02"],
+            ["01", "02", "2000"],
+            ["02", "01", "2000"],
+        ]
+
+    def test_generate_signup_profile_respects_injected_rng(self):
+        today = date(2026, 5, 15)
+
+        first = generate_signup_profile(today=today, rng=random.Random(1234))
+        second = generate_signup_profile(today=today, rng=random.Random(1234))
+
+        assert first == second
 
     def test_signup_profile_is_immutable(self):
         profile = generate_signup_profile()
         with pytest.raises(AttributeError):
             profile.full_name = "Mutated"  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            profile.birthday["year"] = "1900"
+        with pytest.raises(TypeError):
+            profile.birthday.update({"month": "01"})
+
+    def test_signup_profile_copies_birthday_input(self):
+        birthday = {"year": "1990", "month": "06", "day": "15"}
+        profile = SignupProfile(full_name="Test User", birthday=birthday, age="35")
+
+        birthday["year"] = "1900"
+
+        assert profile.birthday["year"] == "1990"
+
+    def test_signup_profile_is_hashable_like_mother_template(self):
+        today = date(2026, 5, 15)
+        rng = random.Random(99)
+
+        seen = {generate_signup_profile(today=today, rng=rng) for _ in range(12)}
+
+        assert len(seen) > 1
 
 
 # ===========================================================================
@@ -205,8 +237,16 @@ class TestChatgptSessionReady:
     def test_no_browser_returns_false(self):
         api = MagicMock()
         api.browser = None
+        api.http_transport = None
         del api.is_started
         assert manager_mod._chatgpt_session_ready(api) is False
+
+    def test_http_transport_fallback_returns_true(self):
+        api = MagicMock()
+        api.browser = None
+        api.http_transport = MagicMock()
+        del api.is_started
+        assert manager_mod._chatgpt_session_ready(api) is True
 
     def test_is_started_takes_precedence(self):
         api = MagicMock()

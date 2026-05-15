@@ -262,17 +262,19 @@ _PASSWORD_WORDS = [
 ]
 
 
-def random_first_name():
-    return random.choice(_FIRST_NAMES)
+def random_first_name(rng=None):
+    rng = rng or random
+    return rng.choice(_FIRST_NAMES)
 
 
-def random_last_name():
-    return random.choice(_LAST_NAMES)
+def random_last_name(rng=None):
+    rng = rng or random
+    return rng.choice(_LAST_NAMES)
 
 
-def random_full_name():
+def random_full_name(rng=None):
     """返回 'Emma Wilson' 这种标准两词姓名。"""
-    return f"{random_first_name()} {random_last_name()}"
+    return f"{random_first_name(rng)} {random_last_name(rng)}"
 
 
 def random_birthday(min_age=22, max_age=42):

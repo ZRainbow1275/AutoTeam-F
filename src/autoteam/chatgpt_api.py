@@ -1223,6 +1223,20 @@ class ChatGPTTeamAPI:
             return True
         return False
 
+    def _close_http_transport(self, *, reason: str = "") -> None:
+        transport = getattr(self, "http_transport", None)
+        try:
+            if transport is not None:
+                transport.close()
+        except Exception as exc:
+            if reason:
+                logger.debug("[ChatGPT] close curl_cffi transport failed (%s): %s", reason, exc)
+            else:
+                logger.debug("[ChatGPT] close curl_cffi transport failed: %s", exc)
+        finally:
+            self.http_transport = None
+            self.transport_name = None
+
     @staticmethod
     def _transport_body_looks_like_html(body):
         text = str(body or "").lower()
@@ -1266,8 +1280,13 @@ class ChatGPTTeamAPI:
         if self.browser:
             return
         if not self.session_token:
+            self.stop()
             raise RuntimeError("缺少 session_token，无法回退到 Playwright transport")
-        self._start_browser_session(self.session_token)
+        try:
+            self._start_browser_session(self.session_token)
+        except Exception:
+            self.stop()
+            raise
 
     def _fetch_access_token_via_transport(self, allow_bearer_file=True):
         if not getattr(self, "http_transport", None):
@@ -1346,18 +1365,23 @@ class ChatGPTTeamAPI:
         if not self.account_id:
             raise RuntimeError("缺少 workspace/account ID")
 
-        if not require_browser and self._start_transport_session(session_token):
-            token_source = self._fetch_access_token_via_transport()
-            if token_source:
-                self._auto_detect_workspace_via_transport()
-                return
-            logger.warning("[ChatGPT] curl_cffi 未能直接获取 access token，回退 Playwright transport")
-            if getattr(self, "http_transport", None):
-                self.http_transport.close()
-            self.http_transport = None
-            self.transport_name = None
+        try:
+            if not require_browser and self._start_transport_session(session_token):
+                token_source = self._fetch_access_token_via_transport()
+                if token_source:
+                    self._auto_detect_workspace_via_transport()
+                    return
+                logger.warning("[ChatGPT] curl_cffi 未能直接获取 access token，回退 Playwright transport")
+                self._close_http_transport(reason="before browser fallback")
+        except Exception:
+            self.stop()
+            raise
 
-        self._start_browser_session(session_token)
+        try:
+            self._start_browser_session(session_token)
+        except Exception:
+            self.stop()
+            raise
 
     def _auto_detect_workspace(self):
         if self.workspace_name:
@@ -1473,12 +1497,18 @@ class ChatGPTTeamAPI:
         if not getattr(self, "http_transport", None):
             raise RuntimeError("curl_cffi transport 未初始化")
 
-        response = self.http_transport.request(
-            method,
-            path,
-            headers=self._build_api_headers(),
-            body=body,
-        )
+        try:
+            response = self.http_transport.request(
+                method,
+                path,
+                headers=self._build_api_headers(),
+                body=body,
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] curl_cffi request failed，回退 Playwright transport: %s", exc)
+            self._close_http_transport(reason="request failed")
+            self._ensure_browser_session()
+            return self._browser_api_fetch(method, path, body)
         status = int(response.get("status") or 0)
         body_text = str(response.get("body") or "")
         lower_body = body_text.lower()
@@ -1486,18 +1516,25 @@ class ChatGPTTeamAPI:
         if status == 401 and path != "/api/auth/session":
             refreshed = self._fetch_access_token_via_transport(allow_bearer_file=False)
             if refreshed:
-                response = self.http_transport.request(
-                    method,
-                    path,
-                    headers=self._build_api_headers(),
-                    body=body,
-                )
+                try:
+                    response = self.http_transport.request(
+                        method,
+                        path,
+                        headers=self._build_api_headers(),
+                        body=body,
+                    )
+                except Exception as exc:
+                    logger.warning("[ChatGPT] curl_cffi retry failed，回退 Playwright transport: %s", exc)
+                    self._close_http_transport(reason="retry failed")
+                    self._ensure_browser_session()
+                    return self._browser_api_fetch(method, path, body)
                 status = int(response.get("status") or 0)
                 body_text = str(response.get("body") or "")
                 lower_body = body_text.lower()
 
         if self._transport_response_requires_browser_fallback(response):
             logger.warning("[ChatGPT] curl_cffi 返回异常响应，回退 Playwright transport")
+            self._close_http_transport(reason="fallback response")
             self._ensure_browser_session()
             return self._browser_api_fetch(method, path, body)
 
@@ -1505,6 +1542,7 @@ class ChatGPTTeamAPI:
             "access token is missing" in lower_body or self._transport_body_looks_like_html(body_text)
         ):
             logger.warning("[ChatGPT] curl_cffi 鉴权异常，回退 Playwright transport")
+            self._close_http_transport(reason="auth fallback")
             self._ensure_browser_session()
             return self._browser_api_fetch(method, path, body)
 
@@ -1776,11 +1814,7 @@ class ChatGPTTeamAPI:
             return result["body"]
 
     def stop(self):
-        try:
-            if getattr(self, "http_transport", None):
-                self.http_transport.close()
-        except Exception:
-            pass
+        self._close_http_transport(reason="stop")
         close_playwright_objects(
             page=self.page,
             context=self.context,

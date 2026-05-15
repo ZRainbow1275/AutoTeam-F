@@ -33,7 +33,9 @@ from autoteam.accounts import (
 from autoteam.chatgpt_api import ChatGPTTeamAPI
 from autoteam.cloudmail import CloudMailClient
 from autoteam.config import get_playwright_launch_options
-from autoteam.identity import random_age, random_birthday, random_full_name, random_password
+from autoteam.identity import random_password
+from autoteam.playwright_lifecycle import close_playwright_objects
+from autoteam.signup_profile import generate_signup_profile
 
 
 def _seat_label_from_raw(raw_seat: str) -> str:
@@ -372,17 +374,12 @@ def register_with_invite(page, invite_link, email, mail_client, password=None, s
     logger.info("[注册] 当前 URL: %s", page.url)
     assert_not_blocked(page, "code_submit")
 
-    # 随机身份（每个账号不同，降低批量注册特征）
-    # signup_profile 优先：调用方传入时直接复用其字段，确保注册 about-you
-    # 阶段与 Codex OAuth about-you 阶段拿到的姓名/生日/年龄完全一致。
-    if signup_profile is not None:
-        bday = dict(signup_profile.birthday or {})
-        full_name = signup_profile.full_name
-        age_value = signup_profile.age_text or signup_profile.age
-    else:
-        bday = random_birthday()
-        full_name = random_full_name()
-        age_value = random_age()
+    # 随机身份（每个账号不同，降低批量注册特征）。始终归一成
+    # SignupProfile，确保注册 about-you 与 Codex OAuth about-you 复用同一份快照。
+    signup_profile = signup_profile or generate_signup_profile()
+    bday = dict(signup_profile.birthday or {})
+    full_name = signup_profile.full_name
+    age_value = signup_profile.age_text or signup_profile.age
     logger.info(
         "[注册] 本次身份: name=%s birthday=%s/%s/%s age=%s",
         full_name,
@@ -578,17 +575,22 @@ def run():
         logger.info("[邀请] 开始注册 ChatGPT 账号")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(**get_playwright_launch_options())
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            )
-            page = context.new_page()
+            browser = None
+            context = None
+            page = None
+            try:
+                browser = p.chromium.launch(**get_playwright_launch_options())
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                )
+                page = context.new_page()
 
-            result, pwd = register_with_invite(page, invite_link, email, mail_client)
+                result, pwd = register_with_invite(page, invite_link, email, mail_client)
 
-            screenshot(page, "final.png")
-            browser.close()
+                screenshot(page, "final.png")
+            finally:
+                close_playwright_objects(page, context, browser, logger=logger, label="invite-registration")
 
         if result:
             logger.info("[邀请] %s 已注册并加入 ChatGPT Team", email)

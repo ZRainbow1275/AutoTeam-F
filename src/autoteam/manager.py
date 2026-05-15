@@ -66,9 +66,11 @@ from autoteam.codex_auth import (
 )
 from autoteam.config import get_playwright_launch_options
 from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
-from autoteam.identity import random_age, random_birthday, random_full_name, random_password
+from autoteam.identity import random_birthday, random_password
 from autoteam.invite import RegisterBlocked  # SPEC-2 shared/add-phone-detection §5 — 5 处 OAuth 调用方 catch
+from autoteam.playwright_lifecycle import close_playwright_objects
 from autoteam.register_failures import MASTER_SUBSCRIPTION_DEGRADED, record_failure
+from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.textio import read_text, write_text
 
 logger = logging.getLogger(__name__)
@@ -167,7 +169,19 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
             return bool(is_started())
         except Exception:
             pass
-    return bool(getattr(chatgpt_api, "browser", None))
+    def _declared_attr(name: str):
+        # Avoid MagicMock/duck objects becoming "ready" via dynamic __getattr__.
+        try:
+            attrs = vars(chatgpt_api)
+        except TypeError:
+            attrs = {}
+        if name in attrs:
+            return attrs[name]
+        if hasattr(type(chatgpt_api), name):
+            return getattr(chatgpt_api, name, None)
+        return None
+
+    return bool(_declared_attr("browser") or _declared_attr("http_transport"))
 
 
 def _has_auth_file(acc: dict | None) -> bool:
@@ -2096,6 +2110,7 @@ def _run_post_register_oauth(
     leave_workspace=False,
     out_outcome=None,
     chatgpt_session_token=None,
+    signup_profile: SignupProfile | None = None,
 ):
     """
     注册（加入 Team）成功后统一的收尾流程：
@@ -2106,6 +2121,7 @@ def _run_post_register_oauth(
     out_outcome: 可选 dict，函数内会写入 `{status, email, reason, ...}` 供上游统计/汇总。
     chatgpt_session_token: 注册阶段从 chatgpt.com 抽出的 __Secure-next-auth.session-token,
                            personal OAuth 时注入到 auth.openai.com 跳过 /log-in 卡死。
+    signup_profile: 注册阶段填写过的身份快照；OAuth about-you 必须复用同一份快照。
     """
 
     def _record_outcome(status, **extra):
@@ -2220,6 +2236,7 @@ def _run_post_register_oauth(
                     mail_client=mail_client,
                     use_personal=True,
                     chatgpt_session_token=chatgpt_session_token,
+                    signup_profile=signup_profile,
                 )
             except RegisterBlocked as blocked:
                 # add-phone / duplicate 等异常是 terminal,不重试
@@ -2413,7 +2430,7 @@ def _run_post_register_oauth(
 
     # 原有 Team 流程 — SPEC-2 §3.1.2 改造:catch RegisterBlocked + plan_supported 检查 + quota probe
     try:
-        bundle = login_codex_via_browser(email, password, mail_client=mail_client)
+        bundle = login_codex_via_browser(email, password, mail_client=mail_client, signup_profile=signup_profile)
     except RegisterBlocked as blocked:
         if blocked.is_phone:
             logger.error(
@@ -2644,21 +2661,26 @@ def _complete_registration(email, password, invite_link, mail_client=None, *, le
 
     logger.info("[注册] 开始注册 %s...", email)
     with sync_playwright() as p:
-        browser = p.chromium.launch(**get_playwright_launch_options())
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
-        result, password = register_with_invite(
-            page,
-            invite_link,
-            email,
-            mail_client,
-            password=password,
-            signup_profile=signup_profile,
-        )
-        browser.close()
+        browser = None
+        context = None
+        page = None
+        try:
+            browser = p.chromium.launch(**get_playwright_launch_options())
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+            result, password = register_with_invite(
+                page,
+                invite_link,
+                email,
+                mail_client,
+                password=password,
+                signup_profile=signup_profile,
+            )
+        finally:
+            close_playwright_objects(page, context, browser, logger=logger, label="complete-registration")
 
     if not result:
         logger.error("[注册] 注册 %s 失败", email)
@@ -2669,7 +2691,12 @@ def _complete_registration(email, password, invite_link, mail_client=None, *, le
         return None
 
     return _run_post_register_oauth(
-        email, password, mail_client, leave_workspace=leave_workspace, out_outcome=out_outcome
+        email,
+        password,
+        mail_client,
+        leave_workspace=leave_workspace,
+        out_outcome=out_outcome,
+        signup_profile=signup_profile,
     )
 
 
@@ -2999,22 +3026,17 @@ def _wait_for_direct_step_change(page, current_step, timeout=15):
     return _detect_direct_register_step(page)
 
 
-def _complete_direct_about_you(page):
+def _complete_direct_about_you(page, signup_profile: SignupProfile | None = None):
     """尽量完成 about-you 页面，兼容不同生日字段顺序。"""
     if "about-you" not in (page.url or "").lower():
         return True
 
     # 本账号整个注册周期内固定一份身份数据，避免多次点提交导致生日漂移
-    identity_bday = random_birthday()
-    identity_name = random_full_name()
-    identity_age = random_age()
-
-    # 字段顺序只尝试 3 种排列，但全部使用相同的随机生日值
-    birthday_orders = [
-        (identity_bday["year"], identity_bday["month"], identity_bday["day"]),
-        (identity_bday["month"], identity_bday["day"], identity_bday["year"]),
-        (identity_bday["day"], identity_bday["month"], identity_bday["year"]),
-    ]
+    signup_profile = signup_profile or generate_signup_profile()
+    identity_bday = dict(signup_profile.birthday or {})
+    identity_name = signup_profile.full_name
+    identity_age = signup_profile.age_text
+    birthday_orders = signup_profile.positional_birthday_orders()
 
     for attempt, values in enumerate(birthday_orders, 1):
         if "about-you" not in (page.url or "").lower():
@@ -3117,7 +3139,7 @@ def _complete_direct_about_you(page):
     return False
 
 
-def _register_direct_once(mail_client, email, password, cloudmail_account_id=None):
+def _register_direct_once(mail_client, email, password, cloudmail_account_id=None, signup_profile=None):
     """执行一次直接注册，返回是否完成注册并进入 Team。
 
     在邮箱/密码/验证码/about-you 四个提交节点调用 assert_not_blocked，
@@ -3129,299 +3151,314 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
     signup_url = "https://chatgpt.com/auth/login"
 
     with sync_playwright() as p:
-        launch_kwargs = get_playwright_launch_options()
-        if sys.platform.startswith("win"):
-            launch_kwargs["slow_mo"] = 100
-        browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
+        browser = None
+        context = None
+        page = None
+        cleanup_done = False
 
-        page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(5)
+        def cleanup_direct_register() -> None:
+            nonlocal cleanup_done
+            if cleanup_done:
+                return
+            cleanup_done = True
+            close_playwright_objects(page, context, browser, logger=logger, label="direct-register")
 
-        for i in range(12):
-            html = page.content()[:2000].lower()
-            if "verify you are human" not in html and "challenge" not in page.url:
-                break
-            logger.info("[直接注册] 等待 Cloudflare... (%ds)", i * 5)
+        try:
+            launch_kwargs = get_playwright_launch_options()
+            if sys.platform.startswith("win"):
+                launch_kwargs["slow_mo"] = 100
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+
+            page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(5)
 
-        _safe_invite_screenshot(page, "direct_01_login_page.png")
-
-        # OpenAI 首页有多种 A/B 测试变体，需要逐步找到邮箱输入框
-        try:
-            email_visible = page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=3000)
-            if not email_visible:
-                # 尝试按优先级点击各种按钮来展开/跳转到邮箱输入
-                for sel, desc in [
-                    ('button:has-text("More options")', "More options"),
-                    ('button:has-text("更多选项")', "更多选项"),
-                    ('a:has-text("Sign up for free")', "Sign up for free"),
-                    ('button:has-text("Sign up for free")', "Sign up for free"),
-                    ('a:has-text("Sign up")', "Sign up"),
-                    ('button:has-text("Sign up")', "Sign up"),
-                    ('a:has-text("注册")', "注册"),
-                    ('button:has-text("注册")', "注册"),
-                    ('a:has-text("Log in")', "Log in"),
-                    ('button:has-text("Log in")', "Log in"),
-                ]:
-                    try:
-                        btn = page.locator(sel).first
-                        if btn.is_visible(timeout=1000):
-                            logger.info("[直接注册] 点击: %s", desc)
-                            btn.click()
-                            time.sleep(2)
-                            # 检查邮箱输入框是否出现了
-                            step = _wait_for_direct_register_step(
-                                page,
-                                {"email", "password", "code", "profile", "completed", "google"},
-                                timeout=10,
-                            )
-                            if step != "unknown":
-                                break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-        _safe_invite_screenshot(page, "direct_02_signup.png")
-
-        logger.info("[直接注册] 输入邮箱: %s", email)
-        email_step = _wait_for_direct_register_step(
-            page,
-            {"email", "password", "code", "profile", "completed", "google"},
-            timeout=15,
-        )
-        logger.info("[直接注册] 邮箱步骤初始状态: %s | URL: %s", email_step, page.url)
-
-        if email_step == "google":
-            logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
-            browser.close()
-            return False, None
-        if email_step == "unknown":
-            logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
-            return False, None
-
-        try:
-            for attempt in range(3):
-                step = _detect_direct_register_step(page)
-                if step != "email":
+            for i in range(12):
+                html = page.content()[:2000].lower()
+                if "verify you are human" not in html and "challenge" not in page.url:
                     break
+                logger.info("[直接注册] 等待 Cloudflare... (%ds)", i * 5)
+                time.sleep(5)
 
-                email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=1500)
-                if not email_input:
-                    logger.info("[直接注册] 邮箱输入框不可编辑，等待页面继续跳转...")
-                    next_step = _wait_for_direct_step_change(page, "email", timeout=10)
-                    if next_step != "email":
-                        break
-                    logger.warning("[直接注册] 邮箱输入框仍不可编辑，继续重试 | URL: %s", page.url)
-                    continue
+            _safe_invite_screenshot(page, "direct_01_login_page.png")
 
-                email_input.fill(email)
-                time.sleep(0.5)
-                logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
-                _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
-                _click_primary_auth_button(page, email_input, ["Continue", "继续"])
+            # OpenAI 首页有多种 A/B 测试变体，需要逐步找到邮箱输入框
+            try:
+                email_visible = page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=3000)
+                if not email_visible:
+                    # 尝试按优先级点击各种按钮来展开/跳转到邮箱输入
+                    for sel, desc in [
+                        ('button:has-text("More options")', "More options"),
+                        ('button:has-text("更多选项")', "更多选项"),
+                        ('a:has-text("Sign up for free")', "Sign up for free"),
+                        ('button:has-text("Sign up for free")', "Sign up for free"),
+                        ('a:has-text("Sign up")', "Sign up"),
+                        ('button:has-text("Sign up")', "Sign up"),
+                        ('a:has-text("注册")', "注册"),
+                        ('button:has-text("注册")', "注册"),
+                        ('a:has-text("Log in")', "Log in"),
+                        ('button:has-text("Log in")', "Log in"),
+                    ]:
+                        try:
+                            btn = page.locator(sel).first
+                            if btn.is_visible(timeout=1000):
+                                logger.info("[直接注册] 点击: %s", desc)
+                                btn.click()
+                                time.sleep(2)
+                                # 检查邮箱输入框是否出现了
+                                step = _wait_for_direct_register_step(
+                                    page,
+                                    {"email", "password", "code", "profile", "completed", "google"},
+                                    timeout=10,
+                                )
+                                if step != "unknown":
+                                    break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
 
-                next_step = _wait_for_direct_step_change(page, "email", timeout=15)
-                logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
-                _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
+            _safe_invite_screenshot(page, "direct_02_signup.png")
 
-                if next_step == "google":
-                    _safe_invite_screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
-                    logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                    page.go_back(wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(2)
-                    continue
-                if next_step != "email":
-                    break
+            logger.info("[直接注册] 输入邮箱: %s", email)
+            email_step = _wait_for_direct_register_step(
+                page,
+                {"email", "password", "code", "profile", "completed", "google"},
+                timeout=15,
+            )
+            logger.info("[直接注册] 邮箱步骤初始状态: %s | URL: %s", email_step, page.url)
 
-                email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=600)
-                if not email_input:
-                    logger.info("[直接注册] 邮箱框已只读/跳转中，额外等待页面推进...")
-                    next_step = _wait_for_direct_step_change(page, "email", timeout=10)
-                    logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
-                    if next_step != "email":
-                        break
-
-                logger.warning(
-                    "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
-                    page.url,
-                    _page_excerpt(page),
-                )
-        except Exception as exc:
-            logger.warning("[直接注册] 邮箱步骤异常: %s | URL: %s", exc, page.url)
-
-        _safe_invite_screenshot(page, "direct_03_after_email.png")
-        current_step = _detect_direct_register_step(page)
-        logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
-        if current_step == "google":
-            logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
-            browser.close()
-            return False, None
-        if current_step == "email":
-            logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
-            return False, None
-
-        try:
-            assert_not_blocked(page, "email_submit")
-        except RegisterBlocked:
-            browser.close()
-            raise
-
-        # 等待页面跳转完成（可能跳到 create-account/password）
-        password_step = _wait_for_direct_register_step(
-            page,
-            {"password", "code", "profile", "completed", "google", "email"},
-            timeout=15,
-        )
-        logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
-        _safe_invite_screenshot(page, "direct_03b_before_password.png")
-
-        try:
-            for attempt in range(2):
-                if _detect_direct_register_step(page) != "password":
-                    logger.info("[直接注册] 未检测到密码输入框，跳过")
-                    break
-
-                pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=1500)
-                if not pwd_input:
-                    logger.info("[直接注册] 密码输入框不可编辑，等待页面继续跳转...")
-                    next_step = _wait_for_direct_step_change(page, "password", timeout=10)
-                    if next_step != "password":
-                        break
-                    logger.warning("[直接注册] 密码输入框仍不可编辑，继续重试 | URL: %s", page.url)
-                    continue
-
-                logger.info("[直接注册] 设置密码")
-                pwd_input.fill(password)
-                time.sleep(0.5)
-                _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
-                next_step = _wait_for_direct_step_change(page, "password", timeout=15)
-                logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
-
-                if next_step == "google":
-                    _safe_invite_screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
-                    logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                    page.go_back(wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(2)
-                    continue
-                if next_step != "password":
-                    break
-
-                pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=600)
-                if not pwd_input:
-                    logger.info("[直接注册] 密码框已只读/跳转中，额外等待页面推进...")
-                    next_step = _wait_for_direct_step_change(page, "password", timeout=10)
-                    logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
-                    if next_step != "password":
-                        break
-        except Exception as exc:
-            logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
-
-        _safe_invite_screenshot(page, "direct_04_after_password.png")
-        current_step = _detect_direct_register_step(page)
-        if current_step == "google":
-            logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
-            browser.close()
-            return False, None
-        if current_step == "email":
-            logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
-            return False, None
-
-        try:
-            assert_not_blocked(page, "password_submit")
-        except RegisterBlocked:
-            browser.close()
-            raise
-
-        code_input = None
-        try:
-            code_input = page.locator(_DIRECT_CODE_SELECTORS).first
-            if not code_input.is_visible(timeout=5000):
-                code_input = None
-        except Exception:
-            code_input = None
-
-        if code_input:
-            logger.info("[直接注册] 等待验证码...")
-            verification_code = None
-            start_t = time.time()
-            while time.time() - start_t < MAIL_TIMEOUT:
-                emails = mail_client.search_emails_by_recipient(email, size=10, account_id=cloudmail_account_id)
-                for em in emails:
-                    verification_code = mail_client.extract_verification_code(em)
-                    if verification_code:
-                        break
-                if verification_code:
-                    break
-                elapsed = int(time.time() - start_t)
-                print(f"\r  等待验证码... ({elapsed}s)", end="", flush=True)
-                time.sleep(3)
-
-            if verification_code:
-                logger.info("[直接注册] 输入验证码: %s", verification_code)
-                code_input.fill(verification_code)
-                time.sleep(0.5)
-                _click_primary_auth_button(page, code_input, ["Continue", "继续"])
-                time.sleep(8)
-            else:
-                logger.error("[直接注册] 未收到验证码")
-                browser.close()
+            if email_step == "google":
+                logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
+                cleanup_direct_register()
+                return False, None
+            if email_step == "unknown":
+                logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
                 return False, None
 
-        _safe_invite_screenshot(page, "direct_05_after_code.png")
-        logger.info("[直接注册] 当前 URL: %s", page.url)
+            try:
+                for attempt in range(3):
+                    step = _detect_direct_register_step(page)
+                    if step != "email":
+                        break
 
-        try:
-            assert_not_blocked(page, "code_submit")
-        except RegisterBlocked:
-            browser.close()
-            raise
+                    email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=1500)
+                    if not email_input:
+                        logger.info("[直接注册] 邮箱输入框不可编辑，等待页面继续跳转...")
+                        next_step = _wait_for_direct_step_change(page, "email", timeout=10)
+                        if next_step != "email":
+                            break
+                        logger.warning("[直接注册] 邮箱输入框仍不可编辑，继续重试 | URL: %s", page.url)
+                        continue
 
-        try:
-            _complete_direct_about_you(page)
-        except RegisterBlocked:
-            # add-phone / duplicate 必须穿透给 create_account_direct 处理
-            browser.close()
-            raise
-        except Exception as exc:
-            logger.warning("[直接注册] about-you 步骤异常: %s | URL: %s", exc, page.url)
+                    email_input.fill(email)
+                    time.sleep(0.5)
+                    logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
+                    _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
+                    _click_primary_auth_button(page, email_input, ["Continue", "继续"])
 
-        _safe_invite_screenshot(page, "direct_06_after_profile.png")
-        logger.info("[直接注册] 当前 URL: %s", page.url)
+                    next_step = _wait_for_direct_step_change(page, "email", timeout=15)
+                    logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
+                    _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
 
-        try:
-            join_btn = page.locator('button:has-text("Accept"), button:has-text("Join"), button:has-text("加入")').first
-            if join_btn.is_visible(timeout=5000):
-                join_btn.click()
-                time.sleep(5)
-        except Exception:
-            pass
+                    if next_step == "google":
+                        _safe_invite_screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
+                        logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                        page.go_back(wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(2)
+                        continue
+                    if next_step != "email":
+                        break
 
-        _safe_invite_screenshot(page, "direct_07_final.png")
+                    email_input = _first_visible_editable_locator(page, _DIRECT_EMAIL_SELECTORS, timeout=600)
+                    if not email_input:
+                        logger.info("[直接注册] 邮箱框已只读/跳转中，额外等待页面推进...")
+                        next_step = _wait_for_direct_step_change(page, "email", timeout=10)
+                        logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                        if next_step != "email":
+                            break
 
-        current_url = page.url
-        success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
-        if success:
-            logger.info("[直接注册] 注册成功并已加入 workspace!")
-        else:
-            logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
+                    logger.warning(
+                        "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
+                        page.url,
+                        _page_excerpt(page),
+                    )
+            except Exception as exc:
+                logger.warning("[直接注册] 邮箱步骤异常: %s | URL: %s", exc, page.url)
 
-        # Round 11 四轮 — 注册成功后从 chatgpt.com context 抽 __Secure-next-auth.session-token,
-        # 透给后续 personal OAuth 用,跳过 auth.openai.com /log-in 页(实测刚踢出 Team 的新号
-        # 在 /log-in 页 Continue 按钮变灰 → 卡死)。SessionCodexAuthFlow._inject_auth_cookies
-        # 是同样的注入模式(主号专用),这里把模式扩展给 personal 子号。
-        session_token = _extract_session_token_from_context(context) if success else None
+            _safe_invite_screenshot(page, "direct_03_after_email.png")
+            current_step = _detect_direct_register_step(page)
+            logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
+            if current_step == "google":
+                logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
+                cleanup_direct_register()
+                return False, None
+            if current_step == "email":
+                logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
 
-        browser.close()
-        return success, session_token
+            try:
+                assert_not_blocked(page, "email_submit")
+            except RegisterBlocked:
+                cleanup_direct_register()
+                raise
+
+            # 等待页面跳转完成（可能跳到 create-account/password）
+            password_step = _wait_for_direct_register_step(
+                page,
+                {"password", "code", "profile", "completed", "google", "email"},
+                timeout=15,
+            )
+            logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
+            _safe_invite_screenshot(page, "direct_03b_before_password.png")
+
+            try:
+                for attempt in range(2):
+                    if _detect_direct_register_step(page) != "password":
+                        logger.info("[直接注册] 未检测到密码输入框，跳过")
+                        break
+
+                    pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=1500)
+                    if not pwd_input:
+                        logger.info("[直接注册] 密码输入框不可编辑，等待页面继续跳转...")
+                        next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+                        if next_step != "password":
+                            break
+                        logger.warning("[直接注册] 密码输入框仍不可编辑，继续重试 | URL: %s", page.url)
+                        continue
+
+                    logger.info("[直接注册] 设置密码")
+                    pwd_input.fill(password)
+                    time.sleep(0.5)
+                    _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
+                    next_step = _wait_for_direct_step_change(page, "password", timeout=15)
+                    logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
+
+                    if next_step == "google":
+                        _safe_invite_screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
+                        logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                        page.go_back(wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(2)
+                        continue
+                    if next_step != "password":
+                        break
+
+                    pwd_input = _first_visible_editable_locator(page, _DIRECT_PASSWORD_SELECTORS, timeout=600)
+                    if not pwd_input:
+                        logger.info("[直接注册] 密码框已只读/跳转中，额外等待页面推进...")
+                        next_step = _wait_for_direct_step_change(page, "password", timeout=10)
+                        logger.info("[直接注册] 额外等待后状态: %s | URL: %s", next_step, page.url)
+                        if next_step != "password":
+                            break
+            except Exception as exc:
+                logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
+
+            _safe_invite_screenshot(page, "direct_04_after_password.png")
+            current_step = _detect_direct_register_step(page)
+            if current_step == "google":
+                logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
+                cleanup_direct_register()
+                return False, None
+            if current_step == "email":
+                logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                cleanup_direct_register()
+                return False, None
+
+            try:
+                assert_not_blocked(page, "password_submit")
+            except RegisterBlocked:
+                cleanup_direct_register()
+                raise
+
+            code_input = None
+            try:
+                code_input = page.locator(_DIRECT_CODE_SELECTORS).first
+                if not code_input.is_visible(timeout=5000):
+                    code_input = None
+            except Exception:
+                code_input = None
+
+            if code_input:
+                logger.info("[直接注册] 等待验证码...")
+                verification_code = None
+                start_t = time.time()
+                while time.time() - start_t < MAIL_TIMEOUT:
+                    emails = mail_client.search_emails_by_recipient(email, size=10, account_id=cloudmail_account_id)
+                    for em in emails:
+                        verification_code = mail_client.extract_verification_code(em)
+                        if verification_code:
+                            break
+                    if verification_code:
+                        break
+                    elapsed = int(time.time() - start_t)
+                    print(f"\r  等待验证码... ({elapsed}s)", end="", flush=True)
+                    time.sleep(3)
+
+                if verification_code:
+                    logger.info("[直接注册] 输入验证码: %s", verification_code)
+                    code_input.fill(verification_code)
+                    time.sleep(0.5)
+                    _click_primary_auth_button(page, code_input, ["Continue", "继续"])
+                    time.sleep(8)
+                else:
+                    logger.error("[直接注册] 未收到验证码")
+                    cleanup_direct_register()
+                    return False, None
+
+            _safe_invite_screenshot(page, "direct_05_after_code.png")
+            logger.info("[直接注册] 当前 URL: %s", page.url)
+
+            try:
+                assert_not_blocked(page, "code_submit")
+            except RegisterBlocked:
+                cleanup_direct_register()
+                raise
+
+            try:
+                _complete_direct_about_you(page, signup_profile=signup_profile)
+            except RegisterBlocked:
+                # add-phone / duplicate 必须穿透给 create_account_direct 处理
+                cleanup_direct_register()
+                raise
+            except Exception as exc:
+                logger.warning("[直接注册] about-you 步骤异常: %s | URL: %s", exc, page.url)
+
+            _safe_invite_screenshot(page, "direct_06_after_profile.png")
+            logger.info("[直接注册] 当前 URL: %s", page.url)
+
+            try:
+                join_btn = page.locator('button:has-text("Accept"), button:has-text("Join"), button:has-text("加入")').first
+                if join_btn.is_visible(timeout=5000):
+                    join_btn.click()
+                    time.sleep(5)
+            except Exception:
+                pass
+
+            _safe_invite_screenshot(page, "direct_07_final.png")
+
+            current_url = page.url
+            success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
+            if success:
+                logger.info("[直接注册] 注册成功并已加入 workspace!")
+            else:
+                logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
+
+            # Round 11 四轮 — 注册成功后从 chatgpt.com context 抽 __Secure-next-auth.session-token,
+            # 透给后续 personal OAuth 用,跳过 auth.openai.com /log-in 页(实测刚踢出 Team 的新号
+            # 在 /log-in 页 Continue 按钮变灰 → 卡死)。SessionCodexAuthFlow._inject_auth_cookies
+            # 是同样的注入模式(主号专用),这里把模式扩展给 personal 子号。
+            session_token = _extract_session_token_from_context(context) if success else None
+
+            cleanup_direct_register()
+            return success, session_token
+        finally:
+            cleanup_direct_register()
 
 
 def _extract_session_token_from_context(context):
@@ -3495,6 +3532,7 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
 
     account_id, email = mail_client.create_temp_email()
     password = random_password()
+    signup_profile = generate_signup_profile()
 
     def _record_outcome(status, **extra):
         if out_outcome is not None:
@@ -3531,7 +3569,11 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
         )
         try:
             success, session_token = _register_direct_once(
-                mail_client, email, password, cloudmail_account_id=account_id
+                mail_client,
+                email,
+                password,
+                cloudmail_account_id=account_id,
+                signup_profile=signup_profile,
             )
         except RegisterBlocked as blocked:
             logger.error("[直接注册] %s 被阻断: %s", email, blocked)
@@ -3568,6 +3610,7 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
                 _discard_email("duplicate")
                 account_id, email = mail_client.create_temp_email()
                 password = random_password()
+                signup_profile = generate_signup_profile()
                 logger.info("[直接注册] 已换新临时邮箱: %s", email)
                 continue
             # 其他阻断按普通失败处理
@@ -3633,6 +3676,7 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
         leave_workspace=leave_workspace,
         out_outcome=out_outcome,
         chatgpt_session_token=session_token,
+        signup_profile=signup_profile,
     )
 
 
@@ -3768,8 +3812,8 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
     logger.info("[轮转] 恢复旧账号: %s（统一 OAuth 登录）", email)
 
-    # 关闭 ChatGPT API 浏览器避免冲突
-    if chatgpt_api and chatgpt_api.browser:
+    # 关闭已有 Team API session 避免 OAuth 浏览器冲突；auto transport 下可能没有 browser 但仍 started。
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.stop()
 
     def _cleanup_team_leftover(reason):

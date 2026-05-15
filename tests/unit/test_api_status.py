@@ -56,6 +56,20 @@ def test_get_status_normalizes_main_account_status_from_saved_auth(tmp_path, mon
     }
 
 
+def test_get_status_survives_runtime_resource_probe_failure(monkeypatch):
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+    monkeypatch.setattr(
+        api,
+        "collect_runtime_resource_snapshot",
+        lambda: (_ for _ in ()).throw(RuntimeError("proc unavailable")),
+    )
+
+    result = api.get_status()
+
+    assert result["accounts"] == []
+    assert result["runtime_resources"] == {"error": "runtime_resource_snapshot_failed"}
+
+
 def test_sanitize_account_keeps_exportable_main_account_active_without_live_quota(tmp_path, monkeypatch):
     main_email = "owner@example.com"
     auth_file = tmp_path / "codex-main.json"

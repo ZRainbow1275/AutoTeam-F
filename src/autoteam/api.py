@@ -26,6 +26,14 @@ from autoteam.textio import read_text
 logger = logging.getLogger(__name__)
 
 
+def _safe_runtime_resource_snapshot() -> dict:
+    try:
+        return collect_runtime_resource_snapshot()
+    except Exception as exc:
+        logger.warning("[资源] runtime resource snapshot failed: %s", exc)
+        return {"error": "runtime_resource_snapshot_failed"}
+
+
 # Round 7 P2.4 — FastAPI 现代 lifespan handler 替代已废弃的 @app.on_event。
 # 启动期:修复 auths 认证文件权限 + 启动 _auto_check_loop 后台线程。
 # 停止期:发 _auto_check_stop 信号让线程优雅退出。
@@ -2265,7 +2273,7 @@ def get_status():
         "accounts": sanitized_accounts,
         "summary": summary,
         "quota_cache": quota_cache,
-        "runtime_resources": collect_runtime_resource_snapshot(),
+        "runtime_resources": _safe_runtime_resource_snapshot(),
     }
 
 

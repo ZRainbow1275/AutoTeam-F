@@ -22,7 +22,12 @@ from autoteam.admin_state import (
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
 from autoteam.config import get_playwright_launch_options
-from autoteam.invite import assert_not_blocked  # SPEC-2 shared/add-phone-detection §3 — OAuth 流程复用
+from autoteam.invite import (  # SPEC-2 shared/add-phone-detection §3 — OAuth 流程复用
+    RegisterBlocked,
+    assert_not_blocked,
+)
+from autoteam.playwright_lifecycle import close_playwright_objects
+from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
@@ -905,10 +910,122 @@ def _perform_fresh_relogin_in_context(context, email, password, mail_client, *, 
         logger.warning("[Codex] fresh re-login 异常: %s", exc)
         return False
     finally:
+        close_playwright_objects(page=page, logger=logger, label="codex-fresh-relogin")
+
+
+def _wait_for_oauth_about_you_exit(page, *, timeout: float = 12.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if "about-you" not in (page.url or "").lower():
+            return True
+        time.sleep(0.5)
+    return "about-you" not in (page.url or "").lower()
+
+
+def _click_oauth_about_you_submit(page) -> None:
+    for selector in (
+        'button:has-text("完成帐户创建")',
+        'button:has-text("Create account")',
+        'button:has-text("Continue")',
+        'button:has-text("继续")',
+        'button[type="submit"]',
+    ):
         try:
-            page.close()
+            button = page.locator(selector).first
+            if button.is_visible(timeout=1000):
+                button.click()
+                return
         except Exception:
-            pass
+            continue
+    page.keyboard.press("Enter")
+
+
+def _complete_oauth_about_you(page, signup_profile: SignupProfile | None = None) -> bool:
+    """Complete OAuth about-you with the same identity snapshot used at registration."""
+    signup_profile = signup_profile or generate_signup_profile()
+
+    logger.info("[Codex] 检测到 about-you 页面，填写个人信息...")
+    try:
+        birthday_orders = signup_profile.positional_birthday_orders()
+        for attempt, values in enumerate(birthday_orders, 1):
+            if "about-you" not in (page.url or "").lower():
+                return True
+
+            name_input = page.locator('input[name="name"]').first
+            if name_input.is_visible(timeout=3000):
+                name_input.fill(signup_profile.full_name)
+                logger.info("[Codex] 已填入随机姓名: %s", signup_profile.full_name)
+
+            spinbuttons = page.locator('[role="spinbutton"]').all()
+            if len(spinbuttons) < 3:
+                age_input = page.locator(
+                    'input[name="age"], input[placeholder*="年龄"], input[placeholder*="Age"]'
+                ).first
+                try:
+                    if age_input.is_visible(timeout=3000):
+                        age_input.fill(signup_profile.age_text)
+                        logger.info("[Codex] 已填入随机年龄: %s", signup_profile.age_text)
+                except Exception:
+                    logger.warning("[Codex] 未找到年龄/生日输入框")
+
+                time.sleep(0.5)
+                _click_oauth_about_you_submit(page)
+                time.sleep(2)
+                assert_not_blocked(page, "oauth_about_you_submit")
+                _screenshot(page, "codex_03d_after_aboutyou.png")
+                done = _wait_for_oauth_about_you_exit(page)
+                logger.info("[Codex] about-you 完成=%s，当前 URL: %s", done, page.url)
+                return done
+
+            try:
+                for label_sel in ("text=生日日期", "text=Date of birth"):
+                    try:
+                        page.locator(label_sel).first.click(timeout=1000)
+                        time.sleep(0.3)
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            for sb, val in zip(spinbuttons[:3], values):
+                sb.click(force=True)
+                time.sleep(0.2)
+                try:
+                    page.keyboard.press("ControlOrMeta+A")
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+                page.keyboard.type(val, delay=80)
+                time.sleep(0.3)
+
+            logger.info(
+                "[Codex] 已填入随机生日: %s (spinbutton, attempt=%d, values=%s)",
+                signup_profile.birthday_text,
+                attempt,
+                values,
+            )
+            time.sleep(0.5)
+            _click_oauth_about_you_submit(page)
+            time.sleep(2)
+            assert_not_blocked(page, "oauth_about_you_submit")
+            _screenshot(page, "codex_03d_after_aboutyou.png")
+            if _wait_for_oauth_about_you_exit(page):
+                logger.info("[Codex] about-you 完成，当前 URL: %s", page.url)
+                return True
+
+            logger.warning(
+                "[Codex] about-you 第 %d 次提交后仍停留在 profile 页，尝试下一生日顺序",
+                attempt,
+            )
+
+        logger.warning("[Codex] about-you 多顺序尝试后仍未完成，当前 URL: %s", page.url)
+        return False
+    except RegisterBlocked:
+        raise
+    except Exception as exc:
+        logger.error("[Codex] about-you 处理失败: %s", exc)
+        return False
 
 
 def login_codex_via_browser(
@@ -919,6 +1036,7 @@ def login_codex_via_browser(
     use_personal=False,
     chatgpt_session_token=None,
     prefetched_personal_uuid=None,
+    signup_profile: SignupProfile | None = None,
 ):
     """
     通过 Playwright 自动完成 Codex OAuth 登录。
@@ -931,6 +1049,7 @@ def login_codex_via_browser(
     prefetched_personal_uuid: Round 11 V8 — accounts.json 持久化的 personal_workspace_id;
                               非空时直接拼到 OAuth `auth_url` 的 allowed_workspace_id 参数,
                               省一次 silent step-0 内的 POST /accounts/personal。
+    signup_profile: 注册 about-you 使用过的身份快照；OAuth about-you 必须复用它。
     返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type,
                        personal_workspace_id}
 
@@ -1174,10 +1293,7 @@ def login_codex_via_browser(
                 except Exception as exc:
                     logger.warning("[Codex] silent step-0 异常(继续走 OAuth): %s", exc)
                 finally:
-                    try:
-                        _silent_page.close()
-                    except Exception:
-                        pass
+                    close_playwright_objects(page=_silent_page, logger=logger, label="codex-silent-step0")
             else:
                 logger.info("[Codex] personal 模式: 无 session_token,跳过 step-0,直接走 auth_url")
         else:
@@ -1324,7 +1440,7 @@ def login_codex_via_browser(
             # _account cookie 已在登录前注入
 
             # 关闭 ChatGPT 页面但保留 context
-            _page.close()
+            close_playwright_objects(page=_page, logger=logger, label="codex-workspace-page")
 
         # 通过监听请求来捕获 OAuth callback redirect
         def on_request(request):
@@ -1466,46 +1582,10 @@ def login_codex_via_browser(
 
         # 处理 about-you 页面（可能出现在 OAuth 流程中）
         if "about-you" in page.url:
-            logger.info("[Codex] 检测到 about-you 页面，填写个人信息...")
-            try:
-                name_input = page.locator('input[name="name"]').first
-                if name_input.is_visible(timeout=3000):
-                    name_input.fill("User")
-
-                # 自适应：生日日期（spinbutton）或年龄（普通 input）
-                spinbuttons = page.locator('[role="spinbutton"]').all()
-                if len(spinbuttons) >= 3:
-                    # 类型 A：React Aria DateField
-                    try:
-                        page.locator("text=生日日期").click()
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                    for sb, val in zip(spinbuttons[:3], ["1995", "06", "15"]):
-                        sb.click(force=True)
-                        time.sleep(0.2)
-                        page.keyboard.type(val, delay=80)
-                        time.sleep(0.3)
-                    logger.info("[Codex] 填入生日: 1995/06/15 (spinbutton)")
-                else:
-                    # 类型 B：普通年龄数字输入框
-                    age_input = page.locator('input[name="age"], input[placeholder*="年龄"]').first
-                    try:
-                        if age_input.is_visible(timeout=3000):
-                            age_input.fill("25")
-                            logger.info("[Codex] 填入年龄: 25")
-                    except Exception:
-                        logger.warning("[Codex] 未找到年龄/生日输入框")
-
-                time.sleep(0.5)
-                page.locator(
-                    'button:has-text("继续"), button:has-text("Continue"), button:has-text("完成帐户创建"), button[type="submit"]'
-                ).first.click()
-                time.sleep(5)
-                _screenshot(page, "codex_03d_after_aboutyou.png")
-                logger.info("[Codex] about-you 完成，当前 URL: %s", page.url)
-            except Exception as e:
-                logger.error("[Codex] about-you 处理失败: %s", e)
+            if not _complete_oauth_about_you(page, signup_profile=signup_profile):
+                logger.warning("[Codex] about-you 未完成，放弃本次 OAuth，交由上层重试/分类处理")
+                close_playwright_objects(page, context, browser, logger=logger, label="codex-oauth")
+                return None
 
         # Round 11 三轮 — Personal 模式: pre-consent workspace_select.
         # 历史:
@@ -1956,17 +2036,14 @@ def login_codex_via_browser(
 
         # SPEC-2 §3.4.5 (位点 C-P4) + Round 6 PRD-5 FR-P1.1:personal 拒收 bundle 之前的最后一道关卡。
         # 防御性 — 通常 C-P1~C-P3 已拦下,但 add-phone 可能在 callback 阶段后晚到一两秒;
-        # 此处在 browser.close() 之前做最后一次探针,确保 page 仍可读。命中即抛 RegisterBlocked,
+        # 此处在统一 cleanup 之前做最后一次探针,确保 page 仍可读。命中即抛 RegisterBlocked,
         # 上游 5 个调用方按 add-phone-detection.md §5.2 矩阵分类处置(personal/team/reinvite/api 各异)。
         try:
             assert_not_blocked(page, "oauth_personal_check")
         except Exception:
             # assert_not_blocked 命中 add-phone 会抛 RegisterBlocked — 必须传播给上层
             # 但要保证 browser 资源被释放
-            try:
-                browser.close()
-            except Exception:
-                pass
+            close_playwright_objects(page, context, browser, logger=logger, label="codex-oauth")
             raise
 
         # Round 11 五轮 Option A — 阶段 1 完成,先尝试 exchange + plan 校验
@@ -2012,7 +2089,7 @@ def login_codex_via_browser(
             )
             if not relogin_ok:
                 logger.warning("[Codex] 阶段 2 fresh re-login 未成功,放弃")
-                browser.close()
+                close_playwright_objects(page, context, browser, logger=logger, label="codex-oauth")
                 return None
 
             # 2) 重新生成 PKCE + state(原 auth_code 已 used,新 OAuth 必须用新 code_verifier)
@@ -2070,10 +2147,7 @@ def login_codex_via_browser(
                     logger.warning("[Codex] 阶段 2 fetch personal uuid 失败: %s", exc)
                 finally:
                     if fetch_page is not None:
-                        try:
-                            fetch_page.close()
-                        except Exception:
-                            pass
+                        close_playwright_objects(page=fetch_page, logger=logger, label="codex-stage2-fetch")
 
             if use_personal and personal_uuid:
                 stage2_auth_url = _build_auth_url_with_allowed_workspace(
@@ -2131,10 +2205,7 @@ def login_codex_via_browser(
                     try:
                         assert_not_blocked(stage2_page, f"oauth_consent_stage2_{s2_step}")
                     except Exception:
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
+                        close_playwright_objects(stage2_page, context, browser, logger=logger, label="codex-oauth-stage2")
                         raise
 
                     _screenshot(stage2_page, f"codex_relogin_07_consent_step{s2_step + 1}.png")
@@ -2203,12 +2274,9 @@ def login_codex_via_browser(
                         (stage2_page.url or "")[:120],
                     )
             finally:
-                try:
-                    stage2_page.close()
-                except Exception:
-                    pass
+                close_playwright_objects(page=stage2_page, logger=logger, label="codex-stage2-page")
 
-            browser.close()
+            close_playwright_objects(page, context, browser, logger=logger, label="codex-oauth")
 
             if not stage2_auth_code:
                 logger.warning("[Codex] 阶段 2 OAuth 失败,放弃")
@@ -2240,7 +2308,7 @@ def login_codex_via_browser(
             return stage2_bundle
 
         # 阶段 1 通过(非 personal 或 plan == free) — 走原退出路径
-        browser.close()
+        close_playwright_objects(page, context, browser, logger=logger, label="codex-oauth")
 
     if not auth_code:
         logger.error("[Codex] OAuth 登录失败: 未获取到 authorization code")
@@ -2601,18 +2669,22 @@ class SessionCodexAuthFlow:
         from autoteam.chatgpt_api import ChatGPTTeamAPI
 
         self.chatgpt = ChatGPTTeamAPI()
-        self.chatgpt.start_with_session(
-            self.session_token,
-            self.account_id,
-            self.workspace_name,
-            require_browser=True,
-        )
-        self.page = self.chatgpt.context.new_page()
-        self._attach_callback_listeners()
-        self._inject_auth_cookies()
-        self.page.goto(self.auth_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(3)
-        return self._advance()
+        try:
+            self.chatgpt.start_with_session(
+                self.session_token,
+                self.account_id,
+                self.workspace_name,
+                require_browser=True,
+            )
+            self.page = self.chatgpt.context.new_page()
+            self._attach_callback_listeners()
+            self._inject_auth_cookies()
+            self.page.goto(self.auth_url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+            return self._advance()
+        except Exception:
+            self.stop()
+            raise
 
     def submit_password(self, password):
         self.password = password
