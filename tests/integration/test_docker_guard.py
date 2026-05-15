@@ -20,6 +20,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BASH_EXE = Path("C:/Program Files/Git/bin/bash.exe")
+if not BASH_EXE.exists():
+    BASH_EXE = Path("C:/Program Files/Git/usr/bin/bash.exe")
+if not BASH_EXE.exists():
+    detected_bash = shutil.which("bash")
+    BASH_EXE = Path(detected_bash) if detected_bash else Path("bash")
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +140,20 @@ def test_self_check_whitelist_imports() -> None:
         save_accounts,
     )
     from autoteam.api import app  # noqa: F401
+    from autoteam.chatgpt_transport import build_chatgpt_transport  # noqa: F401
     from autoteam.manager import sync_account_states  # noqa: F401
+    from autoteam.playwright_lifecycle import close_playwright_objects  # noqa: F401
+    from autoteam.playwright_probe import main as playwright_probe_main  # noqa: F401
+    from autoteam.runtime_resources import collect_runtime_resource_snapshot  # noqa: F401
 
     # 简单的契约校验 — 函数应可调用、状态常量应是字符串
     assert callable(load_accounts)
     assert callable(save_accounts)
     assert callable(sync_account_states)
+    assert callable(collect_runtime_resource_snapshot)
+    assert callable(close_playwright_objects)
+    assert callable(playwright_probe_main)
+    assert callable(build_chatgpt_transport)
     for const in (
         STATUS_ACTIVE,
         STATUS_EXHAUSTED,
@@ -176,6 +190,36 @@ def test_compose_passes_build_args() -> None:
     assert "BUILD_TIME: ${BUILD_TIME:-unknown}" in compose
 
 
+def test_compose_declares_runtime_safety_bounds() -> None:
+    """0515 hardening: compose must keep browser/container resource boundaries."""
+
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "init: true" in compose
+    assert 'shm_size: "1gb"' in compose
+    assert 'mem_limit: "2g"' in compose
+    assert 'memswap_limit: "2g"' in compose
+    assert "pids_limit: 768" in compose
+    assert 'AUTOTEAM_MEMORY_WARN_RATIO: "0.85"' in compose
+    assert 'AUTOTEAM_ZOMBIE_WARN_THRESHOLD: "5"' in compose
+    assert "healthcheck:" in compose
+    assert "curl -fsS http://127.0.0.1:8787/api/version" in compose
+
+
+def test_dockerfile_fast_preserves_runtime_contracts() -> None:
+    """Dockerfile.fast is allowed only if it preserves fingerprint and self-check paths."""
+
+    dockerfile = (REPO_ROOT / "Dockerfile.fast").read_text(encoding="utf-8")
+    assert "FROM autoteam:latest" in dockerfile
+    assert "ARG GIT_SHA" in dockerfile
+    assert "ARG BUILD_TIME" in dockerfile
+    assert "ENV AUTOTEAM_GIT_SHA" in dockerfile
+    assert "ENV AUTOTEAM_BUILD_TIME" in dockerfile
+    assert "org.opencontainers.image.revision" in dockerfile
+    assert "COPY docker-entrypoint.sh /docker-entrypoint.sh" in dockerfile
+    assert "sed -i 's/\\r$//'" in dockerfile
+    assert 'ENTRYPOINT ["/docker-entrypoint.sh"]' in dockerfile
+
+
 def test_entrypoint_contains_self_check() -> None:
     """entrypoint 必须包含 self-check + crash-loop 兜底。"""
 
@@ -183,7 +227,25 @@ def test_entrypoint_contains_self_check() -> None:
     assert "[self-check]" in entrypoint
     assert "from autoteam.api import app" in entrypoint
     assert "from autoteam.accounts import" in entrypoint
+    assert "from autoteam.runtime_resources import collect_runtime_resource_snapshot" in entrypoint
+    assert "from autoteam.playwright_lifecycle import close_playwright_objects" in entrypoint
+    assert "from autoteam.playwright_probe import main as playwright_probe_main" in entrypoint
+    assert "from autoteam.chatgpt_transport import build_chatgpt_transport" in entrypoint
     assert "exit 1" in entrypoint, "self-check 失败必须 exit 1 触发 crash-loop"
+
+
+def test_entrypoint_shell_syntax_is_valid() -> None:
+    """The self-check heredoc must remain valid after Dockerfile CRLF normalization."""
+
+    proc = subprocess.run(
+        [str(BASH_EXE), "-lc", "tr -d '\\r' < docker-entrypoint.sh | bash -n"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=REPO_ROOT,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_pyproject_has_ruff_config() -> None:

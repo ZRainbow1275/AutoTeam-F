@@ -1,0 +1,14 @@
+{"file":"prompts/0515/prd.md","reason":"User-requested authoritative PRD and scope boundaries for this implementation"}
+{"file":"prompts/0515/spec.md","reason":"User-requested implementation contract, including free registration protection rules"}
+{"file":"prompts/0515/implementation-plan.md","reason":"Staged execution checklist and validation plan"}
+{"file":"prompts/0515/research-docker-playwright-hardening.md","reason":"External and local research grounding Docker/Playwright choices"}
+{"file":".trellis/spec/backend/index.md","reason":"Backend spec index for project conventions"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Quality gate context for implementation"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Error-handling context for cleanup and fallback behavior"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Logging context for runtime resource warnings"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Cross-layer impact guide for Docker/API/runtime changes"}
+{"file":".trellis/spec/backend/runtime-docker-hardening.md","reason":"Executable backend contract for Docker bounds, Playwright cleanup, resource probes, and transport safety"}
+{"file":".trellis/spec/backend/free-registration-hardening.md","reason":"Executable backend contract for fill-personal safety, Team-seat preflight, and SignupProfile consistency"}
+{"file":"src/autoteam/codex_auth.py","reason":"Deep review fix: SessionCodexAuthFlow now matches autoteam-1 and forces require_browser=True so CHATGPT_API_TRANSPORT=auto cannot break OAuth browser context"}
+{"file":"src/autoteam/manager.py","reason":"Deep review fix: Team API lifecycle checks now use _chatgpt_session_ready/is_started semantics so HTTP-only auto transport sessions are reused and stopped instead of leaking behind browser-only guards"}
+{"file":"src/autoteam/chatgpt_transport.py","reason":"Deep review fix: __Secure session cookies are set with secure=True to avoid curl_cffi warning and keep cookie semantics explicit"}

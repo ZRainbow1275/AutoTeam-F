@@ -29,14 +29,7 @@ done
 # Self-check: 关键 import 白名单 — 失败即 crash-loop(SPEC-3 §2)
 # ---------------------------------------------------------------------------
 echo "[self-check] verifying critical imports..."
-uv run python - <<'PYEOF' || {
-    echo "[self-check] FATAL: critical import failed - image is likely stale or broken." >&2
-    echo "[self-check] If you just pulled new code, the image must be rebuilt:" >&2
-    echo "[self-check]   docker compose down" >&2
-    echo "[self-check]   docker compose build --no-cache --build-arg GIT_SHA=\$(git rev-parse --short HEAD)" >&2
-    echo "[self-check]   docker compose up -d" >&2
-    exit 1
-}
+if ! uv run python - <<'PYEOF'
 import sys
 
 # 核心 web 应用入口
@@ -58,9 +51,23 @@ from autoteam.accounts import (  # noqa: F401
 # manager → accounts 链路(覆盖跨模块 typo)
 from autoteam.manager import sync_account_states  # noqa: F401
 
-print("[self-check] OK: %d critical symbols imported." % 11)
+# 0515 runtime hardening helpers
+from autoteam.runtime_resources import collect_runtime_resource_snapshot  # noqa: F401
+from autoteam.playwright_lifecycle import close_playwright_objects  # noqa: F401
+from autoteam.playwright_probe import main as playwright_probe_main  # noqa: F401
+from autoteam.chatgpt_transport import build_chatgpt_transport  # noqa: F401
+
+print("[self-check] OK: %d critical symbols imported." % 15)
 sys.exit(0)
 PYEOF
+then
+    echo "[self-check] FATAL: critical import failed - image is likely stale or broken." >&2
+    echo "[self-check] If you just pulled new code, the image must be rebuilt:" >&2
+    echo "[self-check]   docker compose down" >&2
+    echo "[self-check]   docker compose build --no-cache --build-arg GIT_SHA=\$(git rev-parse --short HEAD)" >&2
+    echo "[self-check]   docker compose up -d" >&2
+    exit 1
+fi
 echo "[self-check] passed."
 
 # 执行命令

@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from autoteam.textio import parse_env_line, parse_env_value, read_text
 
@@ -21,6 +21,18 @@ if _env_file.exists():
 
 def _get_int_env(name: str, default: int) -> int:
     return int(parse_env_value(os.environ.get(name, str(default))))
+
+
+def _get_str_env(name: str, default: str = "") -> str:
+    value = parse_env_value(os.environ.get(name, default))
+    return str(value).strip()
+
+
+def _normalize_chatgpt_api_transport(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"auto", "playwright", "curl_cffi"}:
+        return mode
+    return "playwright"
 
 
 # CloudMail 配置
@@ -122,6 +134,49 @@ def _parse_proxy_url(proxy_url: str):
         proxy["username"] = unquote(parsed.username)
     if parsed.password:
         proxy["password"] = unquote(parsed.password)
+    return proxy
+
+
+def get_chatgpt_api_transport() -> str:
+    # Match autoteam-1: Team backend API reads may use HTTP-first transport by default.
+    # Browser/OAuth flows must opt out with require_browser=True at the call site.
+    return _normalize_chatgpt_api_transport(_get_str_env("CHATGPT_API_TRANSPORT", "auto"))
+
+
+def get_chatgpt_api_http_timeout() -> int:
+    return max(5, _get_int_env("CHATGPT_API_HTTP_TIMEOUT", 60))
+
+
+def get_chatgpt_api_impersonate() -> str:
+    return _get_str_env("CHATGPT_API_IMPERSONATE", "chrome136") or "chrome136"
+
+
+def get_chatgpt_http_proxy_url() -> str:
+    proxy_url = _get_str_env("PLAYWRIGHT_PROXY_URL", "")
+    if proxy_url:
+        return proxy_url
+
+    proxy_server = _get_str_env("PLAYWRIGHT_PROXY_SERVER", "")
+    if not proxy_server:
+        return ""
+
+    username = _get_str_env("PLAYWRIGHT_PROXY_USERNAME", "")
+    password = _get_str_env("PLAYWRIGHT_PROXY_PASSWORD", "")
+    if not (username or password):
+        return proxy_server
+
+    parsed = urlsplit(proxy_server)
+    if not parsed.scheme or not parsed.hostname:
+        return proxy_server
+
+    host = _format_proxy_host(parsed.hostname)
+    auth = quote(username, safe="")
+    if password:
+        auth = f"{auth}:{quote(password, safe='')}"
+
+    proxy = f"{parsed.scheme}://{auth}@{host}"
+    if parsed.port:
+        proxy = f"{proxy}:{parsed.port}"
     return proxy
 
 

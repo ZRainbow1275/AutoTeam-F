@@ -3,6 +3,9 @@
 import json
 import logging
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -17,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from autoteam.config import API_KEY
+from autoteam.runtime_resources import collect_runtime_resource_snapshot, log_runtime_resource_snapshot
 from autoteam.textio import read_text
 
 logger = logging.getLogger(__name__)
@@ -72,6 +76,10 @@ async def app_lifespan(app: FastAPI):
     finally:
         logger.info("[lifespan] stopping")
         _auto_check_stop.set()
+        try:
+            _pw_executor.stop()
+        except Exception as exc:
+            logger.warning("[lifespan] stopping Playwright executor failed: %s", exc)
 
 
 app = FastAPI(
@@ -1207,8 +1215,12 @@ def post_admin_login_start(params: AdminEmailParams):
 
         def _do_start(email):
             api = ChatGPTTeamAPI()
-            result = api.begin_admin_login(email)
-            return api, result
+            try:
+                result = api.begin_admin_login(email)
+                return api, result
+            except Exception:
+                api.stop()
+                raise
 
         api, result = _pw_executor.run(_do_start, params.email.strip())
         step = result["step"]
@@ -2061,8 +2073,8 @@ def post_kick_account(email: str):
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
-            chatgpt.start()
             try:
+                chatgpt.start()
                 return remove_from_team(chatgpt, email)
             finally:
                 chatgpt.stop()
@@ -2253,6 +2265,7 @@ def get_status():
         "accounts": sanitized_accounts,
         "summary": summary,
         "quota_cache": quota_cache,
+        "runtime_resources": collect_runtime_resource_snapshot(),
     }
 
 
@@ -2436,8 +2449,8 @@ def get_team_members():
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
-            chatgpt.start()
             try:
+                chatgpt.start()
                 members, invites = fetch_team_state(chatgpt)
                 local_emails = {a["email"].lower() for a in load_accounts()}
 
@@ -2468,7 +2481,12 @@ def get_team_members():
             finally:
                 chatgpt.stop()
 
-        return _pw_executor.run(_fetch_team_members)
+        try:
+            return _pw_executor.run(_fetch_team_members)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         _playwright_lock.release()
 
@@ -2504,8 +2522,8 @@ def post_team_member_remove(params: TeamMemberRemoveParams):
             from autoteam.chatgpt_api import ChatGPTTeamAPI
 
             chatgpt = ChatGPTTeamAPI()
-            chatgpt.start()
             try:
+                chatgpt.start()
                 if member_type == "invite":
                     path = f"/backend-api/accounts/{account_id}/invites/{user_id}"
                     action_text = "取消邀请"
@@ -2663,12 +2681,12 @@ def post_fill(params: TaskParams = TaskParams()):
     则直接返回 409,不启动后台任务(队列化拒绝,Solution C)。本地状态足够用,无需启动
     Playwright 远程查询,避免给前端按错按钮带来额外开销。
     """
-    from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP, cmd_fill
+    from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP, _count_local_team_seat_accounts, cmd_fill
 
     if params.leave_workspace:
-        from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED, load_accounts
+        from autoteam.accounts import load_accounts
 
-        in_team_local = sum(1 for a in load_accounts() if a.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED))
+        in_team_local = _count_local_team_seat_accounts(load_accounts())
         if in_team_local >= TEAM_SUB_ACCOUNT_HARD_CAP:
             raise HTTPException(
                 status_code=409,
@@ -2916,6 +2934,105 @@ _auto_fill_last_trigger_ts = 0.0
 _AUTO_FILL_COOLDOWN_SECONDS = 1800  # 30 min
 
 
+def _playwright_probe_command(*args: str) -> list[str]:
+    return [sys.executable, "-m", "autoteam.playwright_probe", *args]
+
+
+def _kill_subprocess_group(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _parse_playwright_probe_stdout(stdout: str) -> dict:
+    text = (stdout or "").strip()
+    if not text:
+        return {}
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if not line.startswith(("{", "[")):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+    parsed = json.loads(text)
+    return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+
+def _run_playwright_probe(*args: str, timeout_seconds: float = 30) -> dict:
+    cmd = _playwright_probe_command(*args)
+    env = os.environ.copy()
+    env["AUTOTEAM_PROBE_MODE"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=max(1.0, float(timeout_seconds)))
+    except subprocess.TimeoutExpired as exc:
+        _kill_subprocess_group(proc)
+        try:
+            proc.communicate(timeout=1)
+        except Exception:
+            pass
+        raise TimeoutError(f"Playwright probe timeout: {' '.join(args)}") from exc
+
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
+    if proc.returncode != 0:
+        detail = stderr or stdout or f"exit={proc.returncode}"
+        raise RuntimeError(detail)
+
+    return _parse_playwright_probe_stdout(stdout) if stdout else {}
+
+
+def _auto_check_team_member_count(timeout_seconds: float = 30, retries: int = 2) -> int:
+    """Return Team member count via a killable subprocess probe; -1 means unknown."""
+
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            result = _run_playwright_probe("team-member-count", timeout_seconds=timeout_seconds)
+        except TimeoutError:
+            if attempt < retries:
+                logger.warning(
+                    "[巡检] Team 人数探针超时（>%ss），准备重试第 %d/%d 次",
+                    timeout_seconds,
+                    attempt + 1,
+                    retries,
+                )
+                continue
+            logger.warning("[巡检] Team 人数探针超时（>%ss，已重试 %d 次），本轮视为未知", timeout_seconds, retries)
+            return -1
+        except Exception as exc:
+            logger.warning("[巡检] Team 人数探针失败: %s", exc)
+            return -1
+
+        try:
+            return int(result.get("count", -1))
+        except Exception:
+            return -1
+
+
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, load_accounts
@@ -2938,6 +3055,7 @@ def _auto_check_loop():
 
         try:
             cfg = _auto_check_config  # 重新读取
+            log_runtime_resource_snapshot(logger, label="auto-check")
             accounts = load_accounts()
             active = [
                 a
@@ -3003,6 +3121,16 @@ def _auto_check_loop():
                         logger.warning("[巡检] OAuth backoff 检查异常: %s,按原逻辑继续", exc)
 
                     if backoff_triggered:
+                        continue
+
+                    actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
+                    if actual_team_count >= TEAM_SUB_ACCOUNT_HARD_CAP + 1:
+                        logger.info(
+                            "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
+                            len(active),
+                            TEAM_SUB_ACCOUNT_HARD_CAP,
+                            actual_team_count,
+                        )
                         continue
 
                     if not _playwright_lock.acquire(blocking=False):

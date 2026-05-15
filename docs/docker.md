@@ -21,6 +21,20 @@ docker compose restart
 docker compose down
 ```
 
+当前 `docker-compose.yml` 默认启用以下运行时加固：
+
+- `init: true`：容器内启用 init/reaper，帮助回收 Chromium / Playwright 子进程。
+- `shm_size: "1gb"`：提高 `/dev/shm`，降低 Chromium 在 Docker 默认 64MB shm 下崩溃的概率。
+- `mem_limit: "2g"` / `pids_limit: 768`：给浏览器和后台任务设置硬边界，避免异常增长拖垮宿主机。
+- `healthcheck`：通过 `http://127.0.0.1:8787/api/version` 检查真实 API 可用性。
+- `AUTOTEAM_MEMORY_WARN_RATIO` / `AUTOTEAM_ZOMBIE_WARN_THRESHOLD`：控制运行时资源告警阈值。
+
+运行时默认启用与 `autoteam-1` 对齐的轻量 Team API transport：
+
+- 默认 `CHATGPT_API_TRANSPORT=auto`，Team backend API 读取会先尝试 HTTP transport；如果返回 Cloudflare/HTML/challenge 或鉴权异常，会回退 Playwright。
+- 显式设置 `CHATGPT_API_TRANSPORT=playwright` 时，可强制恢复旧的浏览器上下文 fetch 行为。
+- 该选项只影响管理员 Team API 读写；free 帐号注册、Personal OAuth、验证码、workspace UI 选择必须继续强制真实浏览器上下文。
+
 ## 数据持久化
 
 所有运行数据都存储在 `data/` 目录，通过 volume 挂载到容器：
@@ -43,6 +57,24 @@ docker compose down
 docker build -t autoteam .
 docker run -d -p 8787:8787 -v $(pwd)/data:/app/data autoteam
 ```
+
+### 快速增量镜像
+
+首次完整构建后，本仓库提供 `Dockerfile.fast` 用于本地快速迭代。它复用 `autoteam:latest` 中已经安装好的系统依赖、uv 和 Playwright Chromium，只覆盖 Python 依赖与源码。
+
+```bash
+# 先确保有稳定基础镜像
+GIT_SHA=$(git rev-parse --short HEAD) \
+BUILD_TIME=$(date -u +%FT%TZ) \
+docker build -t autoteam:latest .
+
+# 后续本地快速迭代
+GIT_SHA=$(git rev-parse --short HEAD) \
+BUILD_TIME=$(date -u +%FT%TZ) \
+docker build -f Dockerfile.fast -t autoteam:fast .
+```
+
+`Dockerfile.fast` 仅用于开发迭代，不替代首次完整构建；如果系统依赖、Playwright 版本、基础镜像或 `uv.lock` 出现难以解释的问题，回到标准 `Dockerfile` 做 `--no-cache` 构建。
 
 ## 配置方式
 
@@ -83,6 +115,24 @@ docker compose logs
 通常是：
 - 配置缺失
 - CloudMail / CPA 连通性验证失败
+- entrypoint self-check 发现镜像代码与契约符号不一致
+- `/api/version` healthcheck 持续失败
+
+查看健康状态：
+
+```bash
+docker compose ps
+docker inspect --format '{{json .State.Health}}' autoteam-autoteam-1 | python -m json.tool
+```
+
+查看资源占用和 PID 数：
+
+```bash
+docker stats
+docker compose top
+```
+
+如果日志出现 `[资源] ... browser zombie processes=...`，优先确认 compose 中 `init: true` 仍然存在；如果出现 memory usage warning，先减少并发注册/轮转，再考虑调大 `mem_limit`。
 
 ### `data` 目录没有写权限
 
@@ -158,7 +208,7 @@ docker image inspect autoteam-autoteam --format '{{json .Config.Labels}}'
 docker compose logs autoteam | head -20
 # 期望看到:
 # [self-check] verifying critical imports...
-# [self-check] OK: 11 critical symbols imported.
+# [self-check] OK: 15 critical symbols imported.
 # [self-check] passed.
 ```
 

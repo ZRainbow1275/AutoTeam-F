@@ -1,0 +1,29 @@
+# Incremental build: reuse the stable image with system deps, uv, and Playwright Chromium.
+FROM autoteam:latest
+
+WORKDIR /app
+
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.created="${BUILD_TIME}"
+ENV AUTOTEAM_GIT_SHA="${GIT_SHA}"
+ENV AUTOTEAM_BUILD_TIME="${BUILD_TIME}"
+
+# Update Python dependencies only when the lockfile or project metadata changes.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --no-dev
+
+# Overlay the latest app code.
+COPY src/ src/
+COPY web/ web/
+
+# Preserve the regular entrypoint self-check and make the script Linux-safe.
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
+
+ENV DISPLAY=:99
+EXPOSE 8787
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["api"]

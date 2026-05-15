@@ -18,7 +18,9 @@ from autoteam.admin_state import (
     get_chatgpt_workspace_name,
     update_admin_state,
 )
+from autoteam.chatgpt_transport import build_chatgpt_transport
 from autoteam.config import get_playwright_launch_options
+from autoteam.playwright_lifecycle import close_playwright_objects
 from autoteam.textio import read_text
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,8 @@ class ChatGPTTeamAPI:
         self.login_email = None
         self.login_password = None
         self.workspace_options_cache = []
+        self.http_transport = None
+        self.transport_name = None
 
     def _visible_locator_in_frames(self, selectors, timeout_ms=5000):
         selector = ", ".join(selectors)
@@ -115,13 +119,20 @@ class ChatGPTTeamAPI:
 
     def _launch_browser(self):
         SCREENSHOT_DIR.mkdir(exist_ok=True)
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(**get_playwright_launch_options())
-        self.context = self.browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        self.page = self.context.new_page()
+        if self.playwright or self.browser or self.context or self.page:
+            self.stop()
+
+        try:
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(**get_playwright_launch_options())
+            self.context = self.browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            )
+            self.page = self.context.new_page()
+        except Exception:
+            self.stop()
+            raise
 
     def _log_login_state(self, label):
         try:
@@ -1166,15 +1177,82 @@ class ChatGPTTeamAPI:
         self.workspace_name = get_chatgpt_workspace_name()
         self.start_with_session(session_token, self.account_id, self.workspace_name)
 
-    def start_with_session(self, session_token, account_id, workspace_name=""):
-        """用指定的 session/account 启动浏览器上下文。"""
-        if not session_token:
-            raise FileNotFoundError("缺少会话信息")
-        self.account_id = account_id or ""
-        self.workspace_name = workspace_name or ""
-        if not self.account_id:
-            raise RuntimeError("缺少 workspace/account ID")
+    def is_started(self):
+        return bool(self.browser or self.http_transport)
 
+    def _build_api_headers(self, include_auth=True):
+        raw_headers = {
+            "Content-Type": "application/json",
+            "chatgpt-account-id": self.account_id,
+            "oai-device-id": self.oai_device_id,
+            "oai-language": "en-US",
+        }
+        if include_auth and self.access_token:
+            raw_headers["authorization"] = f"Bearer {self.access_token}"
+
+        # Browser fetch headers must be ISO-8859-1 (Latin1). Sanitize here so
+        # Playwright and optional HTTP transports share the Round 11 header fix.
+        headers = {}
+        for key, value in raw_headers.items():
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                value = value.decode("ascii", errors="replace")
+            else:
+                value = str(value)
+            sanitized = value.encode("latin-1", errors="replace").decode("latin-1")
+            if sanitized != value:
+                logger.warning(
+                    "[ChatGPT] _api_fetch header %s 含非 ISO-8859-1 字符已被替换: %r -> %r",
+                    key,
+                    value[:60],
+                    sanitized[:60],
+                )
+            headers[key] = sanitized
+        return headers
+
+    def _start_transport_session(self, session_token):
+        self.http_transport = build_chatgpt_transport(
+            session_token=session_token,
+            account_id=self.account_id,
+            oai_device_id=self.oai_device_id,
+        )
+        if self.http_transport:
+            self.transport_name = getattr(self.http_transport, "name", "curl_cffi")
+            logger.info("[ChatGPT] Team API transport: %s", self.transport_name)
+            return True
+        return False
+
+    @staticmethod
+    def _transport_body_looks_like_html(body):
+        text = str(body or "").lower()
+        return "<html" in text or "<!doctype" in text or "<body" in text
+
+    def _transport_response_requires_browser_fallback(self, response):
+        if not isinstance(response, dict):
+            return True
+
+        status = int(response.get("status") or 0)
+        body = response.get("body", "")
+        if status <= 0 or status >= 500:
+            return True
+        if not self._transport_body_looks_like_html(body):
+            return False
+
+        lower = str(body or "").lower()
+        return any(
+            marker in lower
+            for marker in (
+                "verify you are human",
+                "cloudflare",
+                "challenge",
+                "auth/login",
+                "log in",
+                "unable to load site",
+            )
+        )
+
+    def _start_browser_session(self, session_token):
         self._launch_browser()
         logger.info("[ChatGPT] 访问 chatgpt.com 过 Cloudflare...")
         self.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
@@ -1183,6 +1261,103 @@ class ChatGPTTeamAPI:
         self._inject_session(session_token)
         self._fetch_access_token()
         self._auto_detect_workspace()
+
+    def _ensure_browser_session(self):
+        if self.browser:
+            return
+        if not self.session_token:
+            raise RuntimeError("缺少 session_token，无法回退到 Playwright transport")
+        self._start_browser_session(self.session_token)
+
+    def _fetch_access_token_via_transport(self, allow_bearer_file=True):
+        if not getattr(self, "http_transport", None):
+            return None
+
+        try:
+            result = self.http_transport.request(
+                "GET",
+                "/api/auth/session",
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "oai-device-id": self.oai_device_id,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] curl_cffi 获取 access token 失败: %s", exc)
+            result = None
+
+        if result and int(result.get("status") or 0) == 200:
+            try:
+                data = json.loads(result.get("body") or "{}")
+            except Exception:
+                data = {}
+            if "accessToken" in data:
+                self.access_token = data["accessToken"]
+                logger.info("[ChatGPT] 已通过 curl_cffi 获取 access token")
+                return "curl_cffi"
+
+        if allow_bearer_file:
+            bearer_file = BASE_DIR / "bearer_token"
+            if bearer_file.exists():
+                self.access_token = read_text(bearer_file).strip()
+                logger.info("[ChatGPT] 从 bearer_token 文件加载 access token")
+                return "file"
+
+        return None
+
+    def _auto_detect_workspace_via_transport(self):
+        if self.workspace_name or not getattr(self, "http_transport", None) or not self.account_id:
+            return self.workspace_name
+
+        try:
+            result = self.http_transport.request(
+                "GET",
+                f"/backend-api/accounts/{self.account_id}/settings",
+                headers=self._build_api_headers(),
+            )
+        except Exception as exc:
+            logger.warning("[ChatGPT] curl_cffi 自动检测 workspace 失败: %s", exc)
+            return ""
+
+        if int(result.get("status") or 0) != 200:
+            return ""
+
+        try:
+            data = json.loads(result.get("body") or "{}")
+        except Exception:
+            return ""
+
+        workspace_name = (data or {}).get("workspace_name", "") if isinstance(data, dict) else ""
+        if workspace_name:
+            self.workspace_name = workspace_name
+            update_admin_state(workspace_name=self.workspace_name, account_id=self.account_id)
+            logger.info("[ChatGPT] 自动检测到 workspace 名称: %s", self.workspace_name)
+        return self.workspace_name
+
+    def start_with_session(self, session_token, account_id, workspace_name="", require_browser=False):
+        """用指定的 session/account 启动浏览器上下文。"""
+        if not session_token:
+            raise FileNotFoundError("缺少会话信息")
+        self.stop()
+        self.account_id = account_id or ""
+        self.workspace_name = workspace_name or ""
+        self.session_token = session_token
+        self.access_token = None
+        if not self.account_id:
+            raise RuntimeError("缺少 workspace/account ID")
+
+        if not require_browser and self._start_transport_session(session_token):
+            token_source = self._fetch_access_token_via_transport()
+            if token_source:
+                self._auto_detect_workspace_via_transport()
+                return
+            logger.warning("[ChatGPT] curl_cffi 未能直接获取 access token，回退 Playwright transport")
+            if getattr(self, "http_transport", None):
+                self.http_transport.close()
+            self.http_transport = None
+            self.transport_name = None
+
+        self._start_browser_session(session_token)
 
     def _auto_detect_workspace(self):
         if self.workspace_name:
@@ -1274,39 +1449,9 @@ class ChatGPTTeamAPI:
             logger.warning("[ChatGPT] 未能获取 access token，将尝试无 token 调用")
             return None
 
-    def _api_fetch(self, method, path, body=None):
-        raw_headers = {
-            "Content-Type": "application/json",
-            "chatgpt-account-id": self.account_id,
-            "oai-device-id": self.oai_device_id,
-            "oai-language": "en-US",
-        }
-        if self.access_token:
-            raw_headers["authorization"] = f"Bearer {self.access_token}"
-
-        # Round 11 patch — fetch RequestInit headers 必须 ISO-8859-1 (Latin1)。
-        # 任何 None / bytes / 含 unicode 的 value 都 sanitize,避免 Browser fetch 抛
-        # "String contains non ISO-8859-1 code point"。
-        # 见 prompts/issues1.md / Round 11 task PRD。
-        headers_js = {}
-        for k, v in raw_headers.items():
-            if v is None:
-                # null header value 直接 skip(避免传 "None" 字符串到 fetch)
-                continue
-            if isinstance(v, bytes):
-                v = v.decode("ascii", errors="replace")
-            else:
-                v = str(v)
-            sanitized = v.encode("latin-1", errors="replace").decode("latin-1")
-            if sanitized != v:
-                logger.warning(
-                    "[ChatGPT] _api_fetch header %s 含非 ISO-8859-1 字符已被替换: %r -> %r",
-                    k,
-                    v[:60],
-                    sanitized[:60],
-                )
-            headers_js[k] = sanitized
-
+    def _browser_api_fetch(self, method, path, body=None):
+        if not self.page:
+            raise RuntimeError("Playwright 页面未初始化")
         js_code = """async ([method, url, headers, body]) => {
             try {
                 const opts = { method, headers };
@@ -1321,8 +1466,57 @@ class ChatGPTTeamAPI:
 
         return self.page.evaluate(
             js_code,
-            [method, f"https://chatgpt.com{path}", headers_js, json.dumps(body) if body else None],
+            [method, f"https://chatgpt.com{path}", self._build_api_headers(), json.dumps(body) if body else None],
         )
+
+    def _direct_api_fetch(self, method, path, body=None):
+        if not getattr(self, "http_transport", None):
+            raise RuntimeError("curl_cffi transport 未初始化")
+
+        response = self.http_transport.request(
+            method,
+            path,
+            headers=self._build_api_headers(),
+            body=body,
+        )
+        status = int(response.get("status") or 0)
+        body_text = str(response.get("body") or "")
+        lower_body = body_text.lower()
+
+        if status == 401 and path != "/api/auth/session":
+            refreshed = self._fetch_access_token_via_transport(allow_bearer_file=False)
+            if refreshed:
+                response = self.http_transport.request(
+                    method,
+                    path,
+                    headers=self._build_api_headers(),
+                    body=body,
+                )
+                status = int(response.get("status") or 0)
+                body_text = str(response.get("body") or "")
+                lower_body = body_text.lower()
+
+        if self._transport_response_requires_browser_fallback(response):
+            logger.warning("[ChatGPT] curl_cffi 返回异常响应，回退 Playwright transport")
+            self._ensure_browser_session()
+            return self._browser_api_fetch(method, path, body)
+
+        if status == 401 and (
+            "access token is missing" in lower_body or self._transport_body_looks_like_html(body_text)
+        ):
+            logger.warning("[ChatGPT] curl_cffi 鉴权异常，回退 Playwright transport")
+            self._ensure_browser_session()
+            return self._browser_api_fetch(method, path, body)
+
+        return response
+
+    def _api_fetch(self, method, path, body=None):
+        if getattr(self, "http_transport", None):
+            return self._direct_api_fetch(method, path, body)
+
+        if not self.page and self.session_token:
+            self._ensure_browser_session()
+        return self._browser_api_fetch(method, path, body)
 
     # POST /invites 失败时的重试间隔(秒)。rate_limited / network 类错误按此序列退避。
     _INVITE_POST_RETRY_DELAYS = (5, 15)
@@ -1583,16 +1777,21 @@ class ChatGPTTeamAPI:
 
     def stop(self):
         try:
-            if self.browser:
-                self.browser.close()
+            if getattr(self, "http_transport", None):
+                self.http_transport.close()
         except Exception:
             pass
-        try:
-            if self.playwright:
-                self.playwright.stop()
-        except Exception:
-            pass
+        close_playwright_objects(
+            page=self.page,
+            context=self.context,
+            browser=self.browser,
+            playwright=self.playwright,
+            logger=logger,
+            label="ChatGPTTeamAPI.stop",
+        )
         self.browser = None
         self.context = None
         self.page = None
         self.playwright = None
+        self.http_transport = None
+        self.transport_name = None

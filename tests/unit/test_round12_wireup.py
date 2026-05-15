@@ -52,8 +52,8 @@ def isolated_pool(tmp_path: Path, monkeypatch):
     project state.json (which would back-fill an "active" workspace with
     the production account_id).
     """
-    from autoteam import workspace_pool as wp
     from autoteam import admin_state as ast
+    from autoteam import workspace_pool as wp
 
     tmp_pool = tmp_path / "workspaces.json"
     monkeypatch.setattr(wp.default_pool, "_path", tmp_pool, raising=False)
@@ -258,10 +258,10 @@ class TestC2WorkspacePoolWireUp:
         out1 = mh_mod._apply_master_degraded_classification(
             workspace_id="acc-a", chatgpt_api=api_stub,
         )
-        out2 = mh_mod._apply_master_degraded_classification(
+        mh_mod._apply_master_degraded_classification(
             workspace_id="acc-a", chatgpt_api=api_stub,
         )
-        out3 = mh_mod._apply_master_degraded_classification(
+        mh_mod._apply_master_degraded_classification(
             workspace_id="acc-a", chatgpt_api=api_stub,
         )
 
@@ -427,7 +427,7 @@ class TestM3RegisterPathRotator:
     def test_create_account_direct_accepts_path_rotator(self, monkeypatch):
         """create_account_direct(path_rotator=...) 走 rotator 分支,
         rotator 内部的 action 收到 mail_client 后调用旧路径."""
-        from autoteam.mail.register_dual_path import RegisterPathRotator, RegisterPathExhausted
+        from autoteam.mail.register_dual_path import RegisterPathRotator
 
         # All strategies raise OTP_TIMEOUT-classified failure to ensure rotator
         # iterates all strategies → eventually raises RegisterPathExhausted.
@@ -460,8 +460,8 @@ class TestM3RegisterPathRotator:
     def test_rotator_classify_failure_triggers_provider_switch(self):
         """OTP_TIMEOUT 命中 → should_rotate_on=True → 切下一 provider."""
         from autoteam.mail.register_dual_path import (
-            classify_register_failure,
             RegisterFailureType,
+            classify_register_failure,
             should_rotate_on,
         )
 
@@ -478,9 +478,7 @@ class TestM4MailRoute:
         """acc.mail_provider="addy_io" → _resolve_provider_factory 被调."""
         from autoteam import mail as mail_pkg
 
-        # Track resolver calls
         resolved: list[str] = []
-        original = getattr(mail_pkg, "_resolve_provider_factory")
 
         class _StubClient:
             def __init__(self):

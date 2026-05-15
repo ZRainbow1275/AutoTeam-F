@@ -16,6 +16,8 @@ so we mock that boundary, not OpenAI APIs.
 """
 from __future__ import annotations
 
+import random
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -24,7 +26,13 @@ import pytest
 from autoteam import accounts as accounts_mod
 from autoteam import manager as manager_mod
 from autoteam.account_state import default_machine
-from autoteam.signup_profile import SignupProfile, generate_signup_profile
+from autoteam.signup_profile import (
+    MAX_SIGNUP_AGE,
+    MIN_SIGNUP_AGE,
+    SignupProfile,
+    calculate_age,
+    generate_signup_profile,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +67,13 @@ class TestSignupProfile:
             assert key in profile.birthday and profile.birthday[key]
         # age is non-empty string
         assert profile.age and isinstance(profile.age, str)
+
+    def test_generate_signup_profile_derives_age_from_birthday(self):
+        today = date(2026, 5, 15)
+        profile = generate_signup_profile(today=today, rng=random.Random(7))
+
+        assert profile.age == str(calculate_age(profile.birth_date, today))
+        assert MIN_SIGNUP_AGE <= int(profile.age) <= MAX_SIGNUP_AGE
 
     def test_birthday_text_format_for_logs(self):
         profile = SignupProfile(

@@ -154,10 +154,10 @@ AUTH_REPAIR_HARD_FAILURE_TYPES = frozenset({"human_verification"})
 
 
 def _chatgpt_session_ready(chatgpt_api) -> bool:
-    """判断 chatgpt_api 是否处于"已启动浏览器"状态(上游 `.upstream/manager.py:84`)。
+    """判断 chatgpt_api 是否处于可用 Team API session 状态。
 
-    本地 ChatGPTTeamAPI 没有 `is_started()` 方法,但有 `browser` 属性。getattr 容错
-    保证未来上游加 `is_started()` 时自动适配。
+    `CHATGPT_API_TRANSPORT=auto` 时可能只有 HTTP transport 而没有 browser，
+    因此生命周期判断必须优先使用 `is_started()`，再回退到旧的 browser 字段。
     """
     if not chatgpt_api:
         return False
@@ -661,7 +661,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
         return result
 
     need_stop = False
-    if not chatgpt_api or not getattr(chatgpt_api, "browser", None):
+    if not chatgpt_api or not _chatgpt_session_ready(chatgpt_api):
         try:
             chatgpt_api = ChatGPTTeamAPI()
             chatgpt_api.start()
@@ -975,7 +975,7 @@ def sync_account_states(chatgpt_api=None):
 
     # 获取 Team 实际成员
     need_stop = False
-    if not chatgpt_api or not chatgpt_api.browser:
+    if not chatgpt_api or not _chatgpt_session_ready(chatgpt_api):
         try:
             chatgpt_api = ChatGPTTeamAPI()
             chatgpt_api.start()
@@ -1529,7 +1529,7 @@ def cmd_check(include_standby: bool = False):
         except Exception as exc:
             logger.warning("[检查] pending 对账失败，跳过本轮清理: %s", exc)
         finally:
-            if chatgpt and chatgpt.browser:
+            if chatgpt:
                 chatgpt.stop()
 
         if deleted_pending:
@@ -2752,7 +2752,7 @@ def _is_email_in_team(email):
         logger.warning("[直接注册] 检查 Team 成员失败: %s", exc)
         return False
     finally:
-        if chatgpt and chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
 
 
@@ -3727,7 +3727,7 @@ def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, 
     # 先检查 pending invites
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
 
-    if chatgpt_api and chatgpt_api.browser:
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         logger.info("[创建] 先检查 pending invites...")
         completed = _check_pending_invites(
             chatgpt_api,
@@ -3741,7 +3741,7 @@ def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, 
 
     # 直接注册模式（不需要邀请）
     logger.info("[创建] 使用直接注册模式...")
-    if chatgpt_api and chatgpt_api.browser:
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.stop()
     return create_account_direct(
         mail_client,
@@ -3775,7 +3775,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     def _cleanup_team_leftover(reason):
         """OAuth 失败/plan 不对时,兜底 kick 账号,避免假 standby。"""
         try:
-            if not chatgpt_api.browser:
+            if not _chatgpt_session_ready(chatgpt_api):
                 chatgpt_api.start()
             kick_status = remove_from_team(chatgpt_api, email, return_status=True)
             if kick_status == "removed":
@@ -4138,7 +4138,7 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
             continue
 
         logger.info("[替换] 尝试复用 standby: %s", cand_email)
-        if not chatgpt.browser:
+        if not _chatgpt_session_ready(chatgpt):
             chatgpt.start()
         if reinvite_account(chatgpt, mail_client, acc):
             outcome["filled_by"] = cand_email
@@ -4149,7 +4149,7 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
 
     # 4. 无可复用 standby → 创建新号
     logger.info("[替换] 无可复用 standby,创建新号补位...")
-    if not chatgpt.browser:
+    if not _chatgpt_session_ready(chatgpt):
         chatgpt.start()
     try:
         new_email = create_new_account(chatgpt, mail_client)
@@ -4180,7 +4180,7 @@ def cmd_replace_one(email, reason=""):
     try:
         return _replace_single(chatgpt, mail_client, email, reason=reason)
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
         try:
             sync_to_cpa()
@@ -4204,7 +4204,7 @@ def cmd_replace_batch(emails, trigger=""):
     try:
         for email in emails:
             try:
-                if not chatgpt.browser:
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 out = _replace_single(chatgpt, mail_client, email, reason=trigger or "batch")
                 outcomes.append({"email": email, **out})
@@ -4212,7 +4212,7 @@ def cmd_replace_batch(emails, trigger=""):
                 logger.error("[替换] %s 单个替换抛异常: %s", email, exc)
                 outcomes.append({"email": email, "kicked": False, "filled_by": None, "error": f"exception: {exc}"})
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
         try:
             sync_to_cpa()
@@ -4410,7 +4410,7 @@ def cmd_rotate(target_seats=5):
 
     def ensure_chatgpt():
         nonlocal chatgpt
-        if not chatgpt or not chatgpt.browser:
+        if not chatgpt or not _chatgpt_session_ready(chatgpt):
             chatgpt = ChatGPTTeamAPI()
             chatgpt.start()
         return chatgpt
@@ -4501,7 +4501,7 @@ def cmd_rotate(target_seats=5):
                     preempt_candidates.append(acc)
             if preempt_candidates:
                 logger.info("[2.5/5] 预测式抢先替换 %d 个即将耗尽的账号...", len(preempt_candidates))
-                if not chatgpt or not chatgpt.browser:
+                if not chatgpt or not _chatgpt_session_ready(chatgpt):
                     ensure_chatgpt()
                 for acc in preempt_candidates:
                     email = acc["email"]
@@ -4530,7 +4530,7 @@ def cmd_rotate(target_seats=5):
             initial_api_count = get_team_member_count(chatgpt)
             for acc in all_exhausted:
                 email = acc["email"]
-                if not chatgpt.browser:
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 remove_status = remove_from_team(chatgpt, email, return_status=True)
                 if remove_status in ("removed", "already_absent"):
@@ -4543,7 +4543,7 @@ def cmd_rotate(target_seats=5):
                         logger.info("[3/5] %s → standby（远端已不存在）", email)
         else:
             logger.info("[3/5] 无需移出账号")
-        if not chatgpt or not chatgpt.browser:
+        if not chatgpt or not _chatgpt_session_ready(chatgpt):
             ensure_chatgpt()
         api_count = get_team_member_count(chatgpt)
         logger.info(
@@ -4623,7 +4623,7 @@ def cmd_rotate(target_seats=5):
         candidates = list(standby_list)
 
         def _chatgpt_provider():
-            if not chatgpt or not chatgpt.browser:
+            if not chatgpt or not _chatgpt_session_ready(chatgpt):
                 ensure_chatgpt()
             return chatgpt
 
@@ -4743,12 +4743,12 @@ def cmd_rotate(target_seats=5):
                     logger.warning("[轮转] 收到取消请求,已创建 %d/%d 个新号", i, remaining)
                     break
                 logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
-                if not chatgpt or not chatgpt.browser:
+                if not chatgpt or not _chatgpt_session_ready(chatgpt):
                     ensure_chatgpt()
                 if create_new_account(chatgpt, ensure_mail()):
                     current_count += 1
 
-        if not chatgpt or not chatgpt.browser:
+        if not chatgpt or not _chatgpt_session_ready(chatgpt):
             ensure_chatgpt()
         final_count = get_team_member_count(chatgpt)
         # 双指标终止条件 (Round 12 S3 cherry-pick, 上游 `.upstream/manager.py` 终止条件):
@@ -4775,7 +4775,7 @@ def cmd_rotate(target_seats=5):
             )
 
     finally:
-        if chatgpt and chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
         # 所有操作完成后统一同步 CPA，避免中途同步导致 CPA 不可用
         logger.info("[轮转] 轮转完成，同步 CPA...")
@@ -4813,7 +4813,7 @@ def cmd_add():
         else:
             logger.error("[添加] 添加失败")
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
 
 
@@ -5100,8 +5100,8 @@ def cmd_fill(target=5, leave_workspace=False):
                     logger.info("[填充] 跳过旧账号: %s（%s）", email, skip_reason)
                     continue
                 logger.info("[填充] 复用旧账号: %s", email)
-                # 确保 chatgpt 浏览器可用
-                if not chatgpt.browser:
+                # 确保 Team API session 可用；auto transport 不一定有 browser。
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 added = reinvite_account(chatgpt, mail_client, reusable)
                 if added:
@@ -5111,7 +5111,7 @@ def cmd_fill(target=5, leave_workspace=False):
             if not added:
                 # 创建新账号
                 logger.info("[填充] 创建新账号...")
-                if not chatgpt.browser:
+                if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 added = create_new_account(chatgpt, mail_client)
 
@@ -5119,7 +5119,7 @@ def cmd_fill(target=5, leave_workspace=False):
                 logger.warning("[填充] 本轮补位失败，第 %d/%d 个空缺仍未填上", i + 1, need)
 
             # 验证成员数
-            if not chatgpt.browser:
+            if not _chatgpt_session_ready(chatgpt):
                 chatgpt.start()
             new_count = get_team_member_count(chatgpt)
             if new_count >= 0:
@@ -5130,7 +5130,7 @@ def cmd_fill(target=5, leave_workspace=False):
         cmd_status()
 
     finally:
-        if chatgpt.browser:
+        if chatgpt:
             chatgpt.stop()
 
 
@@ -5314,13 +5314,13 @@ def _cmd_fill_personal(count):
     chatgpt = [None]
 
     def _ensure_chatgpt():
-        if not chatgpt[0] or not chatgpt[0].browser:
+        if not chatgpt[0] or not _chatgpt_session_ready(chatgpt[0]):
             chatgpt[0] = ChatGPTTeamAPI()
             chatgpt[0].start()
         return chatgpt[0]
 
     def _stop_chatgpt():
-        if chatgpt[0] and chatgpt[0].browser:
+        if chatgpt[0]:
             try:
                 chatgpt[0].stop()
             except Exception as exc:

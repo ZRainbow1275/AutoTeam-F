@@ -5,8 +5,23 @@ services:
       args:
         GIT_SHA: ${GIT_SHA:-unknown}
         BUILD_TIME: ${BUILD_TIME:-unknown}
+    init: true
+    shm_size: "1gb"
+    mem_limit: "2g"
+    memswap_limit: "2g"
+    pids_limit: 768
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      AUTOTEAM_MEMORY_WARN_RATIO: "0.85"
+      AUTOTEAM_ZOMBIE_WARN_THRESHOLD: "5"
     ports:
       - "8787:8787"
     volumes:
       - ./data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/api/version >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
     restart: unless-stopped
