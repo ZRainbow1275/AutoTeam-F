@@ -4,7 +4,7 @@
 
 ### 1. Scope / Trigger
 
-- Trigger: any change that touches Docker runtime settings, Playwright lifecycle management, runtime resource probes, background browser probes, or `CHATGPT_API_TRANSPORT`.
+- Trigger: any change that touches Docker runtime settings, Playwright lifecycle management, runtime resource probes, background browser probes, `CHATGPT_API_TRANSPORT`, or per-account IPv6 proxy isolation.
 - Goal: keep browser automation bounded and observable without changing the free-account registration main flow.
 - Applies to:
   - `docker-compose.yml`
@@ -13,8 +13,11 @@
   - `src/autoteam/runtime_resources.py`
   - `src/autoteam/playwright_lifecycle.py`
   - `src/autoteam/playwright_probe.py`
+  - `src/autoteam/ipv6_pool.py`
+  - `src/autoteam/ipv6_proxy.py`
   - `src/autoteam/chatgpt_transport.py`
   - `src/autoteam/chatgpt_api.py`
+  - `src/autoteam/cpa_sync.py`
   - `src/autoteam/api.py`
 
 ### 2. Signatures
@@ -25,7 +28,12 @@
 - `python -m autoteam.playwright_probe team-member-count`
 - `ChatGPTTeamAPI.start_with_session(session_token, account_id, workspace_name="", require_browser=False)`
 - `ChatGPTTeamAPI.stop() -> None`
-- `build_chatgpt_transport(session_token: str, account_id: str = "", oai_device_id: str = "")`
+- `build_chatgpt_transport(session_token: str, account_id: str = "", oai_device_id: str = "", proxy_url: str | None = None)`
+- `get_chatgpt_http_proxy_url(proxy_url: str | None = None) -> str`
+- `IPv6Pool.start(active_emails: Iterable[str] | None = None) -> None`
+- `IPv6Pool.ensure_proxy_for_account(email: str) -> tuple[str, str]`
+- `IPv6Pool.release_proxy_for_account(email: str) -> None`
+- `IPv6Pool.status() -> dict[str, Any]`
 
 ### 3. Contracts
 
@@ -42,6 +50,10 @@
   - `CHATGPT_API_TRANSPORT`, default `auto` to match `D:\Desktop\autoteam-1\AutoTeam`
   - `CHATGPT_API_HTTP_TIMEOUT`, default `60`
   - `CHATGPT_API_IMPERSONATE`, default `chrome136`
+  - `AUTOTEAM_IPV6_POOL_ENABLED`, default `false`
+  - `AUTOTEAM_IPV6_POOL_REQUIRED`, default `false`
+  - `IPV6_PREFIX` and `IPV6_IFACE`, required only when the IPv6 pool is enabled
+  - `IPV6_PROXY_*` keys for local listen, public auth URL, allowed IPs, port range, TTL, and pool persistence
 - `CHATGPT_API_TRANSPORT=curl_cffi` or `auto` is allowed only for backend API reads. It must not be used for free registration, Personal OAuth, captcha/challenge flows, or workspace UI selection; those call sites must force `require_browser=True` or launch their own Playwright context.
 - `/api/status` may include `runtime_resources`, but resource collection must never block or fail the status response.
 - Background Team member count probes must run in a killable subprocess and return unknown (`-1`) on timeout/failure.
@@ -50,6 +62,13 @@
 - Direct HTTP API fetches must close and clear the bad `http_transport` before browser fallback when the transport raises, returns HTML/challenge, or fails again after a 401-triggered token refresh retry.
 - Registration and OAuth Playwright call sites must use `close_playwright_objects()` rather than raw `browser.close()`, `context.close()`, or `page.close()`. Direct registration paths need a `try/finally` guard so unexpected page/navigation errors still release page, context, and browser.
 - `SessionCodexAuthFlow.start()` must stop its `ChatGPTTeamAPI` instance if page creation, cookie injection, navigation, or the first `_advance()` fails after `start_with_session(require_browser=True)`.
+- IPv6 proxy isolation is opt-in. Disabled-by-default installs must not create local proxy processes, mutate network state, or require IPv6 kernel configuration.
+- When `AUTOTEAM_IPV6_POOL_REQUIRED=true`, allocation/preflight failure is a hard business/runtime error. Do not silently fall back to direct network access.
+- Account-scoped browser and HTTP transport paths must propagate the allocated local proxy URL into Playwright launch options and `curl_cffi` transport construction. Persisted auth bundles should store the public/auth proxy URL only when one was allocated.
+- Temporary registration proxies must be released when registration, duplicate-email retry, phone/add-phone terminal failure, or post-registration OAuth fails before the account becomes usable.
+- API startup may pre-warm the IPv6 pool only for non-main, non-disabled active accounts. Shutdown must stop pool proxies after Playwright executor cleanup.
+- `/api/status` may include `ipv6_pool`, but IPv6 status collection must never block or fail the status response. Return a diagnostic `ipv6_pool.error` instead of raising a 500.
+- `sync_to_cpa()` must refresh `proxy_url` in auth JSON for active/personal, non-disabled local accounts before upload. In required mode refresh failure must fail the sync; in non-required mode it may warn and upload the existing file.
 
 ### 4. Validation & Error Matrix
 
@@ -70,6 +89,11 @@
 | invite/direct registration or Codex OAuth opens a Playwright page then raises before a normal return | Cleanup must still close page, context, and browser in dependency order |
 | `SessionCodexAuthFlow.start()` fails after creating a `ChatGPTTeamAPI` | Call `stop()` and clear `chatgpt` / `page` fields |
 | `collect_runtime_resource_snapshot()` unexpectedly raises inside `/api/status` | Return a status response with a diagnostic `runtime_resources.error`; do not raise a 500 |
+| IPv6 pool is disabled | Do not start proxies; status should report disabled/no allocations |
+| IPv6 allocation fails while required mode is true | Raise a clear error and do not continue direct |
+| IPv6 allocation fails while required mode is false | Log a warning and continue only through the existing direct-path fallback |
+| IPv6 status collection raises inside `/api/status` | Return a status response with a diagnostic `ipv6_pool.error`; do not raise a 500 |
+| CPA proxy refresh fails while required mode is true | Raise and stop the sync rather than uploading stale direct auth |
 
 ### 5. Good/Base/Bad Cases
 
@@ -79,6 +103,8 @@
 - Bad: guarding `stop()` with `if api.browser` after `auto` transport is enabled; HTTP-only sessions would leak.
 - Bad: keeping a failed `http_transport` after browser fallback; the next `_api_fetch()` would retry the same known-bad transport instead of using the live browser session.
 - Bad: replacing direct registration's final `browser.close()` but leaving unexpected navigation errors outside a `finally` cleanup guard.
+- Bad: adding a proxy URL to saved auth bundles without actually launching browser/API requests through the same account proxy.
+- Bad: treating required-mode IPv6 failures as warnings; this hides pool exhaustion and defeats isolation.
 
 ### 6. Tests Required
 
@@ -91,6 +117,9 @@
   - `tests/unit/test_api_playwright_cleanup.py`
   - `tests/unit/test_round11_session_token_injection.py`
 - Status endpoint integration: `tests/unit/test_api_status.py`
+- IPv6 pool/proxy persistence and strict required-mode behavior: `tests/unit/test_ipv6_pool.py`
+- IPv6 status and status-failure boundary: `tests/unit/test_api_status.py`
+- CPA auth proxy refresh before upload: `tests/unit/test_cpa_sync.py`
 - Free registration regression:
   - `tests/unit/test_round11_personal_oauth_retry.py`
   - `tests/unit/test_round11_session_token_injection.py`
