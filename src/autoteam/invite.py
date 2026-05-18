@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 SCREENSHOT_DIR = "screenshots"
+INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS = max(0, int(os.environ.get("INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS", "2")))
+INVITE_BLANK_PAGE_RECOVERY_WAIT = max(0.0, float(os.environ.get("INVITE_BLANK_PAGE_RECOVERY_WAIT", "3")))
 
 
 class RegisterBlocked(Exception):
@@ -152,6 +154,69 @@ def screenshot(page, name):
     path = f"{SCREENSHOT_DIR}/{name}"
     page.screenshot(path=path, full_page=True)
     logger.debug("[截图] %s", path)
+
+
+def _page_excerpt(page, limit=240):
+    try:
+        return page.inner_text("body")[:limit]
+    except Exception:
+        return ""
+
+
+def _visible_control_count(page, limit=12):
+    try:
+        controls = page.locator('input, button, a, textarea, select, [role="button"]').all()
+    except Exception:
+        return 0
+
+    visible = 0
+    for locator in controls[:limit]:
+        try:
+            if locator.is_visible(timeout=250):
+                visible += 1
+        except Exception:
+            continue
+    return visible
+
+
+def _is_probably_blank_page(page):
+    """Return True when the page has no visible text or interactive controls."""
+    if _page_excerpt(page, limit=160).strip():
+        return False
+    return _visible_control_count(page) == 0
+
+
+def _recover_blank_invite_page(page, stage, attempts=INVITE_BLANK_PAGE_RECOVERY_ATTEMPTS):
+    """Reload a post-auth blank page a few times without restarting registration."""
+    recovered = False
+    for attempt in range(1, max(0, int(attempts)) + 1):
+        if not _is_probably_blank_page(page):
+            return recovered
+
+        logger.warning(
+            "[注册] %s 检测到空白页，尝试刷新恢复 (%d/%d) | URL=%s",
+            stage,
+            attempt,
+            attempts,
+            getattr(page, "url", ""),
+        )
+        screenshot(page, f"reg_blank_{stage}_{attempt}_before.png")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            logger.warning("[注册] %s 空白页刷新失败: %s", stage, exc)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        time.sleep(INVITE_BLANK_PAGE_RECOVERY_WAIT)
+        wait_for_cloudflare(page, max_wait=20)
+        screenshot(page, f"reg_blank_{stage}_{attempt}_after.png")
+        recovered = True
+
+    if _is_probably_blank_page(page):
+        logger.warning("[注册] %s 刷新后仍为空白页 | URL=%s", stage, getattr(page, "url", ""))
+    return recovered
 
 
 def find_and_click(page, selectors, label="元素", timeout=3000):
@@ -457,6 +522,7 @@ def register_with_invite(page, invite_link, email, mail_client, password=None, s
         time.sleep(8)
         screenshot(page, "reg_07_after_profile.png")
         assert_not_blocked(page, "profile_submit")
+        _recover_blank_invite_page(page, "after_profile_submit")
 
     # 可能需要接受条款 / 加入 workspace
     find_and_click(
@@ -473,6 +539,7 @@ def register_with_invite(page, invite_link, email, mail_client, password=None, s
         timeout=5000,
     )
     time.sleep(5)
+    _recover_blank_invite_page(page, "final")
     screenshot(page, "reg_08_final.png")
 
     # 检查结果
@@ -480,6 +547,8 @@ def register_with_invite(page, invite_link, email, mail_client, password=None, s
     page_text = page.inner_text("body")[:500].lower()
 
     if "chatgpt.com" in current_url and "auth" not in current_url:
+        if _is_probably_blank_page(page):
+            logger.warning("[注册] 最终页仍为空白，但 URL 已进入 ChatGPT，继续后续 session/cookie 验证 | URL=%s", current_url)
         logger.info("[注册] 注册成功并已加入 workspace!")
         return True, password
     elif "workspace" in page_text or "welcome" in page_text:

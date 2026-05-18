@@ -92,6 +92,54 @@
       </div>
     </div>
 
+    <div class="glass rounded-lg p-4 lg:p-5 space-y-4">
+      <div class="flex items-start justify-between gap-3 flex-wrap">
+        <div class="flex items-start gap-3 min-w-0">
+          <div class="shrink-0 w-10 h-10 rounded-lg border flex items-center justify-center"
+            :class="cliproxyTone.iconWrap">
+            <Activity class="w-4 h-4" :stroke-width="2" />
+          </div>
+          <div class="min-w-0">
+            <div class="text-[10px] uppercase tracking-[0.3em] text-ink-500 font-semibold">
+              CLIProxyAPI Health
+            </div>
+            <h3 class="text-base font-bold tracking-tight mt-0.5" :class="cliproxyTone.titleClass">
+              {{ cliproxyTone.title }}
+            </h3>
+            <p class="text-xs text-ink-500 mt-1 max-w-3xl leading-relaxed">
+              {{ cliproxySubtitle }}
+            </p>
+          </div>
+        </div>
+        <div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold"
+          :class="cliproxyTone.badgeClass">
+          <span class="w-1.5 h-1.5 rounded-full" :class="cliproxyTone.dotClass"></span>
+          {{ cliproxyBadgeText }}
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+        <div v-for="item in cliproxyMetrics" :key="item.label"
+          class="rounded-lg border border-hairline bg-ink-50 px-3 py-2.5">
+          <div class="text-[10px] uppercase tracking-widest text-ink-500 font-semibold">
+            {{ item.label }}
+          </div>
+          <div class="mt-1 text-lg font-bold tabular text-ink-950 truncate">
+            {{ item.value }}
+          </div>
+        </div>
+      </div>
+
+      <div v-if="cliproxyMessage" class="flex items-start gap-2 rounded-lg border px-3 py-2 text-xs"
+        :class="cliproxyHealth?.ok
+          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+          : 'bg-amber-50 border-amber-200 text-amber-800'">
+        <AlertTriangle v-if="!cliproxyHealth?.ok" class="w-3.5 h-3.5 mt-0.5 shrink-0" :stroke-width="2" />
+        <Activity v-else class="w-3.5 h-3.5 mt-0.5 shrink-0" :stroke-width="2" />
+        <span class="min-w-0 break-words">{{ cliproxyMessage }}</span>
+      </div>
+    </div>
+
     <TaskPanel
       mode="pool"
       :running-task="runningTask"
@@ -130,6 +178,7 @@ const minGraceUntil = computed(() => {
 })
 
 const ipv6Pool = computed(() => props.status?.ipv6_pool || null)
+const cliproxyHealth = computed(() => props.status?.cliproxy || null)
 const ipv6Preflight = computed(() => ipv6Pool.value?.preflight || {})
 const ipv6Entries = computed(() => {
   const entries = Array.isArray(ipv6Pool.value?.entries) ? ipv6Pool.value.entries : []
@@ -229,6 +278,72 @@ const ipv6Messages = computed(() => {
   ].slice(0, 4)
 })
 
+const cliproxyTone = computed(() => {
+  const health = cliproxyHealth.value
+  if (!health) {
+    return {
+      title: '未上报',
+      titleClass: 'text-slate-700',
+      iconWrap: 'bg-slate-50 text-slate-700 border-slate-200',
+      badgeClass: 'bg-slate-50 text-slate-700 border-slate-200',
+      dotClass: 'bg-slate-500',
+    }
+  }
+  if (health.ok) {
+    return {
+      title: '可用',
+      titleClass: 'text-emerald-700',
+      iconWrap: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      badgeClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      dotClass: 'bg-emerald-500',
+    }
+  }
+  return {
+    title: '需要处理',
+    titleClass: 'text-amber-700',
+    iconWrap: 'bg-amber-50 text-amber-700 border-amber-200',
+    badgeClass: 'bg-amber-50 text-amber-700 border-amber-200',
+    dotClass: 'bg-amber-500',
+  }
+})
+
+const cliproxyBadgeText = computed(() => {
+  const health = cliproxyHealth.value
+  if (!health) return 'unknown'
+  if (health.cached) return health.ok ? 'cached ok' : 'cached check'
+  return health.ok ? 'ok' : 'check'
+})
+
+const cliproxySubtitle = computed(() => {
+  const health = cliproxyHealth.value
+  if (!health) return '当前 `/api/status` 尚未返回 CLIProxyAPI 健康信息。'
+  if (!health.management_api?.ok) return formatCliproxyReason(health.management_api?.reason || 'management_api_unavailable')
+  if (!health.provider_auth?.ok) return formatCliproxyReason(health.provider_auth?.reason || 'provider_auth_unavailable')
+  return `管理接口可读，Codex provider 有 ${health.provider_auth?.available ?? 0} 个可用认证候选。`
+})
+
+const cliproxyMetrics = computed(() => {
+  const health = cliproxyHealth.value || {}
+  const auth = health.provider_auth || {}
+  const mgmt = health.management_api || {}
+  return [
+    { label: '认证总数', value: String(auth.total ?? 0) },
+    { label: '可用', value: String(auth.available ?? 0) },
+    { label: '禁用', value: String(auth.disabled ?? 0) },
+    { label: '延迟', value: mgmt.latency_ms == null ? '-' : `${mgmt.latency_ms}ms` },
+  ]
+})
+
+const cliproxyMessage = computed(() => {
+  const health = cliproxyHealth.value
+  if (!health) return ''
+  if (health.safe_read_only !== true) return '健康检查必须保持只读，请检查后端实现。'
+  if (health.error) return health.error
+  if (!health.management_api?.ok) return formatCliproxyReason(health.management_api?.reason)
+  if (!health.provider_auth?.ok) return formatCliproxyReason(health.provider_auth?.reason)
+  return '健康检查仅读取管理元数据，不会上传、删除或刷新远端认证文件。'
+})
+
 function firstMessage(values) {
   return Array.isArray(values) && values.length ? formatIpv6Message(values[0]) : ''
 }
@@ -244,6 +359,22 @@ function formatIpv6Message(value) {
     status_unavailable: 'IPv6 pool 状态暂不可用。',
   }
   return labels[value] || String(value || '')
+}
+
+function formatCliproxyReason(value) {
+  const labels = {
+    missing_config: '缺少 CPA_URL 或 CPA_KEY，无法读取 CLIProxyAPI 管理接口。',
+    request_failed: 'CLIProxyAPI 管理接口请求失败。',
+    non_200: 'CLIProxyAPI 管理接口返回非 200 状态。',
+    non_json: 'CLIProxyAPI 管理接口返回非 JSON 内容。',
+    invalid_files_payload: 'CLIProxyAPI 管理接口响应缺少 files 列表。',
+    management_api_unavailable: 'CLIProxyAPI 管理接口不可用。',
+    no_provider_auth: 'CLIProxyAPI 中没有 Codex provider 认证文件。',
+    provider_auth_all_unavailable: 'Codex provider 认证文件全部处于禁用、错误或不可用状态。',
+    provider_auth_has_candidates: 'Codex provider 有可用认证候选。',
+    health_check_exception: 'CLIProxyAPI 健康检查异常。',
+  }
+  return labels[value] || String(value || '状态暂不可用。')
 }
 
 function formatUsage(pool) {

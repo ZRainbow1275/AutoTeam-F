@@ -25,7 +25,7 @@ REQUIRED_CONFIGS = [
         True,
     ),
     # cf_temp_email 字段(provider=cf_temp_email 时必填,api.get_setup_status 按 provider 动态切 optional)
-    ("CLOUDMAIL_BASE_URL", "CloudMail API 地址（cf_temp_email 后端）", "", False),
+    ("CLOUDMAIL_BASE_URL", "CloudMail API 地址（cf_temp_email 后端，必须包含 /api）", "", False),
     ("CLOUDMAIL_PASSWORD", "CloudMail 管理员密码（cf_temp_email 后端）", "", False),
     ("CLOUDMAIL_DOMAIN", "邮箱域名（如 @example.com）", "", False),
     # maillab 字段(SPEC-1 §3.4;provider=maillab 时必填,默认 optional 由 setup_status 动态切换)

@@ -198,7 +198,7 @@ uv run autoteam admin-login --email your-admin@example.com
 ## 第四步：首次轮转
 
 ```bash
-uv run autoteam rotate 5
+uv run autoteam rotate 3
 ```
 
 或在 Web 面板「账号池操作」页点击「智能轮转」。
@@ -212,7 +212,7 @@ uv run autoteam rotate 5
 6. 同步 active 认证文件到 CPA
 
 > **注意：**
-> `rotate 5` / `fill 5` 中的 `5` 指的是 **Team 总人数目标**，不是“本地管理账号数量”。
+> `rotate 3` / `fill 3` 中的 `3` 指的是 **Team 总人数目标**，不是“本地管理账号数量”。当前运行契约最多为 `1 owner + 2 managed children`。
 > 如果 Team 中已经有 owner / 外部成员，它们也会计入总数。
 
 ## 第五步：日常使用
@@ -234,7 +234,7 @@ API 模式下：
 ```bash
 uv run autoteam status      # 查看状态
 uv run autoteam check       # 检查额度
-uv run autoteam rotate 5    # 智能轮转
+uv run autoteam rotate 3    # 智能轮转
 uv run autoteam sync        # 同步到 CPA
 uv run autoteam pull-cpa    # 从 CPA 拉回本地
 ```
@@ -244,7 +244,7 @@ uv run autoteam pull-cpa    # 从 CPA 拉回本地
 ### 添加更多账号
 
 ```bash
-uv run autoteam rotate 8   # 补满到 8 个总席位
+uv run autoteam rotate 3   # 补满到 3 个总席位
 # 或
 uv run autoteam add        # 自动注册并添加一个
 # 或
@@ -254,7 +254,7 @@ uv run autoteam manual-add # 手动 OAuth 导入一个账号
 ### 清理多余账号
 
 ```bash
-uv run autoteam cleanup 5  # 保留 5 个总席位
+uv run autoteam cleanup 3  # 保留 3 个总席位
 ```
 
 ### 从 CPA 恢复认证文件到本地

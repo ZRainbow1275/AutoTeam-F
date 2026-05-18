@@ -139,7 +139,7 @@ Linux + Docker 访问宿主机服务，详见 [Docker 部署文档](docs/docker.
 | 命令 | 说明 |
 |------|------|
 | `api` | 启动 Web 面板 + HTTP API（默认端口 8787） |
-| `rotate [N]` | 智能轮转，补满到 N 个（默认 5） |
+| `rotate [N]` | 智能轮转，补满到 N 个总席位（默认 3，最多 3） |
 | `status` | 查看账号状态 |
 | `check` | 检查额度 |
 | `add` | 添加新账号 |

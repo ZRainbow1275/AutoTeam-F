@@ -54,6 +54,31 @@ def _safe_ipv6_pool_status() -> dict:
         }
 
 
+def _safe_cliproxy_health() -> dict:
+    try:
+        from autoteam.cliproxy_health import get_cliproxy_health
+
+        return get_cliproxy_health()
+    except Exception as exc:
+        logger.warning("[API] CLIProxyAPI health check failed: %s", exc)
+        return {
+            "ok": False,
+            "safe_read_only": True,
+            "management_api": {"ok": False, "reason": "health_check_exception"},
+            "provider_auth": {
+                "ok": False,
+                "provider": "codex",
+                "model": os.environ.get("CLIPROXY_HEALTH_MODEL") or "gpt-5.5",
+                "reason": "health_check_exception",
+                "total": 0,
+                "available": 0,
+                "check_type": "management_metadata",
+                "canary_required": True,
+            },
+            "error": str(exc),
+        }
+
+
 # Round 7 P2.4 — FastAPI 现代 lifespan handler 替代已废弃的 @app.on_event。
 # 启动期:修复 auths 认证文件权限 + 启动 _auto_check_loop 后台线程。
 # 停止期:发 _auto_check_stop 信号让线程优雅退出。
@@ -598,6 +623,228 @@ def _prune_tasks():
             del _tasks[tid]
 
 
+_TASK_VALIDATION_COMMANDS = {"auto-fill", "auto-rotate", "rotate", "cleanup", "fill"}
+_ROTATION_VALIDATION_COMMANDS = {"auto-fill", "auto-rotate", "rotate", "fill"}
+_rotation_validation_cooldown = {
+    "next_rotate_after": 0.0,
+    "recorded_at": 0.0,
+    "severity": "",
+    "reason": "",
+}
+
+
+def _auto_check_int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _validation_reasons(validation: dict | None) -> list[str]:
+    if not isinstance(validation, dict):
+        return []
+    reasons = validation.get("reasons")
+    if isinstance(reasons, list):
+        return [str(item) for item in reasons if str(item)]
+    reason = validation.get("reason")
+    return [str(reason)] if reason else []
+
+
+def _validation_failure_reason(validation: dict | None) -> str:
+    reasons = _validation_reasons(validation)
+    return "; ".join(reasons) if reasons else "unknown"
+
+
+def _validation_is_hard_failure(validation: dict | None) -> bool:
+    if not isinstance(validation, dict):
+        return False
+    if validation.get("severity") == "degraded":
+        return False
+    return not validation.get("ok", True)
+
+
+def _record_rotation_validation_decision(command: str, validation: dict | None) -> None:
+    if command not in _ROTATION_VALIDATION_COMMANDS or not isinstance(validation, dict):
+        return
+
+    severity = str(validation.get("severity") or ("ok" if validation.get("ok", True) else "failed"))
+    if severity == "ok":
+        _rotation_validation_cooldown.update(
+            {
+                "next_rotate_after": 0.0,
+                "recorded_at": time.time(),
+                "severity": "ok",
+                "reason": "",
+            }
+        )
+        return
+
+    seconds = _auto_check_int_env(
+        "AUTO_CHECK_DEGRADED_COOLDOWN_SECONDS" if severity == "degraded" else "AUTO_CHECK_FAILED_COOLDOWN_SECONDS",
+        120 if severity == "degraded" else 300,
+    )
+    now = time.time()
+    next_rotate_after = now + seconds if seconds > 0 else 0.0
+    reason = _validation_failure_reason(validation)
+    _rotation_validation_cooldown.update(
+        {
+            "next_rotate_after": next_rotate_after,
+            "recorded_at": now,
+            "severity": severity,
+            "reason": reason,
+        }
+    )
+    followup = validation.setdefault("followup", {})
+    followup["cooldown_seconds"] = seconds
+    followup["next_eligible_rotation_at"] = next_rotate_after
+
+
+def _rotation_validation_cooldown_remaining() -> float:
+    next_rotate_after = float(_rotation_validation_cooldown.get("next_rotate_after") or 0.0)
+    if next_rotate_after <= 0:
+        return 0.0
+    return max(0.0, next_rotate_after - time.time())
+
+
+def _log_task_runtime_validation(command: str) -> dict | None:
+    """Record post-task runtime truth so completed tasks do not hide broken pool state."""
+    if command not in _TASK_VALIDATION_COMMANDS:
+        return None
+
+    try:
+        from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_INVALID, is_account_disabled, load_accounts
+        from autoteam.codex_auth import check_codex_quota
+        from autoteam.manager import _pool_active_target
+
+        accounts = load_accounts()
+        target_seats = _resolve_auto_check_target_seats(_auto_check_config)
+        pool_target = _pool_active_target(target_seats)
+        team_count = _auto_check_team_member_count(timeout_seconds=20, retries=1)
+
+        active_with_auth = 0
+        auth_pending = 0
+        auth_file_count = 0
+        quota_ok = 0
+        quota_exhausted = 0
+        quota_auth_error = 0
+        quota_unknown = 0
+        primary_pcts: list[int] = []
+
+        for acc in accounts:
+            if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
+                continue
+            status = acc.get("status")
+            auth_path = _resolve_status_auth_file(acc)
+            if status == STATUS_AUTH_INVALID:
+                auth_pending += 1
+            if auth_path:
+                auth_file_count += 1
+            if status != STATUS_ACTIVE or not auth_path:
+                continue
+
+            active_with_auth += 1
+            try:
+                auth_data = json.loads(read_text(Path(auth_path)))
+                access_token = auth_data.get("access_token")
+                if not access_token:
+                    quota_unknown += 1
+                    continue
+                quota_status, info = check_codex_quota(access_token)
+                if quota_status == "ok":
+                    quota_ok += 1
+                elif quota_status == "exhausted":
+                    quota_exhausted += 1
+                elif quota_status == "auth_error":
+                    quota_auth_error += 1
+                else:
+                    quota_unknown += 1
+                if isinstance(info, dict) and isinstance(info.get("primary_pct"), (int, float)):
+                    primary_pcts.append(int(info["primary_pct"]))
+            except Exception:
+                quota_unknown += 1
+
+        logger.info(
+            "[验收] %s 后: team=%s/%s active_with_auth=%d/%d auth_invalid=%d auth_files=%d "
+            "quota_ok=%d exhausted=%d auth_error=%d unknown=%d primary_pct=%s",
+            command,
+            team_count if team_count >= 0 else "unknown",
+            target_seats,
+            active_with_auth,
+            pool_target,
+            auth_pending,
+            auth_file_count,
+            quota_ok,
+            quota_exhausted,
+            quota_auth_error,
+            quota_unknown,
+            ",".join(str(v) for v in primary_pcts[:8]) or "-",
+        )
+        validation = {
+            "ok": True,
+            "severity": "ok",
+            "operation_success": True,
+            "pool_health_ok": True,
+            "followup_required": False,
+            "reasons": [],
+            "team_count": team_count,
+            "target_seats": target_seats,
+            "pool_target": pool_target,
+            "active_with_auth": active_with_auth,
+            "auth_pending": auth_pending,
+            "auth_file_count": auth_file_count,
+            "quota_ok": quota_ok,
+            "quota_exhausted": quota_exhausted,
+            "quota_auth_error": quota_auth_error,
+            "quota_unknown": quota_unknown,
+            "primary_pct": primary_pcts[:8],
+        }
+        hard_reasons: list[str] = []
+        followup_reasons: list[str] = []
+
+        if team_count >= 0 and team_count != target_seats:
+            hard_reasons.append(f"team_count={team_count}/{target_seats}")
+        if active_with_auth < pool_target:
+            hard_reasons.append(f"active_with_auth={active_with_auth}/{pool_target}")
+        if quota_auth_error > 0:
+            hard_reasons.append(f"quota_auth_error={quota_auth_error}")
+        if quota_ok < pool_target:
+            followup_reasons.append(f"quota_ok={quota_ok}/{pool_target}")
+
+        if hard_reasons:
+            validation.update(
+                {
+                    "ok": False,
+                    "severity": "failed",
+                    "operation_success": False,
+                    "pool_health_ok": False,
+                    "followup_required": True,
+                    "reasons": hard_reasons + followup_reasons,
+                    "reason": "; ".join(hard_reasons + followup_reasons),
+                }
+            )
+        elif followup_reasons:
+            validation.update(
+                {
+                    "ok": False,
+                    "severity": "degraded",
+                    "operation_success": True,
+                    "pool_health_ok": False,
+                    "followup_required": True,
+                    "reasons": followup_reasons,
+                    "reason": "; ".join(followup_reasons),
+                    "followup": {
+                        "recommended_command": "rotate",
+                        "reason": "; ".join(followup_reasons),
+                    },
+                }
+            )
+
+        return validation
+    except Exception as exc:
+        logger.warning("[验收] %s 后运行态核查失败: %s", command, exc)
+        return None
+
+
 def _run_task(task_id: str, func, *args, **kwargs):
     """在后台线程中执行任务"""
     from autoteam import cancel_signal
@@ -625,6 +872,13 @@ def _run_task(task_id: str, func, *args, **kwargs):
         logger.error("[API] 任务 %s %s: %s", task_id[:8], task["status"], e)
     finally:
         task["finished_at"] = time.time()
+        validation = _log_task_runtime_validation(task.get("command", ""))
+        if validation is not None:
+            task["validation"] = validation
+            _record_rotation_validation_decision(task.get("command", ""), validation)
+            if task["status"] == "completed" and _validation_is_hard_failure(validation):
+                task["status"] = "failed"
+                task["error"] = f"runtime validation failed: {_validation_failure_reason(validation)}"
         _current_task_id = None
         _playwright_lock.release()
 
@@ -662,7 +916,7 @@ def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
 
 
 class TaskParams(BaseModel):
-    target: int = 5
+    target: int = 3
     leave_workspace: bool = False  # cmd_fill 专用：True 表示生产免费号（注册后退出 Team 走 personal OAuth）
 
 
@@ -1506,6 +1760,8 @@ def post_main_codex_start():
     from autoteam.sync_targets import (
         describe_sync_targets,
         get_enabled_sync_targets,
+    )
+    from autoteam.sync_targets import (
         sync_main_codex_to_configured_targets as sync_main_codex_to_cpa,
     )
 
@@ -2462,6 +2718,11 @@ def get_status():
         "quota_cache": quota_cache,
         "runtime_resources": _safe_runtime_resource_snapshot(),
         "ipv6_pool": _safe_ipv6_pool_status(),
+        "cliproxy": _safe_cliproxy_health(),
+        "rotation_validation": {
+            **_rotation_validation_cooldown,
+            "cooldown_remaining_seconds": int(_rotation_validation_cooldown_remaining()),
+        },
     }
 
 
@@ -2830,7 +3091,12 @@ def post_rotate(params: TaskParams = TaskParams()):
     """智能轮转（后台执行）"""
     from autoteam.manager import cmd_rotate
 
-    task = _start_task("rotate", cmd_rotate, {"target": params.target}, params.target)
+    task = _start_task(
+        "rotate",
+        lambda target: cmd_rotate(target, force_auth_repair=True, background_post_sync=True),
+        {"target": params.target},
+        params.target,
+    )
     return task
 
 
@@ -3111,17 +3377,28 @@ from autoteam.config import (
     AUTO_CHECK_MIN_LOW as _DEFAULT_MIN_LOW,
 )
 from autoteam.config import (
+    AUTO_CHECK_TARGET_SEATS as _DEFAULT_TARGET_SEATS,
+)
+from autoteam.config import (
     AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
 )
 
 # 运行时可修改的巡检配置
 _auto_check_config = {
     "interval": _DEFAULT_INTERVAL,
+    "target_seats": _DEFAULT_TARGET_SEATS,
     "threshold": _DEFAULT_THRESHOLD,
     "min_low": _DEFAULT_MIN_LOW,
 }
 _auto_check_stop = threading.Event()
 _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
+
+
+def _resolve_auto_check_target_seats(cfg: dict[str, int | bool]) -> int:
+    try:
+        return max(1, min(3, int(cfg.get("target_seats", 3))))
+    except Exception:
+        return 3
 
 # auto-fill watchdog 冷却:防止反复触发 cmd_rotate 导致 OpenAI 对短时间内
 # 多次 invite/kick 的子号批量 revoke token。30 分钟内只触发一次,给 OpenAI
@@ -3251,6 +3528,8 @@ def _auto_check_loop():
 
         try:
             cfg = _auto_check_config  # 重新读取
+            target_seats = _resolve_auto_check_target_seats(cfg)
+            sub_account_target = max(0, target_seats - 1)
             log_runtime_resource_snapshot(logger, label="auto-check")
             accounts = load_accounts()
             active = [
@@ -3263,15 +3542,13 @@ def _auto_check_loop():
                 and Path(a["auth_file"]).exists()
             ]
 
-            # Watchdog:active 账号数 < TEAM_SUB_ACCOUNT_HARD_CAP 时自动补位。
-            # 之前的 `if not active: continue` 在 4 个 active 全 kick 进 standby
+            # Watchdog:active 账号数 < 子号目标时自动补位。
+            # 之前的 `if not active: continue` 在 active 全 kick 进 standby
             # 之后会让 Team 永远萎缩。但触发频率必须节制 —— OpenAI 对短时间内反复
             # invite/kick 同一批子号会 revoke token(token_revoked 错误),所以加
             # 30 分钟冷却,避免巡检每 5 分钟无脑触发 cmd_rotate 把账号全洗成废号。
-            from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP
-
             global _auto_fill_last_trigger_ts
-            if len(active) < TEAM_SUB_ACCOUNT_HARD_CAP:
+            if len(active) < sub_account_target:
                 now_ts = time.time()
                 should_start_auto_fill = False
                 cooldown_remaining = (_auto_fill_last_trigger_ts + _AUTO_FILL_COOLDOWN_SECONDS) - now_ts
@@ -3279,14 +3556,14 @@ def _auto_check_loop():
                     logger.info(
                         "[巡检] active=%d < %d,但 auto-fill 冷却中(还剩 %d 分钟)",
                         len(active),
-                        TEAM_SUB_ACCOUNT_HARD_CAP,
+                        sub_account_target,
                         int(cooldown_remaining / 60),
                     )
                     # 冷却期内仍然继续做"低额度替换"(下面的 low_accounts 逻辑),
                     # 只是不触发全量 cmd_rotate。例外:Team 真实人数不足时必须继续补位,
                     # 否则 cooldown 会把实际席位缺口拖到下一轮甚至 4h backoff 之后。
                     actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
-                    if actual_team_count >= TEAM_SUB_ACCOUNT_HARD_CAP + 1:
+                    if actual_team_count >= target_seats:
                         logger.info(
                             "[巡检] auto-fill 冷却中且 Team 实际成员数=%d 已满；本轮只保留低额度替换检查",
                             actual_team_count,
@@ -3295,7 +3572,7 @@ def _auto_check_loop():
                         logger.info(
                             "[巡检] auto-fill 冷却中但 Team 实际成员不足（%d/%d），继续补位",
                             actual_team_count,
-                            TEAM_SUB_ACCOUNT_HARD_CAP + 1,
+                            target_seats,
                         )
                         should_start_auto_fill = True
                     else:
@@ -3327,7 +3604,7 @@ def _auto_check_loop():
                                 "backoff 生效,延长冷却到 4h(避免无谓循环)。"
                                 "请检查 codex_auth consent 页面或 master 订阅",
                                 len(active),
-                                TEAM_SUB_ACCOUNT_HARD_CAP,
+                                sub_account_target,
                                 len(recent_failures),
                             )
                             backoff_triggered = True
@@ -3338,11 +3615,11 @@ def _auto_check_loop():
                         continue
 
                     actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
-                    if actual_team_count >= TEAM_SUB_ACCOUNT_HARD_CAP + 1:
+                    if actual_team_count >= target_seats:
                         logger.info(
                             "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
                             len(active),
-                            TEAM_SUB_ACCOUNT_HARD_CAP,
+                            sub_account_target,
                             actual_team_count,
                         )
                         continue
@@ -3353,14 +3630,14 @@ def _auto_check_loop():
                         logger.info(
                             "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",
                             len(active),
-                            TEAM_SUB_ACCOUNT_HARD_CAP,
+                            sub_account_target,
                         )
                         continue
                     _playwright_lock.release()
                     logger.warning(
                         "[巡检] active 账号 %d < %d,触发 auto-fill(cmd_rotate 全流程补位)",
                         len(active),
-                        TEAM_SUB_ACCOUNT_HARD_CAP,
+                        sub_account_target,
                     )
                     from autoteam.manager import cmd_rotate
 
@@ -3368,8 +3645,9 @@ def _auto_check_loop():
                         _start_task(
                             "auto-fill",
                             cmd_rotate,
-                            {"target_seats": TEAM_SUB_ACCOUNT_HARD_CAP + 1},
-                            TEAM_SUB_ACCOUNT_HARD_CAP + 1,
+                            {"target_seats": target_seats},
+                            target_seats,
+                            background_post_sync=True,
                         )
                         _auto_fill_last_trigger_ts = now_ts
                     except Exception as e:
@@ -3467,6 +3745,7 @@ def _auto_check_loop():
 
 class AutoCheckConfig(BaseModel):
     interval: int = 300  # 巡检间隔（秒）
+    target_seats: int = 3  # 自动巡检目标 Team seat 数，最多 1 母 + 2 子
     threshold: int = 10  # 额度阈值（%）
     min_low: int = 2  # 触发轮转的最少账号数
 
@@ -3481,12 +3760,14 @@ def get_auto_check_config():
 def set_auto_check_config(cfg: AutoCheckConfig):
     """修改巡检配置（运行时生效）"""
     _auto_check_config["interval"] = max(60, cfg.interval)  # 最少 1 分钟
+    _auto_check_config["target_seats"] = max(1, min(3, cfg.target_seats))
     _auto_check_config["threshold"] = max(1, min(100, cfg.threshold))
     _auto_check_config["min_low"] = max(1, cfg.min_low)
     _auto_check_restart.set()  # 唤醒巡检线程，立即应用新配置
     logger.info(
-        "[巡检] 配置已更新: 间隔=%ds 阈值=%d%%（min_low 已废弃,任意失效立即 1v1 替换）",
+        "[巡检] 配置已更新: 间隔=%ds 目标 seat=%d 阈值=%d%%（min_low 已废弃,任意失效立即 1v1 替换）",
         _auto_check_config["interval"],
+        _auto_check_config["target_seats"],
         _auto_check_config["threshold"],
     )
     return _auto_check_config.copy()

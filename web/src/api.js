@@ -83,10 +83,10 @@ export const api = {
   postSyncAccounts: () => request('POST', '/sync/accounts'),
   postSyncMainCodex: () => request('POST', '/sync/main-codex'),
 
-  startRotate: (target = 5) => request('POST', '/tasks/rotate', { target }),
+  startRotate: (target = 3) => request('POST', '/tasks/rotate', { target }),
   startCheck: () => request('POST', '/tasks/check'),
   startAdd: () => request('POST', '/tasks/add'),
-  startFill: (target = 5) => request('POST', '/tasks/fill', { target, leave_workspace: false }),
+  startFill: (target = 3) => request('POST', '/tasks/fill', { target, leave_workspace: false }),
   startFillPersonal: (count = 1) => request('POST', '/tasks/fill', { target: count, leave_workspace: true }),
   startCleanup: (maxSeats = null) => request('POST', '/tasks/cleanup', { max_seats: maxSeats }),
 

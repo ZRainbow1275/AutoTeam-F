@@ -68,7 +68,8 @@ API_KEY = os.environ.get("API_KEY", "")
 
 # 自动巡检配置
 AUTO_CHECK_INTERVAL = _get_int_env("AUTO_CHECK_INTERVAL", 300)  # 巡检间隔（秒），默认 5 分钟
-AUTO_CHECK_TARGET_SEATS = max(1, _get_int_env("AUTO_CHECK_TARGET_SEATS", 3))
+# Team 席位目标硬限制为 3 人: 1 个 owner + 2 个受管子号。
+AUTO_CHECK_TARGET_SEATS = max(1, min(3, _get_int_env("AUTO_CHECK_TARGET_SEATS", 3)))
 AUTO_CHECK_THRESHOLD = _get_int_env("AUTO_CHECK_THRESHOLD", 10)  # 额度低于此百分比触发轮转，默认 10%
 AUTO_CHECK_MIN_LOW = _get_int_env("AUTO_CHECK_MIN_LOW", 2)  # 至少几个账号低于阈值才触发，默认 2
 

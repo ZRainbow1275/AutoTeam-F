@@ -46,6 +46,9 @@
           type="text"
           :placeholder="form.MAIL_PROVIDER === 'maillab' ? 'https://your-maillab.example.com' : 'https://example.com/api'"
           class="w-full px-2 py-1.5 bg-surface border border-hairline rounded text-sm text-ink-950 focus-ring" />
+        <p v-if="form.MAIL_PROVIDER !== 'maillab'" class="text-[11px] leading-relaxed text-ink-500">
+          cf_temp_email 的 CLOUDMAIL_BASE_URL 必须填写到 API 前缀，例如 https://your-domain.com/api。
+        </p>
         <input
           v-if="form.MAIL_PROVIDER === 'maillab'"
           v-model="form.MAILLAB_USERNAME"
@@ -145,6 +148,12 @@ const canTestConnection = computed(() => {
   return baseOk && pwdOk
 })
 
+const cloudmailBaseUrlMissingApi = computed(() => {
+  if (form.value.MAIL_PROVIDER === 'maillab') return false
+  const value = String(form.value[baseUrlKey.value] || '').trim().replace(/\/+$/, '')
+  return !!value && !value.endsWith('/api')
+})
+
 const canEnterDomain = computed(() => state.value === 'DOMAIN' || state.value === 'SAVE')
 
 const connectionStatus = computed(() => {
@@ -192,6 +201,14 @@ function selectProvider(value) {
 async function testConnection() {
   testing.value = true
   try {
+    if (cloudmailBaseUrlMissingApi.value) {
+      emit('error', {
+        error_code: 'ROUTE_NOT_FOUND',
+        message: 'CLOUDMAIL_BASE_URL 需要包含 /api',
+        hint: '请填写类似 https://your-domain.com/api 的地址，而不是只填域名根路径。',
+      })
+      return
+    }
     const fp = await api.probeMailProvider({
       provider: form.value.MAIL_PROVIDER,
       step: 'fingerprint',

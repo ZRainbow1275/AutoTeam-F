@@ -23,7 +23,7 @@ class _FakeMailClient:
 
 def test_cmd_fill_tries_other_reusable_accounts_before_creating_new(monkeypatch):
     chatgpt = _FakeChatGPT()
-    count_values = iter([4, 5])
+    count_values = iter([2, 3])
     events = []
 
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
@@ -51,7 +51,7 @@ def test_cmd_fill_tries_other_reusable_accounts_before_creating_new(monkeypatch)
     monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync", None)))
     monkeypatch.setattr(manager, "cmd_status", lambda: events.append(("status", None)))
 
-    manager.cmd_fill(target=5)
+    manager.cmd_fill(target=3)
 
     assert events == [
         ("reinvite", "old-1@example.com"),
@@ -64,7 +64,7 @@ def test_cmd_fill_tries_other_reusable_accounts_before_creating_new(monkeypatch)
 
 def test_cmd_fill_skips_google_accounts_during_auto_reuse(monkeypatch):
     chatgpt = _FakeChatGPT()
-    count_values = iter([4, 5])
+    count_values = iter([2, 3])
     events = []
 
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
@@ -92,7 +92,7 @@ def test_cmd_fill_skips_google_accounts_during_auto_reuse(monkeypatch):
     monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync", None)))
     monkeypatch.setattr(manager, "cmd_status", lambda: events.append(("status", None)))
 
-    manager.cmd_fill(target=5)
+    manager.cmd_fill(target=3)
 
     assert events == [
         ("reinvite", "old-2@example.com"),

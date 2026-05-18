@@ -78,14 +78,14 @@ cat state.json | python -m json.tool
 
 ### rotate 的目标人数为什么算不准
 
-`rotate 5` / `fill 5` 中的 `5` 指的是 **Team 总人数目标**。
+`rotate 3` / `fill 3` 中的 `3` 指的是 **Team 总人数目标**。
 
 也就是说：
 - owner
 - 外部成员
 - 本地管理成员
 
-都会一起计入这 5 个席位。
+都会一起计入这 3 个席位。当前自动轮转契约最多保留 `1 owner + 2 managed children`。
 
 ### 旧号一直被复用但额度不够
 
@@ -102,7 +102,7 @@ cat state.json | python -m json.tool
 `rotate` 会自动清理超员成员。如果没生效，可手动执行：
 
 ```bash
-uv run autoteam cleanup 5
+uv run autoteam cleanup 3
 ```
 
 ## CPA 同步相关

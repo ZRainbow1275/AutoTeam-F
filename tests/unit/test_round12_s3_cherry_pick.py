@@ -151,8 +151,9 @@ class TestRegisterWithInviteSignupProfile:
 # ===========================================================================
 class TestPoolCountingHelpers:
     def test_pool_active_target_subtracts_main_seat(self):
-        # target=5 → 子号 active 目标 = 4 (主号占 1 席)
-        assert manager_mod._pool_active_target(5) == 4
+        # target=3 → 子号 active 目标 = 2 (主号占 1 席)
+        assert manager_mod._pool_active_target(3) == 2
+        assert manager_mod._pool_active_target(manager_mod._clamp_team_target_seats(5)) == 2
         assert manager_mod._pool_active_target(1) == 0
         assert manager_mod._pool_active_target(0) == 0
         # negative defensiveness
@@ -198,8 +199,8 @@ class TestPoolCountingHelpers:
             {"email": "a@x.com", "status": "active"},
             {"email": "b@x.com", "status": "exhausted"},
         ]
-        # target=5 → reserved_main=1 → 2 + 1 = 3
-        assert manager_mod._estimate_local_team_member_count(5, accounts) == 3
+        # target=3 → reserved_main=1 → 2 + 1 = 3
+        assert manager_mod._estimate_local_team_member_count(3, accounts) == 3
         # target=0 → reserved_main=0 → 2 + 0 = 2
         assert manager_mod._estimate_local_team_member_count(0, accounts) == 2
 

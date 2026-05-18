@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -73,7 +74,11 @@ from autoteam.register_failures import MASTER_SUBSCRIPTION_DEGRADED, record_fail
 from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.sync_targets import (
     sync_account_to_configured_targets,
+)
+from autoteam.sync_targets import (
     sync_main_codex_to_configured_targets as sync_main_codex_to_cpa,
+)
+from autoteam.sync_targets import (
     sync_to_configured_targets as sync_to_cpa,
 )
 from autoteam.textio import read_text, write_text
@@ -81,6 +86,8 @@ from autoteam.textio import read_text, write_text
 logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
+TEAM_SEATS_MIN = 2
+TEAM_SEATS_MAX = 3
 
 # Round 11 二轮收尾 — OAuth 子进程默认超时(秒)。任何 subprocess 包裹 login_codex_via_browser
 # (probe 脚本 / 异步 worker / CLI 工具) 必须用此常量,不再硬编码 60s。
@@ -128,6 +135,15 @@ def _is_main_account_email(email: str | None) -> bool:
 
 
 _GOOGLE_AUTO_REUSE_DOMAINS = {"gmail.com", "googlemail.com"}
+
+
+def _clamp_team_target_seats(value, *, minimum: int = TEAM_SEATS_MIN) -> int:
+    """Clamp Team target seats to the hard 1 owner + 2 child contract."""
+    try:
+        parsed = int(value or minimum)
+    except Exception:
+        parsed = minimum
+    return max(int(minimum), min(TEAM_SEATS_MAX, parsed))
 
 
 def _get_account_login_provider(acc: dict | None) -> str:
@@ -187,6 +203,28 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
         return None
 
     return bool(_declared_attr("browser") or _declared_attr("http_transport"))
+
+
+def _run_post_task_sync(stage_label: str, sync_func) -> None:
+    """Run final remote sync after the Playwright-bound task has completed."""
+    try:
+        logger.info("%s 后台远端同步开始...", stage_label)
+        result = sync_func()
+        logger.info("%s 后台远端同步完成: %s", stage_label, result)
+    except Exception as exc:
+        logger.warning("%s 后台远端同步失败，保留本地轮转结果: %s", stage_label, exc)
+
+
+def _schedule_post_task_sync(stage_label: str = "[轮转]", sync_func=None) -> threading.Thread:
+    runner = sync_func or sync_to_cpa
+    thread = threading.Thread(
+        target=_run_post_task_sync,
+        args=(stage_label, runner),
+        name="autoteam-post-task-sync",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _has_auth_file(acc: dict | None) -> bool:
@@ -297,7 +335,7 @@ def _login_codex_via_browser_with_proxy(*args, playwright_proxy_url: str | None 
 def _pool_active_target(team_target: int) -> int:
     """除去主号后的"子号 active 池"目标(上游 `.upstream/manager.py:159`)。
 
-    主号占 1 席,target_seats=5 时子号 active 目标 = 4。轮转主循环 5/5 终止条件用此值。
+    主号占 1 席,target_seats=3 时子号 active 目标 = 2。轮转主循环终止条件用此值。
     """
     return max(0, int(team_target) - 1)
 
@@ -306,7 +344,7 @@ def _count_pool_active_accounts(accounts: list[dict] | None = None, *, require_a
     """统计非主号 + status=ACTIVE 的账号数(上游 `.upstream/manager.py:163`)。
 
     require_auth=True 时还要求本地有可用 auth_file,用于"双指标终止条件"
-    防止"Team 满 5 但本地都是 standby/auth_invalid → 实际可用 0"假满足.
+    防止"Team 满员但本地都是 standby/auth_invalid → 实际可用 0"假满足.
     """
     accounts = accounts if accounts is not None else load_accounts()
     count = 0
@@ -674,10 +712,10 @@ def invite_to_team(chatgpt_api, email, seat_type="default"):
 # --------------------------------------------------------------------------
 
 
-# Team 子账号(非主号)硬上限。主号 + 4 子号 = 5 席,与 cmd_rotate / cmd_fill 默认 target=5 一致。
+# Team 子账号(非主号)硬上限。主号 + 2 子号 = 3 席,与 cmd_rotate / cmd_fill 默认 target=3 一致。
 # 超过这个数说明有"假 standby / 假 personal"在 Team 里占席位(同步延迟或历史 bug 遗留),
-# _reconcile_team_members 会按优先级 kick 多余者,永不让 Team 超出 4 子号。
-TEAM_SUB_ACCOUNT_HARD_CAP = 4
+# _reconcile_team_members 会按优先级 kick 多余者,永不让 Team 超出 2 子号。
+TEAM_SUB_ACCOUNT_HARD_CAP = 2
 
 
 def _find_team_auth_file(email):
@@ -733,7 +771,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
     """对账:Team 实际成员 vs 本地 accounts.json,修复一切不一致。
 
     触发原因:历史 bug(OpenAI /users 同步延迟 → remove_from_team already_absent 误判 →
-    DELETE 被跳过)在 Team 里留下"假 standby""假 personal"遗留成员,占 4 子号的席位。
+    DELETE 被跳过)在 Team 里留下"假 standby""假 personal"遗留成员，占子号席位。
 
     处理矩阵(第一轮):
         Team里 + 本地 active + auth_file 存在           → 正常
@@ -754,7 +792,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
             RECONCILE_KICK_GHOST=true(默认): KICK;否则留给 sync_account_states
 
     之后若 Team 非主号子账号仍 > TEAM_SUB_ACCOUNT_HARD_CAP,按 orphan → auth_invalid →
-    exhausted → personal → standby → 额度最低 active 顺序 kick 到刚好 4 为止。
+    exhausted → personal → standby → 额度最低 active 顺序 kick 到 TEAM_SUB_ACCOUNT_HARD_CAP 为止。
 
     dry_run=True 只诊断不动账户,用于 cmd_reconcile_dry_run。
     """
@@ -946,7 +984,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                     logger.error("[对账] KICK %s 失败: status=%s", email, rs)
                 continue
 
-        # 第二轮:硬上限 4 子号。
+        # 第二轮:硬上限 TEAM_SUB_ACCOUNT_HARD_CAP 子号。
         # 非 dry_run:kick 完第一轮再 GET /users 拿最新数;
         # dry_run:**不**重新 GET /users —— 否则刚"假装 KICK"的 ghost 仍在 workspace 真实
         # 成员里,会被算进 remaining_subs,over_cap 数量被高估。改用第一轮 team_subs
@@ -1587,7 +1625,7 @@ def cmd_check(include_standby: bool = False):
             # status_str == "no_auth" 已在 _check_and_refresh 里被 auth_file 判空挡掉
 
     # 入口先跑一次对账:凡是"Team 里挂着但本地 standby/exhausted/personal"的遗留成员,
-    # 统一 kick。顺便把 Team 子号硬压到 TEAM_SUB_ACCOUNT_HARD_CAP(4)以内。
+    # 统一 kick。顺便把 Team 子号硬压到 TEAM_SUB_ACCOUNT_HARD_CAP 以内。
     # 这里失败不影响后续额度检查(已有 try/except 包裹),避免对账异常把整个 check 打挂。
     try:
         recon = _reconcile_team_members()
@@ -4632,7 +4670,7 @@ def _reuse_one_standby(
         return {"email": email, "result": "failed", "error": str(exc)}
 
 
-def cmd_rotate(target_seats=5):
+def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=False):
     """
     智能轮转 - 保持 Team 始终有 target_seats 个可用成员，尽量少创建新账号。
 
@@ -4647,9 +4685,9 @@ def cmd_rotate(target_seats=5):
       - vacancy 兜底改用 _estimate_local_team_member_count(替代旧 STATUS_ACTIVE 单字段统计).
       - ensure_account_mail(acc) 按账号 mail_provider 路由 mail client(S2 多 provider 必备).
       - 双指标终止条件: current_count >= TARGET AND pool_active >= ACTIVE_TARGET
-        (避免 "Team 满 5 但本地全是 standby/auth_invalid" 假满足).
+        (避免 "Team 满员但本地全是 standby/auth_invalid" 假满足).
     """
-    TARGET = target_seats
+    TARGET = _clamp_team_target_seats(target_seats)
     ACTIVE_TARGET = _pool_active_target(TARGET)
 
     from autoteam.config import AUTO_CHECK_THRESHOLD
@@ -5011,7 +5049,7 @@ def cmd_rotate(target_seats=5):
         final_count = get_team_member_count(chatgpt)
         # 双指标终止条件 (Round 12 S3 cherry-pick, 上游 `.upstream/manager.py` 终止条件):
         #   final_count >= TARGET 且 pool_active >= ACTIVE_TARGET 才算"真满员".
-        # 避免"Team 满 5 但本地全是 standby/auth_invalid → 实际可用 0"假正常状态.
+        # 避免"Team 满员但本地全是 standby/auth_invalid → 实际可用 0"假正常状态.
         final_pool_active = _count_pool_active_accounts()
         logger.info(
             "[轮转] 最终 Team 成员数: %d（目标: %d），子号 pool_active=%d（目标: %d）",
@@ -5035,9 +5073,14 @@ def cmd_rotate(target_seats=5):
     finally:
         if chatgpt:
             chatgpt.stop()
-        # 所有操作完成后统一同步 CPA，避免中途同步导致 CPA 不可用
-        logger.info("[轮转] 轮转完成，同步 CPA...")
-        sync_to_cpa()
+        # 所有操作完成后统一同步远端，避免中途同步导致远端状态不一致。
+        logger.info("[轮转] 轮转完成，同步已启用远端...")
+        if background_post_sync:
+            _schedule_post_task_sync("[轮转]")
+            logger.info("[轮转] 完成，远端同步已转入后台；使用 status 命令查看最新状态")
+        else:
+            sync_to_cpa()
+            logger.info("[轮转] 完成，使用 status 命令查看最新状态")
         # Round 9 RT-5 — cmd_rotate 收尾跑一次 retroactive(走 5min cache,失败仅 warning)。
         # spec/shared/master-subscription-health.md v1.1 §11.3。
         try:
@@ -5053,7 +5096,6 @@ def cmd_rotate(target_seats=5):
                 )
         except Exception as exc:
             logger.warning("[轮转] retroactive helper 异常: %s", exc)
-        logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
 def cmd_add():
@@ -5304,7 +5346,7 @@ def get_team_member_count(chatgpt_api):
     return len(members)
 
 
-def cmd_fill(target=5, leave_workspace=False):
+def cmd_fill(target=3, leave_workspace=False):
     """
     补位流程。
     leave_workspace=False: 补满 Team 席位到 target（原行为），优先复用 standby 旧号
@@ -5312,6 +5354,7 @@ def cmd_fill(target=5, leave_workspace=False):
     """
     if leave_workspace:
         return _cmd_fill_personal(target)
+    target = _clamp_team_target_seats(target)
 
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
@@ -5548,7 +5591,8 @@ def _cmd_fill_personal(count):
     生产 count 个免费号:注册 → 主号踢出 → personal OAuth → 状态置 PERSONAL。
 
     风控策略(用户明确要求):
-    1. 一个主号同时最多 4 个子号在 Team 里 → 每批限制 this_round = min(4, remaining)
+    1. 一个主号同时最多 TEAM_SUB_ACCOUNT_HARD_CAP 个子号在 Team 里
+       → 每批限制 this_round 不超过当前可用子号席位
     2. 不强制清空 Team 现有席位:进入时把非主号成员邮箱快照为 baseline(可能是 Team fill
        创建的真实 Team 子号,用户希望保留)。每批结束后只等"本批注册的新号"被踢干净,
        不管 baseline 成员是否还在。
@@ -5562,7 +5606,7 @@ def _cmd_fill_personal(count):
         logger.info("[免费号] 数量为 0，跳过")
         return
 
-    BATCH_SIZE = 4
+    BATCH_SIZE = TEAM_SUB_ACCOUNT_HARD_CAP
     WAIT_TEAM_EMPTY_TIMEOUT = 180
 
     mail_client = CloudMailClient()
@@ -5646,7 +5690,7 @@ def _cmd_fill_personal(count):
                 logger.warning("[免费号] 收到取消请求,停止后续批次")
                 break
             batch_idx += 1
-            # Team 席位总上限 TEAM_SUB_ACCOUNT_HARD_CAP(4):baseline 已占了一部分,
+            # Team 席位总上限 TEAM_SUB_ACCOUNT_HARD_CAP:baseline 已占了一部分,
             # 本批最多再加 (cap - baseline) 个,严格不超员。若 baseline 已占满,
             # 入口处已经拒绝并 return,这里不会走到。
             max_new_this_batch = TEAM_SUB_ACCOUNT_HARD_CAP - len(baseline_emails)
@@ -6073,7 +6117,7 @@ def main():
         help="同时探测 standby 池的 quota(限速+24h 去重,会对每个 standby 账号打一次 wham/usage)",
     )
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
-    rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
+    rotate_p.add_argument("target", type=int, nargs="?", default=3, help="目标成员数（默认 3，最多 3）")
     sub.add_parser("add", help="手动添加一个新账号")
     sub.add_parser("manual-add", help="手动 OAuth 添加账号（打开链接登录后粘贴回调 URL）")
     admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
@@ -6083,7 +6127,7 @@ def main():
     sub.add_parser("main-codex-sync", help="交互式同步主号 Codex 到 CPA")
 
     fill_p = sub.add_parser("fill", help="补满 Team 成员到指定数量")
-    fill_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
+    fill_p.add_argument("target", type=int, nargs="?", default=3, help="目标成员数（默认 3，最多 3）")
 
     cleanup_p = sub.add_parser("cleanup", help="清理多余成员（只移除本地管理的）")
     cleanup_p.add_argument("max_seats", type=int, nargs="?", default=None, help="最大席位数")

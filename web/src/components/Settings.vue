@@ -336,13 +336,21 @@
         <span v-if="saved" class="text-xs text-emerald-700 transition">已保存</span>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
         <div>
           <label class="block text-sm text-ink-500 mb-1">巡检间隔</label>
           <div class="flex items-center gap-2">
             <input v-model.number="form.interval" type="number" min="1"
               class="w-full px-3 py-2 bg-surface-hover border border-hairline rounded-lg text-sm text-ink-950 focus:outline-none focus:border-indigo-500" />
             <span class="text-sm text-gray-500 shrink-0">分钟</span>
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm text-ink-500 mb-1">目标席位</label>
+          <div class="flex items-center gap-2">
+            <input v-model.number="form.target_seats" type="number" min="1" max="3"
+              class="w-full px-3 py-2 bg-surface-hover border border-hairline rounded-lg text-sm text-ink-950 focus:outline-none focus:border-indigo-500" />
+            <span class="text-sm text-gray-500 shrink-0">席</span>
           </div>
         </div>
         <div>
@@ -365,7 +373,7 @@
 
       <div class="mt-3 flex items-center justify-between gap-3">
         <p class="text-xs text-gray-500">
-          每 {{ form.interval }} 分钟检查一次，{{ form.min_low }} 个以上账号剩余低于 {{ form.threshold }}% 时自动轮转
+          每 {{ form.interval }} 分钟检查一次，目标 {{ form.target_seats }} 席（1 母 + 最多 2 子），{{ form.min_low }} 个以上账号剩余低于 {{ form.threshold }}% 时自动轮转
         </p>
         <button @click="save" :disabled="saving"
           class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-on-accent text-sm rounded-lg transition disabled:opacity-50">
@@ -524,7 +532,7 @@ async function onReloadMasterHealth() {
   finally { setTimeout(() => { masterHealthLoading.value = false }, 1200) }
 }
 
-const form = ref({ interval: 5, threshold: 10, min_low: 2 })
+const form = ref({ interval: 5, target_seats: 3, threshold: 10, min_low: 2 })
 const saving = ref(false)
 const saved = ref(false)
 
@@ -635,6 +643,7 @@ onMounted(async () => {
     const cfg = await api.getAutoCheckConfig()
     form.value = {
       interval: Math.round(cfg.interval / 60),
+      target_seats: cfg.target_seats ?? 3,
       threshold: cfg.threshold,
       min_low: cfg.min_low,
     }
@@ -834,11 +843,13 @@ async function save() {
   try {
     const cfg = await api.setAutoCheckConfig({
       interval: form.value.interval * 60,
+      target_seats: form.value.target_seats,
       threshold: form.value.threshold,
       min_low: form.value.min_low,
     })
     form.value = {
       interval: Math.round(cfg.interval / 60),
+      target_seats: cfg.target_seats ?? 3,
       threshold: cfg.threshold,
       min_low: cfg.min_low,
     }

@@ -191,8 +191,8 @@ const actions = [
 
 const showParams = ref(false)
 const paramLabel = ref('')
-const paramValue = ref(5)
-const paramMax = ref(20)
+const paramValue = ref(3)
+const paramMax = ref(3)
 const pendingAction = ref(null)
 const executingActionKey = ref('')
 
@@ -326,11 +326,11 @@ async function execute(action) {
   if (action.needParam) {
     pendingAction.value = action
     if (action.paramName === 'target') {
-      paramLabel.value = '目标成员数'; paramMax.value = 20; paramValue.value = 5
+      paramLabel.value = '目标成员数'; paramMax.value = 3; paramValue.value = 3
     } else if (action.paramName === 'count') {
-      paramLabel.value = '生成数量'; paramMax.value = 500; paramValue.value = 4
+      paramLabel.value = '生成数量'; paramMax.value = 2; paramValue.value = 1
     } else {
-      paramLabel.value = '最大席位'; paramMax.value = 20; paramValue.value = 5
+      paramLabel.value = '最大席位'; paramMax.value = 3; paramValue.value = 3
     }
     showParams.value = true
     return

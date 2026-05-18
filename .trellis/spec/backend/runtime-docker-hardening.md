@@ -30,6 +30,8 @@
 - `ChatGPTTeamAPI.stop() -> None`
 - `build_chatgpt_transport(session_token: str, account_id: str = "", oai_device_id: str = "", proxy_url: str | None = None)`
 - `get_chatgpt_http_proxy_url(proxy_url: str | None = None) -> str`
+- `get_cliproxy_health() -> dict[str, Any]`
+- `cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=False)`
 - `IPv6Pool.start(active_emails: Iterable[str] | None = None) -> None`
 - `IPv6Pool.ensure_proxy_for_account(email: str) -> tuple[str, str]`
 - `IPv6Pool.release_proxy_for_account(email: str) -> None`
@@ -62,12 +64,16 @@
 - Direct HTTP API fetches must close and clear the bad `http_transport` before browser fallback when the transport raises, returns HTML/challenge, or fails again after a 401-triggered token refresh retry.
 - Registration and OAuth Playwright call sites must use `close_playwright_objects()` rather than raw `browser.close()`, `context.close()`, or `page.close()`. Direct registration paths need a `try/finally` guard so unexpected page/navigation errors still release page, context, and browser.
 - `SessionCodexAuthFlow.start()` must stop its `ChatGPTTeamAPI` instance if page creation, cookie injection, navigation, or the first `_advance()` fails after `start_with_session(require_browser=True)`.
+- API-driven `rotate`, `auto-fill`, and `auto-rotate` must not block task completion on CPA/CLIProxyAPI remote sync. Use `background_post_sync=True` so `cmd_rotate()` schedules final sync after the Playwright-bound operation releases task state.
 - IPv6 proxy isolation is opt-in. Disabled-by-default installs must not create local proxy processes, mutate network state, or require IPv6 kernel configuration.
 - When `AUTOTEAM_IPV6_POOL_REQUIRED=true`, allocation/preflight failure is a hard business/runtime error. Do not silently fall back to direct network access.
 - Account-scoped browser and HTTP transport paths must propagate the allocated local proxy URL into Playwright launch options and `curl_cffi` transport construction. Persisted auth bundles should store the public/auth proxy URL only when one was allocated.
 - Temporary registration proxies must be released when registration, duplicate-email retry, phone/add-phone terminal failure, or post-registration OAuth fails before the account becomes usable.
 - API startup may pre-warm the IPv6 pool only for non-main, non-disabled active accounts. Shutdown must stop pool proxies after Playwright executor cleanup.
 - `/api/status` may include `ipv6_pool`, but IPv6 status collection must never block or fail the status response. Return a diagnostic `ipv6_pool.error` instead of raising a 500.
+- `/api/status` may include `cliproxy` and `rotation_validation`. These fields are additive and must not remove or rename existing status fields.
+- `cliproxy` health must stay read-only. It may read CLIProxyAPI management metadata (`/v0/management/auth-files`) and provider availability counts, but must never call sync/upload/delete/refresh endpoints.
+- `rotation_validation` must distinguish `ok`, `degraded`, and hard `failed` results. Hard post-task validation failure may convert a superficially completed mutation task into `failed`; degraded results keep operation success visible and expose cooldown/follow-up metadata.
 - `sync_to_cpa()` must refresh `proxy_url` in auth JSON for active/personal, non-disabled local accounts before upload. In required mode refresh failure must fail the sync; in non-required mode it may warn and upload the existing file.
 
 ### 4. Validation & Error Matrix
@@ -89,6 +95,11 @@
 | invite/direct registration or Codex OAuth opens a Playwright page then raises before a normal return | Cleanup must still close page, context, and browser in dependency order |
 | `SessionCodexAuthFlow.start()` fails after creating a `ChatGPTTeamAPI` | Call `stop()` and clear `chatgpt` / `page` fields |
 | `collect_runtime_resource_snapshot()` unexpectedly raises inside `/api/status` | Return a status response with a diagnostic `runtime_resources.error`; do not raise a 500 |
+| CLIProxyAPI health config is missing or unreachable | Return `cliproxy.ok=false`, `safe_read_only=true`, and a reason; do not raise a 500 |
+| CLIProxyAPI auth-file payload is malformed | Return provider/management diagnostic fields; do not treat it as an empty healthy provider set |
+| post-task remote sync fails after API-driven rotate | Log a warning, keep the local rotation result, and leave task completion unblocked |
+| post-task runtime validation is degraded | Keep the task completed, record reasons and cooldown/follow-up metadata |
+| post-task runtime validation is a hard failure | Convert the task to `failed` with a business reason |
 | IPv6 pool is disabled | Do not start proxies; status should report disabled/no allocations |
 | IPv6 allocation fails while required mode is true | Raise a clear error and do not continue direct |
 | IPv6 allocation fails while required mode is false | Log a warning and continue only through the existing direct-path fallback |
@@ -117,6 +128,8 @@
   - `tests/unit/test_api_playwright_cleanup.py`
   - `tests/unit/test_round11_session_token_injection.py`
 - Status endpoint integration: `tests/unit/test_api_status.py`
+- CLIProxyAPI read-only health: `tests/unit/test_cliproxy_health.py`
+- Rotate deferred post-sync and validation plumbing: `tests/unit/test_manager_rotate.py` and `tests/unit/test_api_status.py`
 - IPv6 pool/proxy persistence and strict required-mode behavior: `tests/unit/test_ipv6_pool.py`
 - IPv6 status and status-failure boundary: `tests/unit/test_api_status.py`
 - CPA auth proxy refresh before upload: `tests/unit/test_cpa_sync.py`

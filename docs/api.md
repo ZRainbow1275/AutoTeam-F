@@ -65,10 +65,10 @@ Authorization: Bearer <API_KEY>
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/tasks/rotate` | 智能轮转 `{"target": 5}` |
+| POST | `/api/tasks/rotate` | 智能轮转 `{"target": 3}` |
 | POST | `/api/tasks/check` | 检查额度，`{"include_standby": false}` 追加探测 standby 池（限速 1.5s/号 + 24h 去重） |
 | POST | `/api/tasks/add` | 自动注册并添加新账号 |
-| POST | `/api/tasks/fill` | 补满成员 `{"target": 5}` |
+| POST | `/api/tasks/fill` | 补满成员 `{"target": 3}` |
 | POST | `/api/tasks/cleanup` | 清理成员 `{"max_seats": null}` |
 | GET | `/api/tasks` | 任务列表 |
 | GET | `/api/tasks/{task_id}` | 任务详情 |
@@ -138,7 +138,7 @@ Authorization: Bearer <API_KEY>
 {
   "provider": "cf_temp_email | maillab",
   "step": "fingerprint | credentials | domain_ownership",
-  "base_url": "https://example.com",
+  "base_url": "https://example.com/api",
   "username": "admin@example.com",     // 仅 maillab credentials/domain_ownership
   "password": "...",                   // 仅 maillab credentials/domain_ownership
   "admin_password": "...",             // 仅 cf_temp_email credentials/domain_ownership
@@ -203,8 +203,10 @@ cf_temp_email:
 ```bash
 curl -X POST http://localhost:8787/api/mail-provider/probe \
   -H "Content-Type: application/json" \
-  -d '{"provider":"cf_temp_email","step":"credentials","base_url":"...","admin_password":"..."}'
+  -d '{"provider":"cf_temp_email","step":"credentials","base_url":"https://mail.example.com/api","admin_password":"..."}'
 ```
+
+> `cf_temp_email` 的 `base_url` 对应 `CLOUDMAIL_BASE_URL`，必须包含 `/api` 前缀；不要只填域名根路径。
 
 maillab:
 
@@ -246,7 +248,7 @@ curl -H "Authorization: Bearer YOUR_KEY" \
 # 触发轮转
 curl -X POST -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"target": 5}' \
+  -d '{"target": 3}' \
   http://localhost:8787/api/tasks/rotate
 
 # 从 CPA 拉取认证文件到本地

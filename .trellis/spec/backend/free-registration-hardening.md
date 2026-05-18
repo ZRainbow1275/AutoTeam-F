@@ -11,8 +11,9 @@
 ### 2. Signatures
 
 - `TaskParams.leave_workspace: bool = False`
+- `TaskParams.target: int = 3`
 - `post_fill(params: TaskParams = TaskParams())`
-- `cmd_fill(target=5, leave_workspace=False)`
+- `cmd_fill(target=3, leave_workspace=False)`
 - `_cmd_fill_personal(count)`
 - `create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None)`
 - `create_account_direct(mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None)`
@@ -32,6 +33,7 @@
   - persist `STATUS_PERSONAL`
 - API-level fill-personal preflight must use the same local Team-seat definition as `manager._count_local_team_seat_accounts()`.
 - Local Team-seat statuses are `STATUS_ACTIVE`, `STATUS_EXHAUSTED`, and `STATUS_AUTH_INVALID`; `STATUS_PERSONAL` is not a Team seat.
+- Current Team-seat target contract is `3 = 1 owner + 2 managed children`. Team-target inputs for rotate/fill/auto-check must be clamped to `1..3`; the child-account hard cap is `2`.
 - `SignupProfile` must be a single immutable snapshot passed through registration and OAuth. Its nested `birthday` mapping must reject in-place mutation and must be defensively copied from constructor input. Generated birthday and age must also be self-consistent.
 - Registration, direct registration, Team OAuth, and Personal OAuth must not use hardcoded fallback identities such as `User`, `1995-06-15`, or age `25` when a `SignupProfile` is available.
 - OAuth about-you must consume the same `SignupProfile`, try the profile's supported birthday field orders, and return failure if the page still remains on about-you after all supported orders. The caller must treat that failure as `bundle=None` so the existing retry/failure-classification policy can handle it.
@@ -57,7 +59,7 @@
 
 ### 5. Good/Base/Bad Cases
 
-- Good: API rejects fill-personal when the local seat set is `{active, exhausted, auth_invalid, auth_invalid}`.
+- Good: API rejects fill-personal when the local child-seat set already reaches the hard cap, for example `{active, auth_invalid}`.
 - Base: a normal `leave_workspace=False` fill does not use the free-path preflight.
 - Bad: counting only `active/exhausted` at API level while manager counts `auth_invalid` as a seat, because that starts a task that should have been rejected before browser/mail work.
 

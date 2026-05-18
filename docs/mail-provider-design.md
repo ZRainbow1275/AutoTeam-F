@@ -163,7 +163,7 @@ class MailProvider(ABC):
 MAIL_PROVIDER=cf_temp_email          # 或 maillab；缺省=cf_temp_email（保持现状）
 
 # ---- cf_temp_email（现 CLOUDMAIL_*，保留向后兼容） ----
-CLOUDMAIL_BASE_URL=https://...
+CLOUDMAIL_BASE_URL=https://your-domain.com/api  # cf_temp_email 必须包含 /api
 CLOUDMAIL_PASSWORD=...               # 实际是 admin password
 CLOUDMAIL_DOMAIN=@example.com
 # CLOUDMAIL_EMAIL 标记为 deprecated；setup_wizard 不再强制要求

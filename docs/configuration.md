@@ -11,7 +11,7 @@ cp .env.example .env
 | 配置项 | 说明 | 必填 |
 |--------|------|------|
 | `MAIL_PROVIDER` | 临时邮箱后端,`cf_temp_email`(默认) 或 `maillab` | **是(默认 `cf_temp_email`)** |
-| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
+| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址，必须包含 `/api` 前缀(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
 | `CLOUDMAIL_PASSWORD` | cf_temp_email 后端的管理员密码(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
 | `CLOUDMAIL_DOMAIN` | 临时邮箱域名(如 `@example.com`,Web 面板可填) | 是 |
 | `CLOUDMAIL_EMAIL` | 已废弃,保留只为兼容旧 `.env`;不再被使用 | 否 |

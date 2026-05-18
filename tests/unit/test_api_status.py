@@ -86,6 +86,49 @@ def test_get_status_includes_ipv6_pool_status(monkeypatch):
     assert result["ipv6_pool"]["count"] == 2
 
 
+def test_get_status_exposes_clipproxy_and_rotation_validation(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-child.json"
+    auth_file.write_text(json.dumps({"access_token": "token-child"}), encoding="utf-8")
+
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "child@example.com", "status": accounts.STATUS_ACTIVE, "auth_file": str(auth_file)}],
+    )
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda *_args, **_kwargs: ("ok", {"primary_pct": 20}))
+    monkeypatch.setattr(
+        "autoteam.cliproxy_health.get_cliproxy_health",
+        lambda: {
+            "ok": False,
+            "safe_read_only": True,
+            "management_api": {"ok": True},
+            "provider_auth": {
+                "ok": False,
+                "provider": "codex",
+                "model": "gpt-5.5",
+                "reason": "no_provider_auth",
+                "total": 0,
+                "available": 0,
+                "check_type": "management_metadata",
+                "canary_required": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "_rotation_validation_cooldown",
+        {"next_rotate_after": 0.0, "recorded_at": 123.0, "severity": "ok", "reason": ""},
+    )
+
+    result = api.get_status()
+
+    assert result["summary"]["active"] == 1
+    assert result["cliproxy"]["safe_read_only"] is True
+    assert result["cliproxy"]["provider_auth"]["reason"] == "no_provider_auth"
+    assert result["rotation_validation"]["severity"] == "ok"
+    assert result["rotation_validation"]["cooldown_remaining_seconds"] == 0
+
+
 def test_get_playwright_context_options_uses_fingerprint_constants(monkeypatch):
     monkeypatch.setattr(config, "PLAYWRIGHT_USER_AGENT", "AutoTeamTest/1.0")
     monkeypatch.setattr(config, "PLAYWRIGHT_LOCALE", "zh-CN")
@@ -107,10 +150,9 @@ def test_get_playwright_context_options_uses_fingerprint_constants(monkeypatch):
 
 
 def test_auto_check_cooldown_does_not_delay_real_team_shortage(tmp_path, monkeypatch):
-    from autoteam import manager
 
     auth_files = []
-    for idx in range(2):
+    for idx in range(1):
         auth_file = tmp_path / f"active-{idx}.json"
         auth_file.write_text(json.dumps({"access_token": f"token-{idx}"}), encoding="utf-8")
         auth_files.append(auth_file)
@@ -120,18 +162,17 @@ def test_auto_check_cooldown_does_not_delay_real_team_shortage(tmp_path, monkeyp
     def fake_start_task(command, func, params, *args, **kwargs):
         started.append((command, params, args, kwargs))
 
-    monkeypatch.setattr(manager, "TEAM_SUB_ACCOUNT_HARD_CAP", 4)
     monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", time.time())
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
-    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 3)
+    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 2)
     monkeypatch.setattr(api, "_start_task", fake_start_task)
     monkeypatch.setattr(
         "autoteam.accounts.load_accounts",
         lambda: [
             {"email": f"active-{idx}@example.com", "status": "active", "auth_file": str(auth_files[idx])}
-            for idx in range(2)
+            for idx in range(1)
         ],
     )
 
@@ -152,16 +193,15 @@ def test_auto_check_cooldown_does_not_delay_real_team_shortage(tmp_path, monkeyp
     assert len(started) == 1
     command, params, args, kwargs = started[0]
     assert command == "auto-fill"
-    assert params == {"target_seats": 5}
-    assert args == (5,)
-    assert kwargs == {}
+    assert params == {"target_seats": 3}
+    assert args == (3,)
+    assert kwargs == {"background_post_sync": True}
 
 
 def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatch):
-    from autoteam import manager
 
     auth_files = []
-    for idx in range(2):
+    for idx in range(1):
         auth_file = tmp_path / f"active-{idx}.json"
         auth_file.write_text(json.dumps({"access_token": f"token-{idx}"}), encoding="utf-8")
         auth_files.append(auth_file)
@@ -171,11 +211,10 @@ def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatc
 
     def fake_team_count(*args, **kwargs):
         probed.append((args, kwargs))
-        return 5
+        return 3
 
-    monkeypatch.setattr(manager, "TEAM_SUB_ACCOUNT_HARD_CAP", 4)
     monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", time.time())
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
     monkeypatch.setattr(api, "_auto_check_team_member_count", fake_team_count)
@@ -184,7 +223,7 @@ def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatc
         "autoteam.accounts.load_accounts",
         lambda: [
             {"email": f"active-{idx}@example.com", "status": "active", "auth_file": str(auth_files[idx])}
-            for idx in range(2)
+            for idx in range(1)
         ],
     )
     monkeypatch.setattr(
@@ -234,6 +273,34 @@ def test_sanitize_account_masks_disabled_non_main_status(monkeypatch):
     assert sanitized["raw_status"] == "active"
     assert sanitized["status"] == "disabled"
     assert sanitized["disabled"] is True
+
+
+def test_post_rotate_runs_final_sync_in_background(monkeypatch):
+    started = []
+    rotate_calls = []
+
+    def fake_start_task(command, func, params, *args, **kwargs):
+        started.append((command, func, params, args, kwargs))
+        return {"task_id": "rotate-task", "command": command, "params": params}
+
+    monkeypatch.setattr(api, "_start_task", fake_start_task)
+    monkeypatch.setattr(
+        "autoteam.manager.cmd_rotate",
+        lambda *args, **kwargs: rotate_calls.append((args, kwargs)),
+    )
+
+    result = api.post_rotate(api.TaskParams(target=3))
+
+    assert result["task_id"] == "rotate-task"
+    assert len(started) == 1
+    command, func, params, args, kwargs = started[0]
+    assert command == "rotate"
+    assert params == {"target": 3}
+    assert args == (3,)
+    assert kwargs == {}
+
+    func(3)
+    assert rotate_calls == [((3,), {"force_auth_repair": True, "background_post_sync": True})]
 
 
 def test_disable_and_enable_account_toggle_local_flag(tmp_path, monkeypatch):
