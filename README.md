@@ -232,4 +232,4 @@ curl -s -X POST -H "Authorization: Bearer $KEY" http://localhost:8787/api/admin/
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ZRainbow1275/AutoTeam-F&type=Date)](https://star-history.com/#ZRainbow1275/AutoTeam-F&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=ZRainbow1275/AutoTeam-F&type=Date)](https://star-history.dera.page/#ZRainbow1275/AutoTeam-F&Date)
